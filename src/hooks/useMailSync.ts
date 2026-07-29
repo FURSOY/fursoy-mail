@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState, useTransition, type MutableRe
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { AppLocale, AppLanguage } from "../i18n";
 import { updateNotificationBaseline } from "../mailSyncState";
+import { syncIntervalDelayMs } from "../syncInterval";
 import type { Account, AppControls, EmailSummary, OtpMode } from "../types";
 import { tauriApi } from "../tauriApi";
 import { extractVerificationCode, isAuthFailure, isInQuietHours, MAIL_PAGE_SIZE, MAIL_TABS } from "../utils";
@@ -187,7 +188,7 @@ export function useMailSync(options: UseMailSyncOptions) {
           await backgroundSyncRef.current();
         }
         scheduleNext();
-      }, syncIntervalSecondsRef.current * 1000);
+      }, syncIntervalDelayMs(syncIntervalSecondsRef.current));
     };
     scheduleNext();
   }, [accountTokensRef, backgroundSyncRef, clearPeriodicSync, syncChainIdRef, syncIntervalRef, tokenExpiredRef]);
