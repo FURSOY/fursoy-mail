@@ -31,12 +31,21 @@ export interface EmailSummary {
   account_id: string;
 }
 
+export interface GmailLabel {
+  id: string;
+  account_id: string;
+  name: string;
+  background_color: string | null;
+  text_color: string | null;
+}
+
 export interface ThreadGroup {
   latestEmail: EmailSummary;
   hasUnread: boolean;
   unreadCount: number;
   count: number;
   participants: string[];
+  labelIds: string[];
 }
 
 export interface AuthInfo {

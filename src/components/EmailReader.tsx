@@ -4,15 +4,16 @@ import {
   CornerUpLeft, Inbox, Send, Archive, ShieldAlert, Trash2,
   Users, Forward, Eye, RotateCcw, Minus, Plus, Maximize2,
   Settings, X, RefreshCw, Copy, ChevronDown, ChevronUp,
-  Download, FileText, Image, ImageOff, File, Type, Link2, List, ListOrdered, Paperclip, Undo2, Redo2,
+  Download, FileText, Image, ImageOff, File, Type, Link2, List, ListOrdered, Paperclip, Undo2, Redo2, Star,
 } from "lucide-react";
 import { locales, useLocale } from "../i18n";
-import type { EmailSummary, MailViewMode, MailZoom, RenderMode, AttachmentPayload, SavedDraft } from "../types";
+import type { EmailSummary, GmailLabel, MailViewMode, MailZoom, RenderMode, AttachmentPayload, SavedDraft } from "../types";
 import { tauriApi, type EmailAttachmentInfo } from "../tauriApi";
 import { calculateReplyAllRecipients, calculateReplyRecipients, areValidRecipients } from "../mailRecipients";
 import type { ReplySendRequest } from "../hooks/useMailActions";
 import { buildReplyBody } from "../mailCompose";
 import { extractInlineReplyBody, inlineReplyStorageKey, parseStoredInlineReplyDraft, type StoredInlineReplyDraft } from "../inlineReplyDraft";
+import { LabelChips, LabelPicker } from "./MailLabels";
 
 type AttachmentInfo = EmailAttachmentInfo;
 
@@ -412,8 +413,10 @@ interface EmailReaderProps {
   showSpamBtn: boolean;
   showRestoreBtn: boolean;
   showTrashToBinBtn: boolean;
+  isStarred: boolean;
 
   onArchive: (mail: EmailSummary) => void;
+  onToggleStarred: (mail: EmailSummary, starred: boolean) => Promise<void>;
   onReportSpam: (mail: EmailSummary) => void;
   onTrash: (mail: EmailSummary) => void;
   onMoveToInbox: (mail: EmailSummary) => void;
@@ -430,6 +433,10 @@ interface EmailReaderProps {
   accessToken: string | null;
   showToast: (msg: string, kind: "success" | "error" | "info") => void;
   searchQuery: string;
+  gmailLabels: GmailLabel[];
+  gmailLabelIds: string[];
+  onToggleGmailLabel: (labelId: string, applied: boolean) => Promise<void>;
+  onCreateGmailLabel: (name: string) => Promise<GmailLabel | null>;
 }
 
 // ── Main component ─────────────────────────────────────────────────────────────
@@ -443,11 +450,11 @@ export function EmailReader({
   readingToolsOpen, setReadingToolsOpen, renderMode, setRenderMode,
   remoteImagesAllowedForEmail, onLoadRemoteImages, onTrustRemoteImages,
   verificationCode, verificationCopyState, setVerificationCopyState,
-  showArchiveBtn, showSpamBtn, showRestoreBtn, showTrashToBinBtn,
-  onArchive, onReportSpam, onTrash, onMoveToInbox, onMarkAsUnread, onForward,
+  showArchiveBtn, showSpamBtn, showRestoreBtn, showTrashToBinBtn, isStarred,
+  onArchive, onToggleStarred, onReportSpam, onTrash, onMoveToInbox, onMarkAsUnread, onForward,
   onOpenUrl, mailScrollRef, relayoutKey, threadEmails, hasMoreThreadEmails, isLoadingOlderThread,
   threadMemoryLimitReached, onLoadOlderThread, accessToken, showToast,
-  searchQuery,
+  searchQuery, gmailLabels, gmailLabelIds, onToggleGmailLabel, onCreateGmailLabel,
 }: EmailReaderProps) {
   const tr = useLocale();
   const replyEditableRef = useRef<HTMLDivElement>(null);
@@ -1137,6 +1144,12 @@ export function EmailReader({
               <Eye className="w-4 h-4" />
             </button>
           </ToolbarTip>
+          <LabelPicker
+            labels={gmailLabels}
+            labelIds={gmailLabelIds}
+            onToggle={onToggleGmailLabel}
+            onCreate={onCreateGmailLabel}
+          />
           {showRestoreBtn && (
             <ToolbarTip label={activeTab === "spam" ? tr.actions.notSpam : tr.actions.restoreInbox}>
               <button type="button" onClick={() => onMoveToInbox(activeMail)} className="p-2 rounded-md hover:bg-white/5 text-zinc-400 hover:text-emerald-400 transition-colors">
@@ -1144,6 +1157,16 @@ export function EmailReader({
               </button>
             </ToolbarTip>
           )}
+          <ToolbarTip label={isStarred ? tr.actions.unstar : tr.actions.star}>
+            <button
+              type="button"
+              aria-pressed={isStarred}
+              onClick={() => { void onToggleStarred(activeMail, !isStarred); }}
+              className={`rounded-md p-2 transition-colors hover:bg-white/5 ${isStarred ? "text-amber-400" : "text-zinc-400 hover:text-amber-400"}`}
+            >
+              <Star className={`h-4 w-4 ${isStarred ? "fill-current" : ""}`} />
+            </button>
+          </ToolbarTip>
           {showArchiveBtn && (
             <ToolbarTip label={tr.actions.archive}>
               <button type="button" onClick={() => onArchive(activeMail)} className="p-2 rounded-md hover:bg-white/5 text-zinc-400 hover:text-amber-400 transition-colors">
@@ -1268,7 +1291,18 @@ export function EmailReader({
         <div className="mx-auto w-full max-w-[1040px] min-w-0">
 
           {/* Subject heading */}
-          <h1 className="text-xl font-bold text-zinc-100 mb-5 leading-snug"><SearchHighlightedText text={activeMail.subject} query={searchQuery} /></h1>
+          <h1 className="text-xl font-bold text-zinc-100 mb-2 leading-snug"><SearchHighlightedText text={activeMail.subject} query={searchQuery} /></h1>
+          {gmailLabelIds.length > 0 && (
+            <div className="mb-5">
+              <LabelChips
+                labels={gmailLabels}
+                labelIds={gmailLabelIds}
+                max={6}
+                onRemove={labelId => onToggleGmailLabel(labelId, false)}
+              />
+            </div>
+          )}
+          {gmailLabelIds.length === 0 && <div className="mb-5" />}
 
           {/* Received email attachments */}
           {attachments.length > 0 && (
@@ -1399,6 +1433,12 @@ export function EmailReader({
 
           {/* Mobile action buttons */}
           <div className="flex md:hidden items-center gap-1 mt-4">
+            <LabelPicker
+              labels={gmailLabels}
+              labelIds={gmailLabelIds}
+              onToggle={onToggleGmailLabel}
+              onCreate={onCreateGmailLabel}
+            />
             {showRestoreBtn && (
               <ToolbarTip label={activeTab === "spam" ? tr.actions.notSpam : tr.mail.inbox}>
                 <button type="button" onClick={() => onMoveToInbox(activeMail)} className="p-2 rounded-md hover:bg-white/5 text-zinc-400">
@@ -1406,6 +1446,16 @@ export function EmailReader({
                 </button>
               </ToolbarTip>
             )}
+            <ToolbarTip label={isStarred ? tr.actions.unstar : tr.actions.star}>
+              <button
+                type="button"
+                aria-pressed={isStarred}
+                onClick={() => { void onToggleStarred(activeMail, !isStarred); }}
+                className={`rounded-md p-2 ${isStarred ? "text-amber-400" : "text-zinc-400 hover:bg-white/5 hover:text-amber-400"}`}
+              >
+                <Star className={`h-4 w-4 ${isStarred ? "fill-current" : ""}`} />
+              </button>
+            </ToolbarTip>
             {showArchiveBtn && (
               <ToolbarTip label={tr.actions.archive}>
                 <button type="button" onClick={() => onArchive(activeMail)} className="p-2 rounded-md hover:bg-white/5 text-zinc-400">
@@ -1521,14 +1571,18 @@ export function EmailReader({
                   )}
 
                   {/* Format buttons */}
-                  <button type="button" title={tr.compose.undo} aria-label={tr.compose.undo} disabled={!canUndo} onMouseDown={e => { e.preventDefault(); applyFormat("undo"); }}
-                    className={`w-7 h-7 flex items-center justify-center rounded transition-colors ${canUndo ? "text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.06] cursor-pointer" : "text-zinc-700 cursor-default"}`}>
-                    <Undo2 className="w-3.5 h-3.5" />
-                  </button>
-                  <button type="button" title={tr.compose.redo} aria-label={tr.compose.redo} disabled={!canRedo} onMouseDown={e => { e.preventDefault(); applyFormat("redo"); }}
-                    className={`w-7 h-7 flex items-center justify-center rounded transition-colors ${canRedo ? "text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.06] cursor-pointer" : "text-zinc-700 cursor-default"}`}>
-                    <Redo2 className="w-3.5 h-3.5" />
-                  </button>
+                  <ToolbarTip label={tr.compose.undo}>
+                    <button type="button" disabled={!canUndo} onMouseDown={e => { e.preventDefault(); applyFormat("undo"); }}
+                      className={`w-7 h-7 flex items-center justify-center rounded transition-colors ${canUndo ? "text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.06] cursor-pointer" : "text-zinc-700 cursor-default"}`}>
+                      <Undo2 className="w-3.5 h-3.5" />
+                    </button>
+                  </ToolbarTip>
+                  <ToolbarTip label={tr.compose.redo}>
+                    <button type="button" disabled={!canRedo} onMouseDown={e => { e.preventDefault(); applyFormat("redo"); }}
+                      className={`w-7 h-7 flex items-center justify-center rounded transition-colors ${canRedo ? "text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.06] cursor-pointer" : "text-zinc-700 cursor-default"}`}>
+                      <Redo2 className="w-3.5 h-3.5" />
+                    </button>
+                  </ToolbarTip>
                   <div className="w-px h-4 bg-white/10 mx-1 shrink-0" />
                   {([
                     { cmd: "bold",          label: "B",  cls: "font-bold",      title: tr.compose.bold },
@@ -1536,57 +1590,56 @@ export function EmailReader({
                     { cmd: "underline",     label: "U",  cls: "underline",      title: tr.compose.underline },
                     { cmd: "strikeThrough", label: "S",  cls: "line-through",   title: tr.compose.strikethrough },
                   ] as { cmd: string; label: string; cls: string; title: string }[]).map(({ cmd, label, cls, title }) => (
-                    <button
-                      key={cmd}
-                      type="button"
-                      title={title}
-                      aria-label={title}
-                      onMouseDown={e => { e.preventDefault(); applyFormat(cmd); }}
-                      className="w-7 h-7 flex items-center justify-center rounded text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.06] text-xs transition-colors"
-                    >
-                      <span className={cls}>{label}</span>
-                    </button>
+                    <ToolbarTip key={cmd} label={title}>
+                      <button
+                        type="button"
+                        onMouseDown={e => { e.preventDefault(); applyFormat(cmd); }}
+                        className="w-7 h-7 flex items-center justify-center rounded text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.06] text-xs transition-colors"
+                      >
+                        <span className={cls}>{label}</span>
+                      </button>
+                    </ToolbarTip>
                   ))}
 
                   <div className="w-px h-4 bg-white/10 mx-1 shrink-0" />
 
-                  <button
-                    type="button"
-                    title={tr.compose.insertLink}
-                    aria-label={tr.compose.insertLink}
-                    onMouseDown={e => {
-                      e.preventDefault();
-                      saveSelection();
-                      setLinkUrl("");
-                      setLinkPopover(v => !v);
-                    }}
-                    className={`w-7 h-7 flex items-center justify-center rounded transition-colors ${
-                      linkPopover ? "text-blue-400 bg-blue-500/10" : "text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.06]"
-                    }`}
-                  >
-                    <Link2 className="w-3.5 h-3.5" />
-                  </button>
+                  <ToolbarTip label={tr.compose.insertLink}>
+                    <button
+                      type="button"
+                      onMouseDown={e => {
+                        e.preventDefault();
+                        saveSelection();
+                        setLinkUrl("");
+                        setLinkPopover(v => !v);
+                      }}
+                      className={`w-7 h-7 flex items-center justify-center rounded transition-colors ${
+                        linkPopover ? "text-blue-400 bg-blue-500/10" : "text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.06]"
+                      }`}
+                    >
+                      <Link2 className="w-3.5 h-3.5" />
+                    </button>
+                  </ToolbarTip>
 
                   <div className="w-px h-4 bg-white/10 mx-1 shrink-0" />
 
-                  <button
-                    type="button"
-                    title={tr.compose.numberedList}
-                    aria-label={tr.compose.numberedList}
-                    onMouseDown={e => { e.preventDefault(); applyFormat("insertOrderedList"); }}
-                    className="w-7 h-7 flex items-center justify-center rounded text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.06] transition-colors"
-                  >
-                    <ListOrdered className="w-3.5 h-3.5" />
-                  </button>
-                  <button
-                    type="button"
-                    title={tr.compose.bulletList}
-                    aria-label={tr.compose.bulletList}
-                    onMouseDown={e => { e.preventDefault(); applyFormat("insertUnorderedList"); }}
-                    className="w-7 h-7 flex items-center justify-center rounded text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.06] transition-colors"
-                  >
-                    <List className="w-3.5 h-3.5" />
-                  </button>
+                  <ToolbarTip label={tr.compose.numberedList}>
+                    <button
+                      type="button"
+                      onMouseDown={e => { e.preventDefault(); applyFormat("insertOrderedList"); }}
+                      className="w-7 h-7 flex items-center justify-center rounded text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.06] transition-colors"
+                    >
+                      <ListOrdered className="w-3.5 h-3.5" />
+                    </button>
+                  </ToolbarTip>
+                  <ToolbarTip label={tr.compose.bulletList}>
+                    <button
+                      type="button"
+                      onMouseDown={e => { e.preventDefault(); applyFormat("insertUnorderedList"); }}
+                      className="w-7 h-7 flex items-center justify-center rounded text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.06] transition-colors"
+                    >
+                      <List className="w-3.5 h-3.5" />
+                    </button>
+                  </ToolbarTip>
                 </div>
               )}
 
@@ -1616,42 +1669,42 @@ export function EmailReader({
               <div className="px-3 py-2 border-t border-white/5 flex items-center justify-between">
                 <div className="flex items-center gap-1">
                   {/* Paperclip */}
-                  <button
-                    type="button"
-                    title={tr.compose.attachFile}
-                    aria-label={tr.compose.attachFile}
-                    onClick={() => replyFileInputRef.current?.click()}
-                    className="w-7 h-7 flex items-center justify-center rounded-lg text-zinc-500 hover:text-zinc-300 hover:bg-white/[0.04] transition-colors"
-                  >
-                    <Paperclip className="w-3.5 h-3.5" />
-                  </button>
+                  <ToolbarTip label={tr.compose.attachFile}>
+                    <button
+                      type="button"
+                      onClick={() => replyFileInputRef.current?.click()}
+                      className="w-7 h-7 flex items-center justify-center rounded-lg text-zinc-500 hover:text-zinc-300 hover:bg-white/[0.04] transition-colors"
+                    >
+                      <Paperclip className="w-3.5 h-3.5" />
+                    </button>
+                  </ToolbarTip>
                   <input ref={replyFileInputRef} type="file" multiple className="hidden" onChange={handleReplyFileSelect} />
 
                   {/* Formatting toggle */}
-                  <button
-                    type="button"
-                    title={tr.compose.formatting}
-                    aria-label={tr.compose.formatting}
-                    onClick={() => { setShowFormatBar(v => !v); setLinkPopover(false); }}
-                    className={`flex items-center gap-1 px-2 py-1.5 rounded-lg text-xs transition-colors ${
-                      showFormatBar ? "text-blue-400 bg-blue-500/10" : "text-zinc-500 hover:text-zinc-300 hover:bg-white/[0.04]"
-                    }`}
-                  >
-                    <Type className="w-3.5 h-3.5" />
-                    <ChevronDown className={`w-3 h-3 transition-transform duration-150 ${showFormatBar ? "rotate-180" : ""}`} />
-                  </button>
+                  <ToolbarTip label={tr.compose.formatting}>
+                    <button
+                      type="button"
+                      onClick={() => { setShowFormatBar(v => !v); setLinkPopover(false); }}
+                      className={`flex items-center gap-1 px-2 py-1.5 rounded-lg text-xs transition-colors ${
+                        showFormatBar ? "text-blue-400 bg-blue-500/10" : "text-zinc-500 hover:text-zinc-300 hover:bg-white/[0.04]"
+                      }`}
+                    >
+                      <Type className="w-3.5 h-3.5" />
+                      <ChevronDown className={`w-3 h-3 transition-transform duration-150 ${showFormatBar ? "rotate-180" : ""}`} />
+                    </button>
+                  </ToolbarTip>
                 </div>
 
                 <div className="flex items-center gap-2">
-                  <button
-                    type="button"
-                    onClick={() => { void deleteInlineReplyDraft(); }}
-                    title={tr.compose.deleteDraft}
-                    aria-label={tr.compose.deleteDraft}
-                    className="rounded-md p-1.5 text-zinc-600 transition-colors hover:bg-red-500/10 hover:text-red-400"
-                  >
-                    <Trash2 className="h-3.5 w-3.5" />
-                  </button>
+                  <ToolbarTip label={tr.compose.deleteDraft}>
+                    <button
+                      type="button"
+                      onClick={() => { void deleteInlineReplyDraft(); }}
+                      className="rounded-md p-1.5 text-zinc-600 transition-colors hover:bg-red-500/10 hover:text-red-400"
+                    >
+                      <Trash2 className="h-3.5 w-3.5" />
+                    </button>
+                  </ToolbarTip>
                   <button
                     type="button"
                     onClick={() => {

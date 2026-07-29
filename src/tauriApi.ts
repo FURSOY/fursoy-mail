@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Account, AppControls, AttachmentPayload, AuthInfo, DraftContent, DraftPage, EmailSummary, SavedDraft, SendOutcome, ThreadGroup } from "./types";
+import type { Account, AppControls, AttachmentPayload, AuthInfo, DraftContent, DraftPage, EmailSummary, GmailLabel, SavedDraft, SendOutcome, ThreadGroup } from "./types";
+import type { AdvancedSearchCriteria } from "./advancedSearch";
 
 export interface MailboxDownloadStatus {
   running: boolean;
@@ -62,6 +63,7 @@ export interface ThreadPageInput {
 
 export interface ThreadSearchInput {
   query: string;
+  filters?: AdvancedSearchCriteria;
   accountId: string | null;
   limit?: number;
   beforeDate?: number | null;
@@ -85,6 +87,31 @@ export const tauriApi = {
     invoke<EmailSummary[]>("get_emails_by_label", { ...input }),
   getThreadGroupsByLabel: (input: ThreadPageInput) =>
     invoke<ThreadGroup[]>("get_thread_groups_by_label", { ...input }),
+  getGmailLabels: (accountId: string) =>
+    invoke<GmailLabel[]>("get_gmail_labels", { accountId }),
+  createGmailLabel: (accountId: string, name: string) =>
+    invoke<GmailLabel>("create_gmail_label", { accountId, name }),
+  renameGmailLabel: (accountId: string, labelId: string, name: string) =>
+    invoke<GmailLabel>("rename_gmail_label", { accountId, labelId, name }),
+  setGmailLabelColor: (
+    accountId: string,
+    labelId: string,
+    backgroundColor: string | null,
+    textColor: string | null,
+  ) => invoke<GmailLabel>("set_gmail_label_color", {
+    accountId, labelId, backgroundColor, textColor,
+  }),
+  deleteGmailLabel: (accountId: string, labelId: string) =>
+    invoke<void>("delete_gmail_label", { accountId, labelId }),
+  setThreadGmailLabel: (accountId: string, threadId: string, labelId: string, applied: boolean) =>
+    invoke<void>("set_thread_gmail_label", { accountId, threadId, labelId, applied }),
+  setThreadStarred: (accountId: string, threadId: string, starred: boolean) =>
+    invoke<void>("set_thread_gmail_label", {
+      accountId,
+      threadId,
+      labelId: "STARRED",
+      applied: starred,
+    }),
   searchLocalEmails: (query: string, accountId: string | null, limit: number) =>
     invoke<EmailSummary[]>("search_local_emails", { query, accountId, limit }),
   searchLocalThreadGroups: (input: ThreadSearchInput) =>
@@ -114,6 +141,8 @@ export const tauriApi = {
     invoke<EmailSummary[]>("get_thread_emails", { threadId, accountId, limit, offset }),
   markAsRead: (accountId: string, messageId: string) =>
     invoke<void>("mark_as_read", { accountId, messageId }),
+  markThreadAsRead: (accountId: string, threadId: string) =>
+    invoke<void>("mark_thread_as_read", { accountId, threadId }),
   markAsUnread: (accountId: string, threadId: string) =>
     invoke<void>("mark_as_unread", { accountId, threadId }),
   archiveEmail: (accountId: string, threadId: string) =>

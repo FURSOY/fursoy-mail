@@ -131,6 +131,17 @@ pub struct Email {
     pub date: i64,
     pub unread: bool,
     pub label: String,
+    #[serde(default)]
+    pub gmail_label_ids: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct GmailLabel {
+    pub id: String,
+    pub account_id: String,
+    pub name: String,
+    pub background_color: Option<String>,
+    pub text_color: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -159,6 +170,70 @@ pub struct ThreadGroup {
     pub unread_count: u32,
     pub count: u32,
     pub participants: Vec<String>,
+    pub label_ids: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct AdvancedSearchCriteria {
+    #[serde(default)]
+    pub from: String,
+    #[serde(default)]
+    pub to: String,
+    #[serde(default)]
+    pub subject: String,
+    #[serde(default)]
+    pub includes: String,
+    #[serde(default)]
+    pub excludes: String,
+    pub after_date: Option<i64>,
+    pub before_date: Option<i64>,
+    #[serde(default = "default_search_location")]
+    pub location: String,
+    #[serde(default)]
+    pub has_attachment: bool,
+    #[serde(default)]
+    pub unread: bool,
+    #[serde(default)]
+    pub starred: bool,
+}
+
+fn default_search_location() -> String {
+    "all".to_string()
+}
+
+impl Default for AdvancedSearchCriteria {
+    fn default() -> Self {
+        Self {
+            from: String::new(),
+            to: String::new(),
+            subject: String::new(),
+            includes: String::new(),
+            excludes: String::new(),
+            after_date: None,
+            before_date: None,
+            location: default_search_location(),
+            has_attachment: false,
+            unread: false,
+            starred: false,
+        }
+    }
+}
+
+impl AdvancedSearchCriteria {
+    fn is_active(&self) -> bool {
+        !self.from.trim().is_empty()
+            || !self.to.trim().is_empty()
+            || !self.subject.trim().is_empty()
+            || !self.includes.trim().is_empty()
+            || !self.excludes.trim().is_empty()
+            || self.after_date.is_some()
+            || self.before_date.is_some()
+            || self.location != "all"
+            || self.has_attachment
+            || self.unread
+            || self.starred
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -396,6 +471,30 @@ pub fn init_db(app: &AppHandle) -> Result<()> {
             PRIMARY KEY (account_id, id)
         )",
         [],
+    )?;
+
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS gmail_labels (
+             account_id TEXT NOT NULL,
+             id TEXT NOT NULL,
+             name TEXT NOT NULL,
+             background_color TEXT,
+             text_color TEXT,
+             PRIMARY KEY (account_id, id)
+         );
+         CREATE TABLE IF NOT EXISTS email_labels (
+             account_id TEXT NOT NULL,
+             email_id TEXT NOT NULL,
+             label_id TEXT NOT NULL,
+             PRIMARY KEY (account_id, email_id, label_id)
+         );
+         CREATE INDEX IF NOT EXISTS idx_email_labels_account_label
+             ON email_labels(account_id, label_id, email_id);
+         CREATE TRIGGER IF NOT EXISTS email_labels_cleanup
+         AFTER DELETE ON emails BEGIN
+             DELETE FROM email_labels
+             WHERE account_id = old.account_id AND email_id = old.id;
+         END;"
     )?;
 
     // Migration: add missing columns to emails
@@ -909,6 +1008,12 @@ fn remove_account_cache_from_conn(conn: &mut Connection, account_id: &str) -> Re
         "DELETE FROM attachments WHERE account_id = ?1",
         params![account_id],
     )?;
+    if tx.prepare("SELECT 1 FROM email_labels LIMIT 1").is_ok() {
+        tx.execute("DELETE FROM email_labels WHERE account_id = ?1", params![account_id])?;
+    }
+    if tx.prepare("SELECT 1 FROM gmail_labels LIMIT 1").is_ok() {
+        tx.execute("DELETE FROM gmail_labels WHERE account_id = ?1", params![account_id])?;
+    }
     tx.execute(
         "DELETE FROM emails WHERE account_id = ?1",
         params![account_id],
@@ -1481,6 +1586,8 @@ pub fn upsert_sync_mail_batch(
                 sync_generation = excluded.sync_generation",
         )?;
         for (email, body_text, thread_key) in indexed_emails {
+            let email_id = email.id.clone();
+            let gmail_label_ids = email.gmail_label_ids.clone();
             statement.execute(params![
                 email.id,
                 email.thread_id,
@@ -1501,6 +1608,20 @@ pub fn upsert_sync_mail_batch(
                 account_id,
                 sync_generation,
             ])?;
+            tx.execute(
+                "DELETE FROM email_labels WHERE account_id = ?1 AND email_id = ?2",
+                params![account_id, email_id],
+            )?;
+            for label_id in gmail_label_ids {
+                tx.execute(
+                    "INSERT OR IGNORE INTO email_labels (account_id, email_id, label_id)
+                     SELECT ?1, ?2, ?3
+                     WHERE ?3 = 'STARRED' OR EXISTS (
+                         SELECT 1 FROM gmail_labels WHERE account_id = ?1 AND id = ?3
+                     )",
+                    params![account_id, email_id, label_id],
+                )?;
+            }
         }
     }
 
@@ -1584,12 +1705,19 @@ fn map_thread_group_row(row: &rusqlite::Row) -> rusqlite::Result<ThreadGroup> {
         }
     }
     let unread_count = u32::try_from(row.get::<_, i64>(14)?).unwrap_or(u32::MAX);
+    let mut label_ids = Vec::new();
+    for id in row.get::<_, String>(17)?.split('\u{1f}') {
+        if !id.is_empty() && !label_ids.iter().any(|existing| existing == id) {
+            label_ids.push(id.to_string());
+        }
+    }
     Ok(ThreadGroup {
         latest_email,
         has_unread: unread_count > 0,
         unread_count,
         count: u32::try_from(row.get::<_, i64>(15)?).unwrap_or(u32::MAX),
         participants,
+        label_ids,
     })
 }
 
@@ -1625,24 +1753,99 @@ fn body_search_excerpt(body_text: &str, query: &str) -> Option<String> {
 fn search_thread_groups_from_conn(
     conn: &Connection,
     query: &str,
+    filters: Option<&AdvancedSearchCriteria>,
     account_id: Option<&str>,
     limit: i64,
     cursor: Option<(i64, &str, &str)>,
 ) -> Result<Vec<ThreadGroup>> {
     use rusqlite::types::Value;
 
-    let match_query = fts_match_query(query);
-    if match_query.is_empty() {
+    let empty_filters = AdvancedSearchCriteria::default();
+    let filters = filters.unwrap_or(&empty_filters);
+    let mut positive_matches = Vec::new();
+    for text in [query, filters.includes.as_str()] {
+        let part = fts_match_query(text);
+        if !part.is_empty() {
+            positive_matches.push(format!("({part})"));
+        }
+    }
+    for (column, text) in [
+        ("sender", filters.from.as_str()),
+        ("recipient", filters.to.as_str()),
+        ("subject", filters.subject.as_str()),
+    ] {
+        let part = fts_scoped_match_query(column, text);
+        if !part.is_empty() {
+            positive_matches.push(format!("({part})"));
+        }
+    }
+    let positive_match = positive_matches.join(" AND ");
+    if positive_match.is_empty() && query.trim().is_empty() && !filters.is_active() {
         return Ok(Vec::new());
     }
 
-    let mut values = vec![Value::Text(match_query)];
+    let mut values = Vec::new();
+    let mut conditions = Vec::new();
+    let from_clause = if positive_match.is_empty() {
+        "FROM emails e"
+    } else {
+        values.push(Value::Text(positive_match));
+        conditions.push("email_search MATCH ?".to_string());
+        "FROM email_search JOIN emails e ON e.rowid = email_search.rowid"
+    };
     let account_condition = if let Some(account_id) = account_id {
         values.push(Value::Text(account_id.to_string()));
-        "AND e.account_id = ?"
+        "e.account_id = ?"
     } else {
-        "AND e.account_id != ''"
+        "e.account_id != ''"
     };
+    conditions.push(account_condition.to_string());
+    conditions.push("e.label != 'draft'".to_string());
+
+    let excluded_match = fts_any_match_query(&filters.excludes);
+    if !excluded_match.is_empty() {
+        values.push(Value::Text(excluded_match));
+        conditions.push(
+            "e.rowid NOT IN (SELECT rowid FROM email_search WHERE email_search MATCH ?)"
+                .to_string(),
+        );
+    }
+    if let Some(after_date) = filters.after_date {
+        values.push(Value::Integer(after_date));
+        conditions.push("e.date >= ?".to_string());
+    }
+    if let Some(before_date) = filters.before_date {
+        values.push(Value::Integer(before_date));
+        conditions.push("e.date < ?".to_string());
+    }
+    if filters.has_attachment {
+        conditions.push(
+            "EXISTS (SELECT 1 FROM attachments a WHERE a.account_id = e.account_id AND a.email_id = e.id)"
+                .to_string(),
+        );
+    }
+    if filters.unread {
+        conditions.push("e.unread = 1".to_string());
+    }
+    if filters.starred {
+        conditions.push(
+            "EXISTS (SELECT 1 FROM email_labels starred WHERE starred.account_id = e.account_id AND starred.email_id = e.id AND starred.label_id = 'STARRED')"
+                .to_string(),
+        );
+    }
+    if let Some(label_id) = filters.location.strip_prefix("gmail:") {
+        values.push(Value::Text(label_id.to_string()));
+        conditions.push(
+            "EXISTS (SELECT 1 FROM email_labels located WHERE located.account_id = e.account_id AND located.email_id = e.id AND located.label_id = ?)"
+                .to_string(),
+        );
+    } else if matches!(filters.location.as_str(), "inbox" | "sent" | "archive" | "spam" | "trash") {
+        values.push(Value::Text(filters.location.clone()));
+        conditions.push("e.label = ?".to_string());
+    } else if filters.location == "all" {
+        conditions.push("e.label NOT IN ('spam', 'trash')".to_string());
+    }
+
     // Read matching message keys in date order and collapse them into threads
     // in Rust. This avoids SQLite building and joining multiple materialized
     // temporary tables for very broad prefixes such as "a". Most threads have
@@ -1650,12 +1853,10 @@ fn search_thread_groups_from_conn(
     // complete.
     let sql = format!(
         "SELECT e.rowid, e.account_id, e.thread_key, e.date
-         FROM email_search
-         JOIN emails e ON e.rowid = email_search.rowid
-         WHERE email_search MATCH ?
-           {account_condition}
-           AND e.label != 'draft'
-         ORDER BY e.date DESC, e.account_id ASC, e.thread_key ASC, e.rowid ASC"
+         {from_clause}
+         WHERE {}
+         ORDER BY e.date DESC, e.account_id ASC, e.thread_key ASC, e.rowid ASC",
+        conditions.join(" AND ")
     );
     let mut statement = conn.prepare(&sql)?;
     let mut rows = statement.query(rusqlite::params_from_iter(values.iter()))?;
@@ -1685,11 +1886,30 @@ fn search_thread_groups_from_conn(
     drop(rows);
     drop(statement);
 
+    let label_selection = if conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'email_labels')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap_or(false)
+    {
+        "COALESCE((
+            SELECT GROUP_CONCAT(el.label_id, char(31))
+            FROM emails tagged
+            JOIN email_labels el
+              ON el.account_id = tagged.account_id AND el.email_id = tagged.id
+            WHERE tagged.account_id = e.account_id AND tagged.thread_key = e.thread_key
+        ), '')"
+    } else {
+        "''"
+    };
     let detail_sql = format!(
         "SELECT e.id, e.thread_id, e.sender, e.recipient, e.cc, e.reply_to,
                 e.message_id, e.references_header, e.subject, e.snippet,
                 e.date, e.unread, e.label, e.account_id,
                 ts.unread_count, ts.message_count, ts.participants,
+                {label_selection},
                 COALESCE(e.body_text, '')
          FROM emails e
          JOIN thread_summaries ts
@@ -1698,11 +1918,16 @@ fn search_thread_groups_from_conn(
     );
     let mut detail_statement = conn.prepare(&detail_sql)?;
     let mut groups = Vec::with_capacity(selected_rowids.len());
+    let excerpt_query = [query.trim(), filters.includes.trim()]
+        .into_iter()
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
     for rowid in selected_rowids {
         let group = detail_statement.query_row(params![rowid], |row| {
             let mut group = map_thread_group_row(row)?;
-            let body_text: String = row.get(17)?;
-            if let Some(excerpt) = body_search_excerpt(&body_text, query) {
+            let body_text: String = row.get(18)?;
+            if let Some(excerpt) = body_search_excerpt(&body_text, &excerpt_query) {
                 group.latest_email.snippet = excerpt;
             }
             Ok(group)
@@ -1723,7 +1948,7 @@ fn get_thread_groups_from_conn(
     use rusqlite::types::Value;
 
     if let Some(query) = query {
-        return search_thread_groups_from_conn(conn, query, account_id, limit, cursor);
+        return search_thread_groups_from_conn(conn, query, None, account_id, limit, cursor);
     }
 
     let mut conditions = Vec::new();
@@ -1735,9 +1960,57 @@ fn get_thread_groups_from_conn(
         conditions.push("account_id != ''".to_string());
     }
     conditions.push("label != 'draft'".to_string());
+    let email_labels_exist = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'email_labels')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap_or(false);
     if let Some(label) = label {
-        conditions.push("label = ?".to_string());
-        values.push(Value::Text(label.to_string()));
+        if label == "all" {
+            conditions.push("label NOT IN ('spam', 'trash')".to_string());
+        } else if label == "starred" {
+            if !email_labels_exist {
+                return Ok(Vec::new());
+            }
+            conditions.push(
+                "EXISTS (
+                     SELECT 1 FROM emails starred_message
+                     JOIN email_labels starred
+                       ON starred.account_id = starred_message.account_id
+                      AND starred.email_id = starred_message.id
+                     WHERE starred_message.account_id = emails.account_id
+                       AND starred_message.thread_key = CASE
+                           WHEN emails.thread_id = '' THEN emails.id ELSE emails.thread_id
+                       END
+                       AND starred.label_id = 'STARRED'
+                 )"
+                    .to_string(),
+            );
+        } else if let Some(gmail_label_id) = label.strip_prefix("gmail:") {
+            if !email_labels_exist {
+                return Ok(Vec::new());
+            }
+            conditions.push(
+                "EXISTS (
+                     SELECT 1 FROM emails tagged_filter
+                     JOIN email_labels el
+                       ON el.account_id = tagged_filter.account_id
+                      AND el.email_id = tagged_filter.id
+                     WHERE tagged_filter.account_id = emails.account_id
+                       AND tagged_filter.thread_key = CASE
+                           WHEN emails.thread_id = '' THEN emails.id ELSE emails.thread_id
+                       END
+                       AND el.label_id = ?
+                 )"
+                    .to_string(),
+            );
+            values.push(Value::Text(gmail_label_id.to_string()));
+        } else {
+            conditions.push("label = ?".to_string());
+            values.push(Value::Text(label.to_string()));
+        }
     }
     let cursor_clause = if let Some((date, account_id, thread_id)) = cursor {
         values.push(Value::Integer(date));
@@ -1764,37 +2037,55 @@ fn get_thread_groups_from_conn(
     }
     values.push(Value::Integer(limit));
 
-    let snippet_selection = "r.snippet";
-    let grouped_cte = "SELECT account_id, thread_key, MAX(date) AS latest_date,
-                SUM(CASE WHEN unread THEN 1 ELSE 0 END) AS unread_count,
-                COUNT(*) AS message_count,
-                GROUP_CONCAT(sender, char(31)) AS participants
-         FROM filtered
-         GROUP BY account_id, thread_key";
+    let label_selection = if email_labels_exist {
+        "COALESCE((
+            SELECT GROUP_CONCAT(el.label_id, char(31))
+            FROM emails tagged
+            JOIN email_labels el
+              ON el.account_id = tagged.account_id AND el.email_id = tagged.id
+            WHERE tagged.account_id = r.account_id AND tagged.thread_key = g.thread_key
+        ), '')"
+    } else {
+        "''"
+    };
     let sql = format!(
         "WITH filtered AS (
-           SELECT {SUMMARY_COLS}, rowid AS search_rowid,
+           SELECT id, account_id, sender, date, unread,
                   CASE WHEN thread_id = '' THEN id ELSE thread_id END AS thread_key
            FROM emails
            WHERE {}
-         ), ranked AS (
-           SELECT *, ROW_NUMBER() OVER (
-             PARTITION BY account_id, thread_key ORDER BY date DESC, id ASC
-           ) AS row_number
-           FROM filtered
          ), grouped AS (
-           {grouped_cte}
+           SELECT account_id, thread_key, MAX(date) AS latest_date,
+                  SUM(CASE WHEN unread THEN 1 ELSE 0 END) AS unread_count,
+                  COUNT(*) AS message_count,
+                  GROUP_CONCAT(sender, char(31)) AS participants
+           FROM filtered
+           GROUP BY account_id, thread_key
+         ), paged AS (
+           SELECT g.*
+           FROM grouped g
+           {cursor_clause}
+           ORDER BY g.latest_date DESC, g.account_id ASC, g.thread_key ASC
+           LIMIT ?
+         ), ranked AS (
+           SELECT f.id, f.account_id, f.thread_key,
+                  ROW_NUMBER() OVER (
+                    PARTITION BY f.account_id, f.thread_key ORDER BY f.date DESC, f.id ASC
+                  ) AS row_number
+           FROM filtered f
+           JOIN paged g ON g.account_id = f.account_id AND g.thread_key = f.thread_key
          )
          SELECT r.id, r.thread_id, r.sender, r.recipient, r.cc, r.reply_to, r.message_id,
-                r.references_header, r.subject, {snippet_selection}, r.date, r.unread, r.label, r.account_id,
-                g.unread_count, g.message_count, COALESCE(g.participants, '')
-         FROM grouped g
-         JOIN ranked r ON r.account_id = g.account_id
-                      AND r.thread_key = g.thread_key
-                      AND r.row_number = 1
-         {cursor_clause}
+                r.references_header, r.subject, r.snippet, r.date, r.unread, r.label, r.account_id,
+                g.unread_count, g.message_count, COALESCE(g.participants, ''),
+                {label_selection}
+         FROM paged g
+         JOIN ranked latest ON latest.account_id = g.account_id
+                           AND latest.thread_key = g.thread_key
+                           AND latest.row_number = 1
+         JOIN emails r ON r.account_id = latest.account_id AND r.id = latest.id
          ORDER BY g.latest_date DESC, g.account_id ASC, g.thread_key ASC
-         LIMIT ?",
+         ",
         conditions.join(" AND ")
     );
     let mut statement = conn.prepare(&sql)?;
@@ -2007,6 +2298,26 @@ fn fts_match_query(query: &str) -> String {
         .join(" AND ")
 }
 
+fn fts_scoped_match_query(column: &str, query: &str) -> String {
+    query
+        .split_whitespace()
+        .filter(|term| term.chars().any(char::is_alphanumeric))
+        .take(20)
+        .map(|term| format!("{column}:\"{}\"*", term.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" AND ")
+}
+
+fn fts_any_match_query(query: &str) -> String {
+    query
+        .split_whitespace()
+        .filter(|term| term.chars().any(char::is_alphanumeric))
+        .take(20)
+        .map(|term| format!("\"{}\"*", term.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" OR ")
+}
+
 fn search_local_emails_from_conn(
     conn: &Connection,
     query: &str,
@@ -2075,6 +2386,7 @@ pub async fn search_local_thread_groups(
     app: tauri::AppHandle,
     coordinator: tauri::State<'_, SearchCoordinator>,
     query: String,
+    filters: Option<AdvancedSearchCriteria>,
     account_id: Option<String>,
     limit: Option<u32>,
     before_date: Option<i64>,
@@ -2082,7 +2394,7 @@ pub async fn search_local_thread_groups(
     before_thread_id: Option<String>,
 ) -> Result<Vec<ThreadGroup>, String> {
     crate::require_command_window(&window, &["main"])?;
-    if query.trim().is_empty() {
+    if query.trim().is_empty() && !filters.as_ref().is_some_and(AdvancedSearchCriteria::is_active) {
         return Ok(Vec::new());
     }
     let db_path = get_db_path(&app);
@@ -2107,10 +2419,10 @@ pub async fn search_local_thread_groups(
             }
             _ => None,
         };
-        let result = get_thread_groups_from_conn(
+        let result = search_thread_groups_from_conn(
             &conn,
-            None,
-            Some(&query),
+            &query,
+            filters.as_ref(),
             account_id.as_deref(),
             limit,
             cursor,
@@ -2144,6 +2456,175 @@ pub fn cancel_local_search(
     crate::require_command_window(&window, &["main"])?;
     coordinator.cancel();
     Ok(())
+}
+
+pub fn replace_gmail_labels(
+    app: &AppHandle,
+    account_id: &str,
+    account_generation: i64,
+    labels: &[GmailLabel],
+) -> Result<(), String> {
+    let db_path = get_db_path(app);
+    let mut conn = Connection::open(db_path).map_err(database_error)?;
+    let tx = conn.transaction().map_err(database_error)?;
+    ensure_account_generation(&tx, account_id, account_generation).map_err(database_error)?;
+    let mut existing_colors = std::collections::HashMap::new();
+    {
+        let mut statement = tx
+            .prepare(
+                "SELECT id, background_color, text_color FROM gmail_labels WHERE account_id = ?1",
+            )
+            .map_err(database_error)?;
+        let rows = statement
+            .query_map(params![account_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .map_err(database_error)?;
+        for row in rows.filter_map(Result::ok) {
+            existing_colors.insert(row.0, (row.1, row.2));
+        }
+    }
+    tx.execute("DELETE FROM gmail_labels WHERE account_id = ?1", params![account_id])
+        .map_err(database_error)?;
+    for label in labels {
+        let previous = existing_colors.get(&label.id);
+        let background_color = label
+            .background_color
+            .as_ref()
+            .or_else(|| previous.and_then(|colors| colors.0.as_ref()));
+        let text_color = label
+            .text_color
+            .as_ref()
+            .or_else(|| previous.and_then(|colors| colors.1.as_ref()));
+        tx.execute(
+            "INSERT INTO gmail_labels (account_id, id, name, background_color, text_color)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![account_id, label.id, label.name, background_color, text_color],
+        )
+        .map_err(database_error)?;
+    }
+    tx.execute(
+        "DELETE FROM email_labels
+         WHERE account_id = ?1 AND label_id != 'STARRED' AND label_id NOT IN (
+             SELECT id FROM gmail_labels WHERE account_id = ?1
+         )",
+        params![account_id],
+    )
+    .map_err(database_error)?;
+    tx.commit().map_err(database_error)
+}
+
+pub fn upsert_gmail_label(app: &AppHandle, label: &GmailLabel) -> Result<(), String> {
+    let db_path = get_db_path(app);
+    let conn = Connection::open(db_path).map_err(database_error)?;
+    conn.execute(
+        "INSERT INTO gmail_labels (account_id, id, name, background_color, text_color)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(account_id, id) DO UPDATE SET
+             name = excluded.name,
+             background_color = excluded.background_color,
+             text_color = excluded.text_color",
+        params![label.account_id, label.id, label.name, label.background_color, label.text_color],
+    )
+    .map_err(database_error)?;
+    Ok(())
+}
+
+pub fn delete_gmail_label_local(
+    app: &AppHandle,
+    account_id: &str,
+    label_id: &str,
+) -> Result<(), String> {
+    let db_path = get_db_path(app);
+    let mut conn = Connection::open(db_path).map_err(database_error)?;
+    let tx = conn.transaction().map_err(database_error)?;
+    tx.execute(
+        "DELETE FROM email_labels WHERE account_id = ?1 AND label_id = ?2",
+        params![account_id, label_id],
+    )
+    .map_err(database_error)?;
+    tx.execute(
+        "DELETE FROM gmail_labels WHERE account_id = ?1 AND id = ?2",
+        params![account_id, label_id],
+    )
+    .map_err(database_error)?;
+    tx.commit().map_err(database_error)
+}
+
+#[tauri::command]
+pub fn get_gmail_labels(
+    window: tauri::WebviewWindow,
+    app: tauri::AppHandle,
+    account_id: String,
+) -> Result<Vec<GmailLabel>, String> {
+    crate::require_command_window(&window, &["main"])?;
+    let db_path = get_db_path(&app);
+    let conn = Connection::open(db_path).map_err(database_error)?;
+    let mut statement = conn
+        .prepare(
+            "SELECT id, account_id, name, background_color, text_color
+             FROM gmail_labels WHERE account_id = ?1 ORDER BY name COLLATE NOCASE, id",
+        )
+        .map_err(database_error)?;
+    let labels = statement
+        .query_map(params![account_id], |row| {
+            Ok(GmailLabel {
+                id: row.get(0)?,
+                account_id: row.get(1)?,
+                name: row.get(2)?,
+                background_color: row.get(3)?,
+                text_color: row.get(4)?,
+            })
+        })
+        .map_err(database_error)?
+        .filter_map(Result::ok)
+        .collect();
+    Ok(labels)
+}
+
+pub fn set_thread_gmail_label_local(
+    app: &AppHandle,
+    account_id: &str,
+    thread_id: &str,
+    label_id: &str,
+    applied: bool,
+) -> Result<(), String> {
+    let db_path = get_db_path(app);
+    let conn = Connection::open(db_path).map_err(database_error)?;
+    if applied {
+        conn.execute(
+            "INSERT OR IGNORE INTO email_labels (account_id, email_id, label_id)
+             SELECT account_id, id, ?3 FROM emails
+             WHERE account_id = ?1 AND thread_key = ?2 AND label != 'draft'",
+            params![account_id, thread_id, label_id],
+        )
+        .map_err(database_error)?;
+    } else {
+        conn.execute(
+            "DELETE FROM email_labels
+             WHERE account_id = ?1 AND label_id = ?3 AND email_id IN (
+                 SELECT id FROM emails WHERE account_id = ?1 AND thread_key = ?2
+             )",
+            params![account_id, thread_id, label_id],
+        )
+        .map_err(database_error)?;
+    }
+    Ok(())
+}
+
+pub fn gmail_label_exists(app: &AppHandle, account_id: &str, label_id: &str) -> Result<bool, String> {
+    let db_path = get_db_path(app);
+    let conn = Connection::open(db_path).map_err(database_error)?;
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM gmail_labels WHERE account_id = ?1 AND id = ?2)",
+        params![account_id, label_id],
+        |row| row.get(0),
+    )
+    .map_err(database_error)
 }
 
 #[tauri::command]
@@ -2251,6 +2732,20 @@ pub fn mark_thread_as_unread_local(app: &AppHandle, thread_id: &str, account_id:
     let tx = conn.transaction().map_err(database_error)?;
     tx.execute(
         "UPDATE emails SET unread = 1 WHERE thread_key = ?1 AND account_id = ?2 AND label != 'draft'",
+        params![thread_id, account_id],
+    )
+    .map_err(database_error)?;
+    refresh_thread_summary(&tx, account_id, thread_id).map_err(database_error)?;
+    tx.commit().map_err(database_error)?;
+    Ok(())
+}
+
+pub fn mark_thread_as_read_local(app: &AppHandle, thread_id: &str, account_id: &str) -> Result<(), String> {
+    let db_path = get_db_path(app);
+    let mut conn = Connection::open(db_path).map_err(database_error)?;
+    let tx = conn.transaction().map_err(database_error)?;
+    tx.execute(
+        "UPDATE emails SET unread = 0 WHERE thread_key = ?1 AND account_id = ?2 AND label != 'draft'",
         params![thread_id, account_id],
     )
     .map_err(database_error)?;
@@ -3325,6 +3820,98 @@ mod tests {
     }
 
     #[test]
+    fn advanced_search_combines_structured_local_filters() {
+        assert!(!AdvancedSearchCriteria::default().is_active());
+        let conn = Connection::open_in_memory().expect("open in-memory database");
+        conn.execute_batch(
+            "CREATE TABLE emails (
+                id TEXT, thread_id TEXT, thread_key TEXT, sender TEXT, recipient TEXT, cc TEXT,
+                subject TEXT, snippet TEXT, body_text TEXT, date INTEGER,
+                unread BOOLEAN, label TEXT, account_id TEXT,
+                reply_to TEXT DEFAULT '', message_id TEXT DEFAULT '',
+                references_header TEXT DEFAULT ''
+             );
+             CREATE VIRTUAL TABLE email_search USING fts5(
+                sender, recipient, cc, subject, snippet, body_text,
+                content='emails', content_rowid='rowid'
+             );
+             CREATE TABLE thread_summaries (
+                account_id TEXT, thread_key TEXT, latest_email_id TEXT, latest_date INTEGER,
+                unread_count INTEGER, message_count INTEGER, participants TEXT,
+                PRIMARY KEY (account_id, thread_key)
+             );
+             CREATE TABLE attachments (id TEXT, email_id TEXT, account_id TEXT);
+             CREATE TABLE email_labels (account_id TEXT, email_id TEXT, label_id TEXT);
+             INSERT INTO emails (id, thread_id, thread_key, sender, recipient, cc, subject, snippet, body_text, date, unread, label, account_id) VALUES
+               ('match', 'thread-match', 'thread-match', 'Alice <alice@example.test>', 'me@example.test', '', 'Quarterly plan', '', 'green budget notes', 2000, 1, 'inbox', 'account-a'),
+               ('other', 'thread-other', 'thread-other', 'Bob <bob@example.test>', 'me@example.test', '', 'Quarterly plan', '', 'red budget notes', 2100, 1, 'inbox', 'account-a');
+             INSERT INTO thread_summaries VALUES
+               ('account-a', 'thread-match', 'match', 2000, 1, 1, 'Alice'),
+               ('account-a', 'thread-other', 'other', 2100, 1, 1, 'Bob');
+             INSERT INTO attachments VALUES ('attachment', 'match', 'account-a');
+             INSERT INTO email_labels VALUES ('account-a', 'match', 'STARRED');
+             INSERT INTO email_search(email_search) VALUES('rebuild');",
+        )
+        .expect("seed advanced search cache");
+
+        let filters = AdvancedSearchCriteria {
+            from: "alice".to_string(),
+            includes: "budget".to_string(),
+            excludes: "red".to_string(),
+            after_date: Some(1000),
+            before_date: Some(3000),
+            location: "inbox".to_string(),
+            has_attachment: true,
+            unread: true,
+            starred: true,
+            ..AdvancedSearchCriteria::default()
+        };
+        let results = search_thread_groups_from_conn(
+            &conn,
+            "",
+            Some(&filters),
+            Some("account-a"),
+            20,
+            None,
+        )
+        .expect("run advanced search");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].latest_email.id, "match");
+
+        let subject_exclusion = AdvancedSearchCriteria {
+            excludes: "quarterly".to_string(),
+            ..AdvancedSearchCriteria::default()
+        };
+        assert!(search_thread_groups_from_conn(
+            &conn,
+            "",
+            Some(&subject_exclusion),
+            Some("account-a"),
+            20,
+            None,
+        )
+        .expect("exclude a subject term")
+        .is_empty());
+
+        let sender_exclusion = AdvancedSearchCriteria {
+            excludes: "alice".to_string(),
+            ..AdvancedSearchCriteria::default()
+        };
+        let without_alice = search_thread_groups_from_conn(
+            &conn,
+            "",
+            Some(&sender_exclusion),
+            Some("account-a"),
+            20,
+            None,
+        )
+        .expect("exclude a sender term");
+        assert_eq!(without_alice.len(), 1);
+        assert_eq!(without_alice[0].latest_email.id, "other");
+    }
+
+    #[test]
     fn thread_summary_refresh_tracks_latest_counts_and_participants() {
         let conn = Connection::open_in_memory().expect("open in-memory database");
         conn.execute_batch(
@@ -3402,12 +3989,16 @@ mod tests {
                 ('t2', 'thread-2', 'thread-2', 'Carol <carol@example.test>', '', '', 'Second', '', '', 30, 1, 'inbox', 'account-a'),
                 ('t3', 'thread-3', 'thread-3', 'Dave <dave@example.test>', '', '', 'Third', '', '', 20, 0, 'inbox', 'account-a'),
                 ('draft', 'thread-3', 'thread-3', 'Me <me@example.test>', '', '', 'Draft reply', '', '', 25, 0, 'draft', 'account-a'),
-                ('sent', 'thread-4', 'thread-4', 'Eve', '', '', 'Sent', '', '', 50, 1, 'sent', 'account-a');
+                ('sent', 'thread-4', 'thread-4', 'Eve', '', '', 'Sent', '', '', 50, 1, 'sent', 'account-a'),
+                ('spam', 'thread-5', 'thread-5', 'Spam', '', '', 'Spam', '', '', 60, 1, 'spam', 'account-a'),
+                ('trash', 'thread-6', 'thread-6', 'Trash', '', '', 'Trash', '', '', 55, 0, 'trash', 'account-a');
              INSERT INTO thread_summaries VALUES
                 ('account-a', 'thread-1', 't1-new', 40, 1, 2, 'Alice <alice@example.test>' || char(31) || 'Bob <bob@example.test>'),
                 ('account-a', 'thread-2', 't2', 30, 1, 1, 'Carol <carol@example.test>'),
                 ('account-a', 'thread-3', 't3', 20, 0, 1, 'Dave <dave@example.test>'),
-                ('account-a', 'thread-4', 'sent', 50, 1, 1, 'Eve');
+                ('account-a', 'thread-4', 'sent', 50, 1, 1, 'Eve'),
+                ('account-a', 'thread-5', 'spam', 60, 1, 1, 'Spam'),
+                ('account-a', 'thread-6', 'trash', 55, 0, 1, 'Trash');
              INSERT INTO email_search(email_search) VALUES('rebuild');",
         )
         .expect("seed conversation summaries");
@@ -3445,6 +4036,20 @@ mod tests {
         .expect("load second conversation page");
         assert_eq!(second.iter().map(|group| group.latest_email.id.as_str()).collect::<Vec<_>>(), ["t3"]);
 
+        let all_mail = get_thread_groups_from_conn(
+            &conn,
+            Some("all"),
+            None,
+            Some("account-a"),
+            20,
+            None,
+        )
+        .expect("load all mail without spam, trash, or drafts");
+        assert_eq!(
+            all_mail.iter().map(|group| group.latest_email.id.as_str()).collect::<Vec<_>>(),
+            ["sent", "t1-new", "t2", "t3"],
+        );
+
         let drafts = get_thread_groups_from_conn(
             &conn,
             None,
@@ -3455,6 +4060,42 @@ mod tests {
         )
         .expect("search conversations without draft cards");
         assert!(drafts.is_empty());
+
+        conn.execute_batch(
+            "CREATE TABLE email_labels (
+                 account_id TEXT, email_id TEXT, label_id TEXT
+             );
+             INSERT INTO email_labels VALUES
+                 ('account-a', 't1-old', 'Label_9'),
+                 ('account-a', 't1-new', 'Label_9'),
+                 ('account-a', 't2', 'STARRED');",
+        )
+        .expect("seed Gmail labels");
+        let labeled = get_thread_groups_from_conn(
+            &conn,
+            Some("gmail:Label_9"),
+            None,
+            Some("account-a"),
+            10,
+            None,
+        )
+        .expect("filter conversations by Gmail label");
+        assert_eq!(labeled.len(), 1);
+        assert_eq!(labeled[0].latest_email.id, "t1-new");
+        assert_eq!(labeled[0].label_ids, ["Label_9"]);
+
+        let starred = get_thread_groups_from_conn(
+            &conn,
+            Some("starred"),
+            None,
+            Some("account-a"),
+            10,
+            None,
+        )
+        .expect("filter starred conversations");
+        assert_eq!(starred.len(), 1);
+        assert_eq!(starred[0].latest_email.id, "t2");
+        assert_eq!(starred[0].label_ids, ["STARRED"]);
     }
 
     #[test]

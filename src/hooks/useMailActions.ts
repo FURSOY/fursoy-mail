@@ -344,22 +344,28 @@ export function useMailActions(options: UseMailActionsOptions) {
 
   const handleMarkAsUnread = useCallback(async (mail: EmailSummary) => {
     if (!getTokenForEmail(mail)) return;
+    const unreadDelta = mail.unread ? 0 : 1;
     recentlyReadRef.current.delete(emailKey(mail));
     setEmails(previous => previous.map(email => sameEmail(email, mail) ? { ...email, unread: true } : email));
-    adjustUnreadBadge(mail.account_id, 1);
+    if (unreadDelta) adjustUnreadBadge(mail.account_id, unreadDelta);
+    // Leave the reader before refreshing the thread. An open reader marks its
+    // loaded messages as read, which can otherwise immediately undo this action.
+    setSelectedMail(null);
     try {
       await enqueueMailMutation(
         mailMutationQueueRef.current,
         emailKey(mail),
         () => runAuthenticatedAction(mail, () => tauriApi.markAsUnread(mail.account_id, mail.thread_id || mail.id)),
       );
+      await loadEmails(activeTabRef.current);
+      await refreshUnreadCount();
     } catch (error) {
       console.error("Mark email as unread failed:", error);
-      adjustUnreadBadge(mail.account_id, -1);
+      if (unreadDelta) adjustUnreadBadge(mail.account_id, -unreadDelta);
       showToast(actionFailureMessage(locale.messages.operationFailed, error), "error");
       void loadEmails(activeTabRef.current);
     }
-  }, [activeTabRef, adjustUnreadBadge, getTokenForEmail, loadEmails, locale, recentlyReadRef, runAuthenticatedAction, setEmails, showToast]);
+  }, [activeTabRef, adjustUnreadBadge, getTokenForEmail, loadEmails, locale, recentlyReadRef, refreshUnreadCount, runAuthenticatedAction, setEmails, setSelectedMail, showToast]);
 
   const handleForward = useCallback(async (mail: EmailSummary) => {
     const exactBody = await tauriApi.getEmailBody(mail.id, mail.account_id).catch(() => mail.snippet);

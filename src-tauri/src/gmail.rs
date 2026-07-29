@@ -3,7 +3,9 @@ use crate::db::{
     get_active_full_sync, get_all_mailbox_sync_states, get_history_id, get_mailbox_cursor_state,
     get_mailbox_sync_state, has_pending_mailbox_pages, load_tokens, next_full_sync_generation,
     set_gmail_inbox_unread_stats, set_history_id, set_mailbox_cursor, set_mailbox_sync_state,
-    upsert_sync_mail_batch, Email, EmailSummary,
+    delete_gmail_label_local, gmail_label_exists, replace_gmail_labels,
+    set_thread_gmail_label_local, upsert_gmail_label,
+    upsert_sync_mail_batch, Email, EmailSummary, GmailLabel,
 };
 use base64::Engine;
 use futures::stream::{self, StreamExt, TryStreamExt};
@@ -242,12 +244,122 @@ async fn get_inbox_unread_stats(
     res.json().await.map_err(|e| e.to_string())
 }
 
+async fn sync_gmail_labels(
+    app: &AppHandle,
+    account_id: &str,
+    account_generation: i64,
+    client: &Client,
+    access_token: &str,
+) -> Result<(), String> {
+    let res = gmail_get_with_retry(
+        client,
+        access_token,
+        "https://gmail.googleapis.com/gmail/v1/users/me/labels".to_string(),
+        "Label list fetch error",
+    )
+    .await?;
+    if !res.status().is_success() {
+        return Err(format!("Label list API error: {}", res.status()));
+    }
+    let response: GmailLabelListResponse = res.json().await.map_err(|e| e.to_string())?;
+    let labels: Vec<GmailLabel> = response
+        .labels
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|label| label.label_type.as_deref() == Some("user"))
+        .map(|label| GmailLabel {
+            id: label.id,
+            account_id: account_id.to_string(),
+            name: label.name,
+            background_color: label.color.as_ref().and_then(|color| color.background_color.clone()),
+            text_color: label.color.and_then(|color| color.text_color),
+        })
+        .collect();
+    replace_gmail_labels(app, account_id, account_generation, &labels)
+}
+
+fn window_state_allows_label_sync(
+    visible: Option<bool>,
+    minimized: Option<bool>,
+    focused: Option<bool>,
+) -> bool {
+    visible.unwrap_or(true) && !minimized.unwrap_or(false) && focused.unwrap_or(true)
+}
+
+fn should_sync_gmail_labels(app: &AppHandle) -> bool {
+    let Some(window) = app.get_webview_window("main") else {
+        return true;
+    };
+    window_state_allows_label_sync(
+        window.is_visible().ok(),
+        window.is_minimized().ok(),
+        window.is_focused().ok(),
+    )
+}
+
 // ── Fetch history changes since a given historyId ──
 struct HistoryPage {
     fetch_ids: Vec<String>,
     delete_ids: Vec<String>,
     next_page_token: Option<String>,
     latest_history_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct GmailLabelListResponse {
+    labels: Option<Vec<GmailLabelApi>>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GmailLabelApi {
+    id: String,
+    name: String,
+    #[serde(rename = "type")]
+    label_type: Option<String>,
+    color: Option<GmailLabelColor>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GmailLabelColor {
+    background_color: Option<String>,
+    text_color: Option<String>,
+}
+
+const GMAIL_LABEL_COLOR_PAIRS: &[(&str, &str)] = &[
+    ("#000000", "#ffffff"),
+    ("#434343", "#ffffff"),
+    ("#666666", "#ffffff"),
+    ("#999999", "#ffffff"),
+    ("#cccccc", "#000000"),
+    ("#efefef", "#000000"),
+    ("#fb4c2f", "#ffffff"),
+    ("#ffad47", "#000000"),
+    ("#fad165", "#000000"),
+    ("#16a766", "#ffffff"),
+    ("#43d692", "#000000"),
+    ("#4a86e8", "#ffffff"),
+    ("#a479e2", "#ffffff"),
+    ("#f691b3", "#000000"),
+    ("#e66550", "#ffffff"),
+    ("#285bac", "#ffffff"),
+];
+
+fn gmail_label_from_api(account_id: &str, label: GmailLabelApi) -> GmailLabel {
+    GmailLabel {
+        id: label.id,
+        account_id: account_id.to_string(),
+        name: label.name,
+        background_color: label.color.as_ref().and_then(|color| color.background_color.clone()),
+        text_color: label.color.and_then(|color| color.text_color),
+    }
+}
+
+fn gmail_label_color_allowed(background_color: &str, text_color: &str) -> bool {
+    GMAIL_LABEL_COLOR_PAIRS
+        .iter()
+        .any(|pair| pair.0 == background_color && pair.1 == text_color)
 }
 
 async fn fetch_history_page(
@@ -656,6 +768,7 @@ fn parse_message_detail(detail: MessageDetail) -> (Email, Vec<crate::db::Attachm
         date: date_i64,
         unread: is_unread,
         label,
+        gmail_label_ids: labels,
     };
 
     (email, attachments)
@@ -820,6 +933,16 @@ async fn run_sync_cycle(
     loop {
         if get_active_full_sync(app, account_id)?.is_some() {
             return Ok(token);
+        }
+        // Mail and notification synchronization must keep running in the tray,
+        // but refreshing the user-label catalog is only useful while the main
+        // window can display it.
+        if should_sync_gmail_labels(app) {
+            let label_client = Client::builder()
+                .timeout(std::time::Duration::from_secs(15))
+                .build()
+                .unwrap_or_default();
+            sync_gmail_labels(app, account_id, account_generation, &label_client, &token).await?;
         }
         let history_id = get_history_id(app, account_id);
         if let Some(history_id) = history_id {
@@ -1241,6 +1364,206 @@ pub async fn archive_email(
     }
 
     Ok(())
+}
+
+#[tauri::command]
+pub async fn create_gmail_label(
+    window: tauri::WebviewWindow,
+    app: AppHandle,
+    account_id: String,
+    name: String,
+) -> Result<GmailLabel, String> {
+    crate::require_command_window(&window, &["main"])?;
+    let name = name.trim();
+    if name.is_empty() || name.chars().count() > 225 {
+        return Err("Label name must contain between 1 and 225 characters.".to_string());
+    }
+    let access_token = crate::db::load_account_access_token(&account_id)?;
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap_or_default();
+    let response = client
+        .post("https://gmail.googleapis.com/gmail/v1/users/me/labels")
+        .bearer_auth(&access_token)
+        .json(&serde_json::json!({
+            "name": name,
+            "labelListVisibility": "labelShow",
+            "messageListVisibility": "show"
+        }))
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    if !response.status().is_success() {
+        return Err(format!("Gmail label creation error (HTTP {}).", response.status()));
+    }
+    let created: GmailLabelApi = response.json().await.map_err(|error| error.to_string())?;
+    let label = gmail_label_from_api(&account_id, created);
+    upsert_gmail_label(&app, &label)?;
+    Ok(label)
+}
+
+#[tauri::command]
+pub async fn rename_gmail_label(
+    window: tauri::WebviewWindow,
+    app: AppHandle,
+    account_id: String,
+    label_id: String,
+    name: String,
+) -> Result<GmailLabel, String> {
+    crate::require_command_window(&window, &["main"])?;
+    validate_gmail_identifier("label ID", &label_id)?;
+    if !gmail_label_exists(&app, &account_id, &label_id)? {
+        return Err("The selected Gmail label is not available for this account.".to_string());
+    }
+    let name = name.trim();
+    if name.is_empty() || name.chars().count() > 225 {
+        return Err("Label name must contain between 1 and 225 characters.".to_string());
+    }
+    let access_token = crate::db::load_account_access_token(&account_id)?;
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap_or_default();
+    let response = client
+        .patch(format!(
+            "https://gmail.googleapis.com/gmail/v1/users/me/labels/{}",
+            label_id
+        ))
+        .bearer_auth(&access_token)
+        .json(&serde_json::json!({ "name": name }))
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    if !response.status().is_success() {
+        return Err(format!("Gmail label rename error (HTTP {}).", response.status()));
+    }
+    let updated = gmail_label_from_api(
+        &account_id,
+        response.json::<GmailLabelApi>().await.map_err(|error| error.to_string())?,
+    );
+    upsert_gmail_label(&app, &updated)?;
+    Ok(updated)
+}
+
+#[tauri::command]
+pub async fn set_gmail_label_color(
+    window: tauri::WebviewWindow,
+    app: AppHandle,
+    account_id: String,
+    label_id: String,
+    background_color: Option<String>,
+    text_color: Option<String>,
+) -> Result<GmailLabel, String> {
+    crate::require_command_window(&window, &["main"])?;
+    validate_gmail_identifier("label ID", &label_id)?;
+    if !gmail_label_exists(&app, &account_id, &label_id)? {
+        return Err("The selected Gmail label is not available for this account.".to_string());
+    }
+    let color = match (background_color, text_color) {
+        (None, None) => serde_json::Value::Null,
+        (Some(background), Some(text)) if gmail_label_color_allowed(&background, &text) => {
+            serde_json::json!({ "backgroundColor": background, "textColor": text })
+        }
+        _ => return Err("Unsupported Gmail label color.".to_string()),
+    };
+    let access_token = crate::db::load_account_access_token(&account_id)?;
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap_or_default();
+    let response = client
+        .patch(format!(
+            "https://gmail.googleapis.com/gmail/v1/users/me/labels/{}",
+            label_id
+        ))
+        .bearer_auth(&access_token)
+        .json(&serde_json::json!({ "color": color }))
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    if !response.status().is_success() {
+        return Err(format!("Gmail label color error (HTTP {}).", response.status()));
+    }
+    let updated = gmail_label_from_api(
+        &account_id,
+        response.json::<GmailLabelApi>().await.map_err(|error| error.to_string())?,
+    );
+    upsert_gmail_label(&app, &updated)?;
+    Ok(updated)
+}
+
+#[tauri::command]
+pub async fn delete_gmail_label(
+    window: tauri::WebviewWindow,
+    app: AppHandle,
+    account_id: String,
+    label_id: String,
+) -> Result<(), String> {
+    crate::require_command_window(&window, &["main"])?;
+    validate_gmail_identifier("label ID", &label_id)?;
+    if !gmail_label_exists(&app, &account_id, &label_id)? {
+        return Err("The selected Gmail label is not available for this account.".to_string());
+    }
+    let access_token = crate::db::load_account_access_token(&account_id)?;
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap_or_default();
+    let response = client
+        .delete(format!(
+            "https://gmail.googleapis.com/gmail/v1/users/me/labels/{}",
+            label_id
+        ))
+        .bearer_auth(&access_token)
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    if !response.status().is_success() {
+        return Err(format!("Gmail label delete error (HTTP {}).", response.status()));
+    }
+    delete_gmail_label_local(&app, &account_id, &label_id)
+}
+
+#[tauri::command]
+pub async fn set_thread_gmail_label(
+    window: tauri::WebviewWindow,
+    app: AppHandle,
+    account_id: String,
+    thread_id: String,
+    label_id: String,
+    applied: bool,
+) -> Result<(), String> {
+    crate::require_command_window(&window, &["main"])?;
+    validate_gmail_identifier("thread ID", &thread_id)?;
+    validate_gmail_identifier("label ID", &label_id)?;
+    if label_id != "STARRED" && !gmail_label_exists(&app, &account_id, &label_id)? {
+        return Err("The selected Gmail label is not available for this account.".to_string());
+    }
+    let access_token = crate::db::load_account_access_token(&account_id)?;
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap_or_default();
+    let body = if applied {
+        serde_json::json!({ "addLabelIds": [label_id] })
+    } else {
+        serde_json::json!({ "removeLabelIds": [label_id] })
+    };
+    let response = client
+        .post(format!(
+            "https://gmail.googleapis.com/gmail/v1/users/me/threads/{}/modify",
+            thread_id
+        ))
+        .bearer_auth(&access_token)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    if !response.status().is_success() {
+        return Err(format!("Gmail label update error (HTTP {}).", response.status()));
+    }
+    set_thread_gmail_label_local(&app, &account_id, &thread_id, &label_id, applied)
 }
 
 #[tauri::command]
@@ -2521,6 +2844,55 @@ pub async fn mark_as_read(
 }
 
 #[tauri::command]
+pub async fn mark_thread_as_read(
+    window: tauri::WebviewWindow,
+    app: AppHandle,
+    account_id: String,
+    thread_id: String,
+) -> Result<(), String> {
+    crate::require_command_window(&window, &["main"])?;
+    let access_token = crate::db::load_account_access_token(&account_id)?;
+    validate_gmail_identifier("thread ID", &thread_id)?;
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap_or_default();
+    let url = format!(
+        "https://gmail.googleapis.com/gmail/v1/users/me/threads/{}/modify",
+        thread_id
+    );
+    let body = serde_json::json!({
+        "removeLabelIds": ["UNREAD"]
+    });
+
+    let res = client
+        .post(&url)
+        .bearer_auth(&access_token)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if !res.status().is_success() {
+        return Err(format!(
+            "Gmail mark thread as read error (HTTP {}).",
+            res.status()
+        ));
+    }
+
+    if let Err(error) = crate::db::mark_thread_as_read_local(&app, &thread_id, &account_id) {
+        if let Err(sync_error) = sync_emails(window, app, account_id, Some(true)).await {
+            eprintln!("[MAIL_CACHE] thread read-state reconciliation failed: {sync_error}");
+        }
+        return Err(format!(
+            "Gmail konuşmayı okundu yaptı ancak yerel önbellek güncellenemedi: {error}"
+        ));
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
 pub async fn mark_as_unread(
     window: tauri::WebviewWindow,
     app: AppHandle,
@@ -2864,12 +3236,13 @@ pub async fn save_and_reveal_attachment(
 mod tests {
     use super::{
         build_raw_mime, build_reply_references, determine_label, execute_send,
-        generate_outbound_message_id, gmail_get_with_retry, gmail_retry_delay, gmail_trash_request,
-        is_retryable_gmail_status, mailbox_failure_status, parse_message_detail,
-        parse_retry_after_delay, safe_attachment_filename, validate_draft_recipient_header,
-        validate_optional_recipient_header, validate_outbound_message_id,
-        validate_recipient_header, AttachmentPayload, DraftListResponse, GmailLabelStats,
-        MessageDetail, SendAttempt, GMAIL_GET_MAX_RETRY_AFTER_SECS,
+        generate_outbound_message_id, gmail_get_with_retry, gmail_label_color_allowed,
+        gmail_retry_delay, gmail_trash_request, is_retryable_gmail_status, mailbox_failure_status,
+        parse_message_detail, parse_retry_after_delay, safe_attachment_filename,
+        validate_draft_recipient_header, validate_optional_recipient_header,
+        validate_outbound_message_id, validate_recipient_header, window_state_allows_label_sync,
+        AttachmentPayload, DraftListResponse, GmailLabelStats, MessageDetail, SendAttempt,
+        GMAIL_GET_MAX_RETRY_AFTER_SECS,
     };
     use reqwest::{Client, StatusCode};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2879,6 +3252,39 @@ mod tests {
         assert!(validate_optional_recipient_header("").is_ok());
         assert!(validate_optional_recipient_header("person@example.test").is_ok());
         assert!(validate_optional_recipient_header("not-an-address").is_err());
+    }
+
+    #[test]
+    fn label_colors_are_limited_to_supported_gmail_pairs() {
+        assert!(gmail_label_color_allowed("#4a86e8", "#ffffff"));
+        assert!(gmail_label_color_allowed("#fad165", "#000000"));
+        assert!(!gmail_label_color_allowed("#4a86e8", "#000000"));
+        assert!(!gmail_label_color_allowed("#123456", "#ffffff"));
+    }
+
+    #[test]
+    fn label_catalog_sync_runs_only_for_an_active_window() {
+        assert!(window_state_allows_label_sync(
+            Some(true),
+            Some(false),
+            Some(true)
+        ));
+        assert!(!window_state_allows_label_sync(
+            Some(false),
+            Some(false),
+            Some(true)
+        ));
+        assert!(!window_state_allows_label_sync(
+            Some(true),
+            Some(true),
+            Some(true)
+        ));
+        assert!(!window_state_allows_label_sync(
+            Some(true),
+            Some(false),
+            Some(false)
+        ));
+        assert!(window_state_allows_label_sync(None, None, None));
     }
 
     #[test]
@@ -2901,7 +3307,7 @@ mod tests {
     fn message_parser_preserves_rfc_reply_headers() {
         let detail: MessageDetail = serde_json::from_str(r#"{
           "id":"gmail-message", "threadId":"gmail-thread", "snippet":"hello",
-          "internalDate":"123", "labelIds":["INBOX"],
+          "internalDate":"123", "labelIds":["INBOX","Label_9"],
           "payload":{"headers":[
             {"name":"From","value":"Alice <alice@example.test>"},
             {"name":"To","value":"Me <me@example.test>"},
@@ -2915,6 +3321,7 @@ mod tests {
         assert_eq!(email.reply_to, "Help <help@example.test>");
         assert_eq!(email.message_id, "<child@example.test>");
         assert_eq!(email.references, "<root@example.test>");
+        assert_eq!(email.gmail_label_ids, vec!["INBOX", "Label_9"]);
     }
 
     #[test]

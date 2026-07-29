@@ -9,15 +9,21 @@ import {
 import { LocaleContext, locales, type AppLanguage } from "./i18n";
 import { surfaces, themePresets, type ThemePresetName } from "./theme";
 import "./index.css";
+import { normalizeSyncIntervalSeconds } from "./syncInterval";
+import { readMailListCache, writeMailListCache, type MailListCache } from "./mailListCache";
+import {
+  advancedSearchKey, createEmptyAdvancedSearch, isAdvancedSearchActive, searchSidebarTab,
+  type AdvancedSearchCriteria,
+} from "./advancedSearch";
 
 import {
   type EmailSummary, type ThreadGroup, type AppControls, type OtpMode, type RenderMode,
   type MailZoom, type DensityMode, type MailViewMode, type MailViewPreference,
-  type RemoteImageMode, DEFAULT_APP_CONTROLS,
+  type RemoteImageMode, type GmailLabel, DEFAULT_APP_CONTROLS,
 } from "./types";
 import {
   MAIL_TABS, STARTUP_NETWORK_DELAY_MS,
-  MAX_LABEL_CACHE, MAIL_PAGE_SIZE, ZOOM_STEPS,
+  MAX_MAIL_LIST_CACHE_ENTRIES, MAIL_PAGE_SIZE, ZOOM_STEPS,
   isAuthFailure, extractVerificationCode,
   readMailZoom, readThemePreset, getAutoMailViewMode, parseMailtoUrl,
 } from "./utils";
@@ -25,7 +31,7 @@ import { addBoundedSetValue, MAX_RECENTLY_READ_EMAILS, MAX_REMOTE_IMAGE_EMAILS }
 
 import { Sidebar } from "./components/Sidebar";
 import { Onboarding } from "./components/Onboarding";
-import { EmailList } from "./components/EmailList";
+import { EmailList, type BulkMailAction } from "./components/EmailList";
 import { EmailReader } from "./components/EmailReader";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { ComposeModal } from "./components/ComposeModal";
@@ -38,7 +44,7 @@ import { useMailSync } from "./hooks/useMailSync";
 import { useMailActions } from "./hooks/useMailActions";
 import { useMailReader } from "./hooks/useMailReader";
 import { tauriApi, type MailboxDownloadStatus } from "./tauriApi";
-import { enqueueMailMutation, type MailMutationQueue } from "./mailActionState";
+import { enqueueMailMutation, runAuthenticatedMailAction, type MailMutationQueue } from "./mailActionState";
 
 function readTrustedImageSenders(): Record<string, string[]> {
   try {
@@ -72,6 +78,20 @@ function threadKey(group: ThreadGroup): string {
   return `${email.account_id}\u0000${email.thread_id || email.id}`;
 }
 
+function isMailView(value: string): boolean {
+  return MAIL_TABS.has(value) || value.startsWith("gmail:");
+}
+
+function updateGroupLabel(group: ThreadGroup, mail: EmailSummary, labelId: string, applied: boolean): ThreadGroup {
+  const groupThreadId = group.latestEmail.thread_id || group.latestEmail.id;
+  const mailThreadId = mail.thread_id || mail.id;
+  if (group.latestEmail.account_id !== mail.account_id || groupThreadId !== mailThreadId) return group;
+  const labelIds = applied
+    ? [...new Set([...group.labelIds, labelId])]
+    : group.labelIds.filter(id => id !== labelId);
+  return { ...group, labelIds };
+}
+
 function applyRecentlyRead(group: ThreadGroup, recentlyRead: Set<string>): ThreadGroup {
   if (!recentlyRead.has(emailKey(group.latestEmail))) return group;
   const unreadCount = group.latestEmail.unread ? Math.max(0, group.unreadCount - 1) : group.unreadCount;
@@ -98,16 +118,17 @@ function sameEmail(left: EmailSummary, right: EmailSummary): boolean {
   return left.id === right.id && left.account_id === right.account_id;
 }
 
+const BULK_MAIL_ACTION_CONCURRENCY = 6;
+
 function App() {
-  const [activeTab, setActiveTab] = useState<"inbox" | "sent" | "archive" | "spam" | "trash" | "settings">("inbox");
+  const [activeTab, setActiveTab] = useState<string>("inbox");
   const [selectedMail, setSelectedMail] = useState<string | null>(null);
   const [authStatus, setAuthStatus] = useState<string>("");
 
   // Settings
   const [syncIntervalValue, setSyncIntervalValue] = useState(() => {
     const saved = localStorage.getItem("fursoy_sync_interval");
-    const parsed = saved ? parseInt(saved, 10) : 30;
-    return Number.isFinite(parsed) ? Math.max(15, parsed) : 30;
+    return normalizeSyncIntervalSeconds(saved);
   });
   const [notifDuration, setNotifDuration] = useState(() => {
     const saved = localStorage.getItem("fursoy_notif_duration");
@@ -154,6 +175,7 @@ function App() {
   const [singlePanelView, setSinglePanelView] = useState<"list" | "reader">("list");
   const [emails, setEmails] = useState<EmailSummary[]>([]);
   const [mailThreadGroups, setMailThreadGroups] = useState<ThreadGroup[]>([]);
+  const [gmailLabelsByAccount, setGmailLabelsByAccount] = useState<Record<string, GmailLabel[]>>({});
   const {
     accounts, accountsLoaded, isConnecting, accountTokens, activeAccountId,
     tokenExpired, expiredAccountIds,
@@ -163,7 +185,9 @@ function App() {
   } = useAccounts();
 
   const [searchQuery, setSearchQuery] = useState("");
+  const [advancedSearch, setAdvancedSearch] = useState<AdvancedSearchCriteria>(createEmptyAdvancedSearch);
   const [activeSearchQuery, setActiveSearchQuery] = useState("");
+  const [activeAdvancedSearch, setActiveAdvancedSearch] = useState<AdvancedSearchCriteria>(createEmptyAdvancedSearch);
   const [isSearchLoading, setIsSearchLoading] = useState(false);
   const [searchFailed, setSearchFailed] = useState(false);
   const [searchSubmitVersion, setSearchSubmitVersion] = useState(0);
@@ -172,6 +196,7 @@ function App() {
   const [searchThreadGroups, setSearchThreadGroups] = useState<ThreadGroup[] | null>(null);
   const [hasMoreEmails, setHasMoreEmails] = useState(true);
   const [isLoadingMoreEmails, setIsLoadingMoreEmails] = useState(false);
+  const [isMailListLoading, setIsMailListLoading] = useState(false);
   const [mailAppendVersion, setMailAppendVersion] = useState(0);
   const [notificationFocusVersion, setNotificationFocusVersion] = useState(0);
   const [isMailboxBackfilling, setIsMailboxBackfilling] = useState(false);
@@ -201,14 +226,17 @@ function App() {
   const notificationBaselineEpochRef = useRef(0);
   const recentlyReadRef = useRef<Set<string>>(new Set());
   const mailMutationQueueRef = useRef<MailMutationQueue>(new Map());
+  const pendingStarMutationsRef = useRef<Set<string>>(new Set());
   const pendingUnreadBadgeDeltasRef = useRef<Map<string, { delta: number; expiresAt: number }>>(new Map());
   const mailPageCursorRef = useRef<ThreadGroup | null>(null);
   const mailListRequestIdRef = useRef(0);
   const searchRequestIdRef = useRef(0);
   const activeSearchQueryRef = useRef("");
+  const activeAdvancedSearchRef = useRef<AdvancedSearchCriteria>(createEmptyAdvancedSearch());
   const handledSearchSubmitVersionRef = useRef(0);
   const isLoadingMoreEmailsRef = useRef(false);
-  const tabEmailCacheRef = useRef<Partial<Record<string, ThreadGroup[]>>>({});
+  const tabEmailCacheRef = useRef<MailListCache>({});
+  const mailListLoadingTimerRef = useRef<number | null>(null);
   const [, startTabTransition] = useTransition();
   const [, startDataTransition] = useTransition();
   const activeTabRef = useRef(activeTab);
@@ -376,7 +404,6 @@ function App() {
       if (!messageId || !accountId) return;
       if (accountId && accountId !== activeAccountIdRef.current) {
         selectAccount(accountId);
-        tabEmailCacheRef.current = {};
       }
       setMobileMenuOpen(false);
       setSinglePanelView("reader");
@@ -436,7 +463,7 @@ function App() {
   const loadEmails = async (tab?: string, options?: { append?: boolean; cursor?: ThreadGroup | null }) => {
     try {
       const label = tab || activeTabRef.current;
-      if (!MAIL_TABS.has(label)) {
+      if (!isMailView(label)) {
         startDataTransition(() => setEmails([]));
         setMailThreadGroups([]);
         return [];
@@ -463,17 +490,12 @@ function App() {
         mailPageCursorRef.current = adjusted[adjusted.length - 1];
       }
       const cacheKey = mailCacheKey(label, accountId);
-      const cachedGroups = tabEmailCacheRef.current[cacheKey] ?? [];
+      const cachedGroups = readMailListCache(tabEmailCacheRef.current, cacheKey) ?? [];
       const cachedKeys = new Set(cachedGroups.map(threadKey));
       const nextGroups = options?.append
         ? [...cachedGroups, ...adjusted.filter(group => !cachedKeys.has(threadKey(group)))]
         : adjusted;
-      tabEmailCacheRef.current[cacheKey] = nextGroups;
-      const cacheKeys = Object.keys(tabEmailCacheRef.current);
-      while (cacheKeys.length > MAX_LABEL_CACHE) {
-        const oldest = cacheKeys.shift();
-        if (oldest && oldest !== cacheKey) delete tabEmailCacheRef.current[oldest];
-      }
+      writeMailListCache(tabEmailCacheRef.current, cacheKey, nextGroups, MAX_MAIL_LIST_CACHE_ENTRIES);
       startDataTransition(() => {
         setMailThreadGroups(nextGroups);
         setEmails(nextGroups.map(group => group.latestEmail));
@@ -499,24 +521,30 @@ function App() {
   const loadOlderEmails = async () => {
     const label = activeTabRef.current;
     const accountId = activeAccountIdRef.current;
-    if (!MAIL_TABS.has(label) || !hasMoreEmails || isLoadingMoreEmailsRef.current) return false;
+    if (!isMailView(label) || !hasMoreEmails || isLoadingMoreEmailsRef.current) return false;
 
     isLoadingMoreEmailsRef.current = true;
     setIsLoadingMoreEmails(true);
     try {
       const query = activeSearchQueryRef.current;
+      const filters = activeAdvancedSearchRef.current;
       let pageLength = 0;
-      if (query) {
+      if (query || isAdvancedSearchActive(filters)) {
         const cursor = mailPageCursorRef.current;
         const page = await tauriApi.searchLocalThreadGroups({
           query,
+          filters,
           accountId,
           limit: MAIL_PAGE_SIZE,
           beforeDate: cursor?.latestEmail.date ?? null,
           beforeAccountId: cursor?.latestEmail.account_id ?? null,
           beforeThreadId: cursor ? (cursor.latestEmail.thread_id || cursor.latestEmail.id) : null,
         });
-        if (query !== searchQuery.trim() || accountId !== activeAccountIdRef.current) return false;
+        if (
+          query !== searchQuery.trim()
+          || advancedSearchKey(filters) !== advancedSearchKey(advancedSearch)
+          || accountId !== activeAccountIdRef.current
+        ) return false;
         const adjusted = page.map(group => applyRecentlyRead(group, recentlyReadRef.current));
         if (adjusted.length > 0) mailPageCursorRef.current = adjusted[adjusted.length - 1];
         const current = searchThreadGroups ?? [];
@@ -547,7 +575,7 @@ function App() {
       setIsMailboxBackfilling(status.running);
       setMailboxDownloadPending(status.pending);
       setMailboxDownloadState(status.state);
-      setHasMoreEmails(pageLength === MAIL_PAGE_SIZE || (!query && (status.running || status.pending)));
+      setHasMoreEmails(pageLength === MAIL_PAGE_SIZE || ((!query && !isAdvancedSearchActive(filters)) && (status.running || status.pending)));
       return pageLength > 0;
     } catch (error) {
       console.error("Failed to load older emails:", error);
@@ -694,6 +722,17 @@ function App() {
     showToast,
   });
 
+  useEffect(() => {
+    let cancelled = false;
+    void Promise.all(accounts.map(async account => {
+      const labels = await tauriApi.getGmailLabels(account.id).catch(() => []);
+      return [account.id, labels] as const;
+    })).then(entries => {
+      if (!cancelled) setGmailLabelsByAccount(Object.fromEntries(entries));
+    });
+    return () => { cancelled = true; };
+  }, [accounts, isUserSyncing, isBackgroundSyncing]);
+
   const openExternalMailUrlRef = useRef<(url: string) => void>(() => {});
 
   useEffect(() => {
@@ -785,18 +824,48 @@ function App() {
   }, [shouldDeferNetworkForGameMode, markSessionExpired]);
 
   useEffect(() => {
-    if (!MAIL_TABS.has(activeTab)) {
+    if (mailListLoadingTimerRef.current !== null) {
+      window.clearTimeout(mailListLoadingTimerRef.current);
+      mailListLoadingTimerRef.current = null;
+    }
+    if (!isMailView(activeTab)) {
+      setIsMailListLoading(false);
       startDataTransition(() => setEmails([]));
       setMailThreadGroups([]);
       return;
     }
     resetMailPagination();
-    const cached = tabEmailCacheRef.current[mailCacheKey(activeTab, activeAccountId)];
+    const label = activeTab;
+    const accountId = activeAccountId;
+    const cached = readMailListCache(tabEmailCacheRef.current, mailCacheKey(label, accountId));
     if (cached !== undefined) {
+      setIsMailListLoading(false);
       setMailThreadGroups(cached);
       setEmails(cached.map(group => group.latestEmail));
+    } else {
+      setMailThreadGroups([]);
+      setEmails([]);
+      mailListLoadingTimerRef.current = window.setTimeout(() => {
+        mailListLoadingTimerRef.current = null;
+        if (isMailContextCurrent(label, accountId)) setIsMailListLoading(true);
+      }, 150);
     }
-    void loadEmails(activeTab);
+    let cancelled = false;
+    void loadEmails(label).finally(() => {
+      if (cancelled || !isMailContextCurrent(label, accountId)) return;
+      if (mailListLoadingTimerRef.current !== null) {
+        window.clearTimeout(mailListLoadingTimerRef.current);
+        mailListLoadingTimerRef.current = null;
+      }
+      setIsMailListLoading(false);
+    });
+    return () => {
+      cancelled = true;
+      if (mailListLoadingTimerRef.current !== null) {
+        window.clearTimeout(mailListLoadingTimerRef.current);
+        mailListLoadingTimerRef.current = null;
+      }
+    };
   }, [activeTab, activeAccountId]);
 
   useEffect(() => {
@@ -811,7 +880,7 @@ function App() {
         setIsMailboxBackfilling(status.running);
         setMailboxDownloadPending(status.pending);
         setMailboxDownloadState(status.state);
-        if (!searchQuery.trim() && !status.running && !status.pending && MAIL_TABS.has(label)) {
+        if (!searchQuery.trim() && !isAdvancedSearchActive(advancedSearch) && !status.running && !status.pending && isMailView(label)) {
           const cursor = mailPageCursorRef.current;
           const nextPage = await tauriApi.getThreadGroupsByLabel({
             label,
@@ -831,7 +900,7 @@ function App() {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [accountsLoaded, activeAccountId, activeTab, searchQuery]);
+  }, [accountsLoaded, activeAccountId, activeTab, searchQuery, advancedSearch]);
 
   useEffect(() => {
     const unlistenPromise = listen("mail-search-index-ready", () => {
@@ -842,13 +911,17 @@ function App() {
 
   useEffect(() => {
     const query = searchQuery.trim();
+    const filters = advancedSearch;
+    const filtersActive = isAdvancedSearchActive(filters);
     const requestId = ++searchRequestIdRef.current;
     const submitImmediately = searchSubmitVersion !== handledSearchSubmitVersionRef.current;
     handledSearchSubmitVersionRef.current = searchSubmitVersion;
-    if (!query) {
+    if (!query && !filtersActive) {
       void tauriApi.cancelLocalSearch().catch(() => {});
       activeSearchQueryRef.current = "";
+      activeAdvancedSearchRef.current = createEmptyAdvancedSearch();
       setActiveSearchQuery("");
+      setActiveAdvancedSearch(createEmptyAdvancedSearch());
       setIsSearchLoading(false);
       setSearchFailed(false);
       setSearchResults(null);
@@ -868,7 +941,9 @@ function App() {
       void (async () => {
         if (searchRequestIdRef.current !== requestId) return;
         activeSearchQueryRef.current = query;
+        activeAdvancedSearchRef.current = filters;
         setActiveSearchQuery(query);
+        setActiveAdvancedSearch(filters);
         setIsSearchLoading(true);
         setSearchFailed(false);
         searchTimeout = window.setTimeout(() => {
@@ -883,10 +958,11 @@ function App() {
           setSearchFailed(true);
         }, 8_000);
         try {
-          const results = await tauriApi.searchLocalThreadGroups({ query, accountId, limit: MAIL_PAGE_SIZE });
+          const results = await tauriApi.searchLocalThreadGroups({ query, filters, accountId, limit: MAIL_PAGE_SIZE });
           if (
             searchRequestIdRef.current !== requestId ||
-            activeAccountIdRef.current !== accountId
+            activeAccountIdRef.current !== accountId ||
+            advancedSearchKey(filters) !== advancedSearchKey(advancedSearch)
           ) return;
           const adjusted = results.map(group => applyRecentlyRead(group, recentlyReadRef.current));
           setSearchThreadGroups(adjusted);
@@ -912,7 +988,7 @@ function App() {
       window.clearTimeout(timer);
       window.clearTimeout(searchTimeout);
     };
-  }, [searchQuery, activeAccountId, searchIndexVersion, searchSubmitVersion]);
+  }, [searchQuery, advancedSearch, activeAccountId, searchIndexVersion, searchSubmitVersion]);
 
   useEffect(() => {
     if (activeTab !== "settings") return;
@@ -1009,14 +1085,199 @@ function App() {
     }
   }
 
-  async function handleSwitchAccount(accountId: string | null) {
-    selectAccount(accountId);
-    tabEmailCacheRef.current = {};
-    resetMailPagination();
+  function handleSwitchAccount(accountId: string | null) {
+    if (accountId === activeAccountIdRef.current) return;
     setSelectedMail(null);
-    await loadEmails(activeTabRef.current);
-    await refreshUnreadCount();
+    const nextTab = activeTabRef.current.startsWith("gmail:") ? "inbox" : activeTabRef.current;
+    const cached = readMailListCache(tabEmailCacheRef.current, mailCacheKey(nextTab, accountId));
+    if (cached !== undefined) {
+      setMailThreadGroups(cached);
+      setEmails(cached.map(group => group.latestEmail));
+    } else {
+      setMailThreadGroups([]);
+      setEmails([]);
+    }
+    setSearchResults(null);
+    setSearchThreadGroups(null);
+    selectAccount(accountId);
+    if (nextTab !== activeTabRef.current) {
+      activeTabRef.current = nextTab;
+      setActiveTab(nextTab);
+    }
+    void refreshUnreadCount();
   }
+
+  const handleCreateGmailLabel = async (accountId: string, name: string): Promise<GmailLabel | null> => {
+    try {
+      const label = await tauriApi.createGmailLabel(accountId, name);
+      setGmailLabelsByAccount(previous => ({
+        ...previous,
+        [accountId]: [...(previous[accountId] ?? []).filter(item => item.id !== label.id), label]
+          .sort((left, right) => left.name.localeCompare(right.name)),
+      }));
+      showToast(tr.labels.created, "success");
+      return label;
+    } catch (error) {
+      console.error("Create Gmail label failed:", error);
+      showToast(`${tr.labels.createFailed}: ${error}`, "error");
+      return null;
+    }
+  };
+
+  const storeUpdatedGmailLabel = (label: GmailLabel) => {
+    setGmailLabelsByAccount(previous => ({
+      ...previous,
+      [label.account_id]: [...(previous[label.account_id] ?? []).filter(item => item.id !== label.id), label]
+        .sort((left, right) => left.name.localeCompare(right.name)),
+    }));
+  };
+
+  const handleRenameGmailLabel = async (label: GmailLabel, name: string): Promise<boolean> => {
+    try {
+      const updated = await tauriApi.renameGmailLabel(label.account_id, label.id, name);
+      storeUpdatedGmailLabel(updated);
+      showToast(tr.labels.renamed, "success");
+      return true;
+    } catch (error) {
+      console.error("Rename Gmail label failed:", error);
+      showToast(`${tr.labels.renameFailed}: ${error}`, "error");
+      return false;
+    }
+  };
+
+  const handleMoveGmailLabel = async (label: GmailLabel, name: string): Promise<boolean> => {
+    try {
+      const updated = await tauriApi.renameGmailLabel(label.account_id, label.id, name);
+      storeUpdatedGmailLabel(updated);
+      showToast(tr.labels.moved, "success");
+      return true;
+    } catch (error) {
+      console.error("Move Gmail label failed:", error);
+      showToast(`${tr.labels.moveFailed}: ${error}`, "error");
+      return false;
+    }
+  };
+
+  const handleSetGmailLabelColor = async (
+    label: GmailLabel,
+    backgroundColor: string | null,
+    textColor: string | null,
+  ): Promise<boolean> => {
+    try {
+      const updated = await tauriApi.setGmailLabelColor(
+        label.account_id,
+        label.id,
+        backgroundColor,
+        textColor,
+      );
+      storeUpdatedGmailLabel(updated);
+      showToast(tr.labels.colorUpdated, "success");
+      return true;
+    } catch (error) {
+      console.error("Update Gmail label color failed:", error);
+      showToast(`${tr.labels.colorFailed}: ${error}`, "error");
+      return false;
+    }
+  };
+
+  const handleDeleteGmailLabel = async (label: GmailLabel) => {
+    try {
+      await tauriApi.deleteGmailLabel(label.account_id, label.id);
+      setGmailLabelsByAccount(previous => ({
+        ...previous,
+        [label.account_id]: (previous[label.account_id] ?? []).filter(item => item.id !== label.id),
+      }));
+      const removeLabel = (groups: ThreadGroup[]) => groups.map(group => ({
+        ...group,
+        labelIds: group.labelIds.filter(id => id !== label.id),
+      }));
+      setMailThreadGroups(removeLabel);
+      setSearchThreadGroups(previous => previous ? removeLabel(previous) : null);
+      for (const [key, groups] of Object.entries(tabEmailCacheRef.current)) {
+        if (groups) tabEmailCacheRef.current[key] = removeLabel(groups);
+      }
+      delete tabEmailCacheRef.current[mailCacheKey(`gmail:${label.id}`, label.account_id)];
+      if (activeTabRef.current === `gmail:${label.id}` && activeAccountIdRef.current === label.account_id) {
+        activeTabRef.current = "inbox";
+        setActiveTab("inbox");
+        setSelectedMail(null);
+        await loadEmails("inbox");
+      }
+      showToast(tr.labels.deleted, "success");
+    } catch (error) {
+      console.error("Delete Gmail label failed:", error);
+      showToast(`${tr.labels.deleteFailed}: ${error}`, "error");
+    }
+  };
+
+  const requestDeleteGmailLabel = (label: GmailLabel) => {
+    setConfirmModal({
+      message: tr.labels.deleteConfirm.replace("{name}", label.name),
+      onConfirm: () => { void handleDeleteGmailLabel(label); },
+    });
+  };
+
+  const handleSetThreadGmailLabel = async (mail: EmailSummary, labelId: string, applied: boolean) => {
+    try {
+      await tauriApi.setThreadGmailLabel(mail.account_id, mail.thread_id || mail.id, labelId, applied);
+      const updateGroups = (groups: ThreadGroup[]) => groups
+        .map(group => updateGroupLabel(group, mail, labelId, applied))
+        .filter(group => !(activeTabRef.current === `gmail:${labelId}` && !applied &&
+          group.latestEmail.account_id === mail.account_id &&
+          (group.latestEmail.thread_id || group.latestEmail.id) === (mail.thread_id || mail.id)));
+      setMailThreadGroups(updateGroups);
+      setSearchThreadGroups(previous => previous ? updateGroups(previous) : null);
+      for (const [key, groups] of Object.entries(tabEmailCacheRef.current)) {
+        if (groups) tabEmailCacheRef.current[key] = updateGroups(groups);
+      }
+      if (activeTabRef.current === `gmail:${labelId}` && !applied) setSelectedMail(null);
+      showToast(tr.labels.updated, "success");
+    } catch (error) {
+      console.error("Update Gmail labels failed:", error);
+      showToast(`${tr.labels.updateFailed}: ${error}`, "error");
+      throw error;
+    }
+  };
+
+  const handleToggleStarred = async (mail: EmailSummary, starred: boolean) => {
+    const mutationKey = `${mail.account_id}\u0000${mail.thread_id || mail.id}`;
+    if (pendingStarMutationsRef.current.has(mutationKey)) return;
+    pendingStarMutationsRef.current.add(mutationKey);
+    const updateGroups = (groups: ThreadGroup[], applied: boolean) =>
+      groups.map(group => updateGroupLabel(group, mail, "STARRED", applied));
+    const removeThread = (groups: ThreadGroup[]) => groups.filter(group => {
+      const candidate = group.latestEmail;
+      return candidate.account_id !== mail.account_id
+        || (candidate.thread_id || candidate.id) !== (mail.thread_id || mail.id);
+    });
+    const applyLocalState = (applied: boolean, removeFromStarred = false) => {
+      setMailThreadGroups(groups => activeTabRef.current === "starred" && removeFromStarred
+        ? removeThread(groups)
+        : updateGroups(groups, applied));
+      setSearchThreadGroups(groups => groups
+        ? (activeAdvancedSearchRef.current.starred && removeFromStarred ? removeThread(groups) : updateGroups(groups, applied))
+        : null);
+      for (const [key, groups] of Object.entries(tabEmailCacheRef.current)) {
+        if (groups) {
+          tabEmailCacheRef.current[key] = key.endsWith("\u0000starred") && removeFromStarred
+            ? removeThread(groups)
+            : updateGroups(groups, applied);
+        }
+      }
+    };
+
+    applyLocalState(starred);
+    try {
+      await tauriApi.setThreadStarred(mail.account_id, mail.thread_id || mail.id, starred);
+      if (!starred) applyLocalState(false, true);
+    } catch (error) {
+      applyLocalState(!starred);
+      console.error("Update Gmail star failed:", error);
+      showToast(tr.messages.starUpdateFailed, "error");
+    } finally {
+      pendingStarMutationsRef.current.delete(mutationKey);
+    }
+  };
 
   const handleRefresh = async () => {
     if (Object.keys(accountTokensRef.current).length === 0) {
@@ -1107,10 +1368,18 @@ function App() {
   }, [handleLoadRemoteImages]);
 
   // --- Derived state ---
-  const hasSearchQuery = activeSearchQuery.length > 0;
+  const hasSearchQuery = activeSearchQuery.length > 0 || isAdvancedSearchActive(activeAdvancedSearch);
+  const sidebarActiveTab = searchSidebarTab(activeTab, hasSearchQuery, activeAdvancedSearch);
   const displayEmails = hasSearchQuery ? (searchResults ?? []) : emails;
   const threadGroups = hasSearchQuery ? (searchThreadGroups ?? []) : mailThreadGroups;
   const activeMail = [...displayEmails, ...emails].find(m => emailKey(m) === selectedMail);
+  const activeThreadGroup = activeMail
+    ? threadGroups.find(group => sameEmail(group.latestEmail, activeMail))
+      ?? mailThreadGroups.find(group => sameEmail(group.latestEmail, activeMail))
+    : undefined;
+  const activeMailLabels = activeMail ? (gmailLabelsByAccount[activeMail.account_id] ?? []) : [];
+  const activeMailLabelIds = activeThreadGroup?.labelIds ?? [];
+  const sidebarGmailLabels = activeAccountId ? (gmailLabelsByAccount[activeAccountId] ?? []) : [];
   const activeMailKey = activeMail ? emailKey(activeMail) : null;
   const selectedMailViewMode = mailViewPreference === "auto" ? getAutoMailViewMode(windowWidth) : mailViewPreference;
   const mailViewMode: MailViewMode = selectedMailViewMode === "single-toggle" ? "split" : selectedMailViewMode;
@@ -1173,6 +1442,70 @@ function App() {
     markAccountExpired,
     showToast,
   });
+
+  const handleBulkMailAction = useCallback(async (action: BulkMailAction, mails: EmailSummary[]) => {
+    if (mails.length === 0) return;
+    setSelectedMail(null);
+
+    const runForMail = async (mail: EmailSummary): Promise<boolean> => {
+      const currentToken = getTokenForEmail(mail);
+      if (!currentToken) return false;
+
+      if (action === "unread") recentlyReadRef.current.delete(emailKey(mail));
+
+      try {
+        await enqueueMailMutation(
+          mailMutationQueueRef.current,
+          emailKey(mail),
+          () => runAuthenticatedMailAction({
+            accountId: mail.account_id,
+            currentToken,
+            reloginRequiredMessage: tr.messages.reloginRequired,
+            refreshAccessToken,
+            upsertToken,
+            clearExpiredAccount,
+            markAccountExpired,
+            action: () => {
+              const targetId = mail.thread_id || mail.id;
+              switch (action) {
+                case "archive": return tauriApi.archiveEmail(mail.account_id, targetId);
+                case "inbox": return tauriApi.moveToInbox(mail.account_id, targetId);
+                case "read": return tauriApi.markThreadAsRead(mail.account_id, targetId);
+                case "unread": return tauriApi.markAsUnread(mail.account_id, targetId);
+                case "spam": return tauriApi.reportSpam(mail.account_id, targetId);
+                case "trash": return tauriApi.trashEmail(mail.account_id, targetId);
+              }
+            },
+          }),
+        );
+        return true;
+      } catch (error) {
+        console.error(`Bulk mail action failed (${action}):`, error);
+        return false;
+      }
+    };
+
+    let failedCount = 0;
+    for (let offset = 0; offset < mails.length; offset += BULK_MAIL_ACTION_CONCURRENCY) {
+      const results = await Promise.all(
+        mails.slice(offset, offset + BULK_MAIL_ACTION_CONCURRENCY).map(runForMail),
+      );
+      failedCount += results.filter(succeeded => !succeeded).length;
+    }
+
+    await Promise.all([
+      loadEmails(activeTabRef.current),
+      refreshUnreadCount(),
+    ]);
+    if (activeSearchQuery.trim() || isAdvancedSearchActive(activeAdvancedSearch)) {
+      setSearchSubmitVersion(version => version + 1);
+    }
+    if (failedCount > 0) showToast(tr.messages.operationFailed, "error");
+  }, [
+    activeSearchQuery, activeAdvancedSearch, clearExpiredAccount, getTokenForEmail, loadEmails,
+    markAccountExpired, refreshAccessToken, refreshUnreadCount, showToast, tr,
+    upsertToken,
+  ]);
 
   const openExternalMailUrl = useCallback((url: string) => {
     if (!url || url.startsWith("#")) return;
@@ -1356,7 +1689,7 @@ function App() {
 
       <div className="flex flex-1 overflow-hidden">
         <Sidebar
-          activeTab={activeTab}
+          activeTab={sidebarActiveTab}
           goToTab={goToTab}
           mobileMenuOpen={mobileMenuOpen}
           setMobileMenuOpen={setMobileMenuOpen}
@@ -1371,6 +1704,11 @@ function App() {
           onAddAccount={loginWithGoogle}
           onLogoutAccount={handleLogoutAccount}
           expiredAccountIds={expiredAccountIds}
+          gmailLabels={sidebarGmailLabels}
+          onRenameGmailLabel={handleRenameGmailLabel}
+          onMoveGmailLabel={handleMoveGmailLabel}
+          onSetGmailLabelColor={handleSetGmailLabelColor}
+          onDeleteGmailLabel={requestDeleteGmailLabel}
         />
 
         {/* Compose FAB */}
@@ -1467,6 +1805,8 @@ function App() {
               threadGroups={threadGroups}
               selectedMail={selectedMail}
               onMailClick={handleMailClick}
+              onToggleStarred={handleToggleStarred}
+              onBulkAction={handleBulkMailAction}
               isUserSyncing={isUserSyncing}
               isBackgroundSyncing={isBackgroundSyncing}
               searchQuery={searchQuery}
@@ -1475,6 +1815,15 @@ function App() {
               searchFailed={searchFailed}
               setSearchQuery={setSearchQuery}
               onSearchSubmit={() => setSearchSubmitVersion(version => version + 1)}
+              advancedSearch={advancedSearch}
+              onAdvancedSearch={(criteria) => {
+                setAdvancedSearch(criteria);
+                setSearchSubmitVersion(version => version + 1);
+              }}
+              onClearSearch={() => {
+                setSearchQuery("");
+                setAdvancedSearch(createEmptyAdvancedSearch());
+              }}
               searchInputRef={searchInputRef}
               activeTab={activeTab}
               usesOverlaySidebar={usesOverlaySidebar}
@@ -1485,6 +1834,7 @@ function App() {
               onLoadMore={loadOlderEmails}
               hasMoreEmails={hasMoreEmails}
               isLoadingMoreEmails={isLoadingMoreEmails}
+              isMailListLoading={isMailListLoading && !hasSearchQuery}
               mailAppendVersion={mailAppendVersion}
               notificationFocusVersion={notificationFocusVersion}
               isMailboxBackfilling={isMailboxBackfilling}
@@ -1493,6 +1843,7 @@ function App() {
               accessToken={accessToken}
               accounts={accounts}
               activeAccountId={activeAccountId}
+              gmailLabelsByAccount={gmailLabelsByAccount}
             />
             {activeMail ? (
               <EmailReader
@@ -1528,7 +1879,9 @@ function App() {
                 showSpamBtn={showSpamBtn}
                 showRestoreBtn={showRestoreBtn}
                 showTrashToBinBtn={showTrashToBinBtn}
+                isStarred={activeMailLabelIds.includes("STARRED")}
                 onArchive={handleArchive}
+                onToggleStarred={handleToggleStarred}
                 onReportSpam={handleReportSpam}
                 onTrash={handleTrash}
                 onMoveToInbox={handleMoveToInbox}
@@ -1545,6 +1898,10 @@ function App() {
                 accessToken={getTokenForEmail(activeMail) ?? null}
                 showToast={showToast}
                 searchQuery={activeSearchQuery}
+                gmailLabels={activeMailLabels}
+                gmailLabelIds={activeMailLabelIds}
+                onToggleGmailLabel={(labelId, applied) => handleSetThreadGmailLabel(activeMail, labelId, applied)}
+                onCreateGmailLabel={(name) => handleCreateGmailLabel(activeMail.account_id, name)}
               />
             ) : (
               <main
