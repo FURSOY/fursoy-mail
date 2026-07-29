@@ -1,14 +1,23 @@
-## Open source
+## Threaded conversations and drafts
 
-- FURSOY Mail is now released as free software under the GNU General Public License version 3 only (`GPL-3.0-only`).
-- Added the full application license and third-party dependency notices to the source and Windows installer.
+- Reply, Reply All, and Forward now operate on the selected message inside a conversation.
+- Added restorable inline Gmail drafts with correct recipients and RFC reply headers.
+- Improved draft reconciliation after sending or deleting a reply.
+- Added thread-aware archive, trash, unread, and spam actions.
 
-## Improvements
+## Search and synchronization
 
-- Reduced memory growth during long mail sessions by bounding cached message and reader state.
-- Improved thread scrolling stability while messages load, selections change, and thread content updates.
+- Added fast full-message search backed by SQLite FTS5, including in-message highlighting.
+- Virtualized long message lists and optimized incremental search to keep the interface responsive.
+- Added resumable background synchronization for mailboxes larger than the initial sync window.
 
-## Reliability and Security
+## Message reader
 
-- Prevented stale reader work from accumulating or updating mail state after the active message changes.
-- Removed the unused shadcn CLI and its transitive packages from production dependencies, reducing the install and audit surface without changing the interface.
+- Improved HTML and plain-text rendering, spacing, fit behavior, and message details.
+- Refined desktop and mobile layouts for multi-message conversations.
+
+## Reliability, security, and maintenance
+
+- Kept desktop OAuth protected with PKCE and compatible with the configured Google client credentials.
+- Updated frontend and Rust dependencies, license notices, privacy terms, and security guidance.
+- Added regression coverage for OAuth, search, sync, threads, recipients, replies, drafts, and rendering.
