@@ -1,13 +1,18 @@
-import { useRef, useState, useEffect, useLayoutEffect, type CSSProperties } from "react";
+import { useRef, useState, useEffect, useLayoutEffect, useCallback, type CSSProperties } from "react";
+import { createPortal } from "react-dom";
 import {
   CornerUpLeft, Inbox, Send, Archive, ShieldAlert, Trash2,
   Users, Forward, Eye, RotateCcw, Minus, Plus, Maximize2,
   Settings, X, RefreshCw, Copy, ChevronDown, ChevronUp,
   Download, FileText, Image, ImageOff, File, Type, Link2, List, ListOrdered, Paperclip, Undo2, Redo2,
 } from "lucide-react";
-import { useLocale } from "../i18n";
-import type { EmailSummary, MailViewMode, MailZoom, RenderMode, AttachmentPayload } from "../types";
+import { locales, useLocale } from "../i18n";
+import type { EmailSummary, MailViewMode, MailZoom, RenderMode, AttachmentPayload, SavedDraft } from "../types";
 import { tauriApi, type EmailAttachmentInfo } from "../tauriApi";
+import { calculateReplyAllRecipients, calculateReplyRecipients, areValidRecipients } from "../mailRecipients";
+import type { ReplySendRequest } from "../hooks/useMailActions";
+import { buildReplyBody } from "../mailCompose";
+import { extractInlineReplyBody, inlineReplyStorageKey, parseStoredInlineReplyDraft, type StoredInlineReplyDraft } from "../inlineReplyDraft";
 
 type AttachmentInfo = EmailAttachmentInfo;
 
@@ -22,9 +27,16 @@ function AttachmentIcon({ mimeType }: { mimeType: string }) {
   if (mimeType === "application/pdf" || mimeType.startsWith("text/")) return <FileText className="w-3.5 h-3.5" />;
   return <File className="w-3.5 h-3.5" />;
 }
-import { formatDateFull, buildRenderableEmailHtml, hasRemoteEmailImages, normalizeComposerLinkUrl } from "../utils";
+import { formatDateFull, formatRelativeTime, buildRenderableEmailHtml, hasRemoteEmailImages, normalizeComposerLinkUrl, splitSearchHighlight } from "../utils";
 import { EmailHtmlView } from "./EmailHtmlView";
 import { ToolbarTip } from "./ToolbarTip";
+
+function SearchHighlightedText({ text, query }: { text: string; query: string }) {
+  return <>{splitSearchHighlight(text, query).map((segment, index) => segment.match
+    ? <mark key={`${index}-${segment.text}`} className="rounded-sm bg-yellow-300 px-px text-zinc-950">{segment.text}</mark>
+    : <span key={`${index}-${segment.text}`}>{segment.text}</span>
+  )}</>;
+}
 
 // ── Thread card — one email in the conversation stack ──────────────────────────
 function ThreadCard({
@@ -44,6 +56,14 @@ function ThreadCard({
   onLoadRemoteImages,
   onTrustRemoteImages,
   scrollRef,
+  onReply,
+  onReplyAll,
+  onForward,
+  canReplyAll,
+  replyEditorOpen,
+  relativeNow,
+  collapsible,
+  searchQuery,
 }: {
   email: EmailSummary;
   isActive: boolean;
@@ -61,19 +81,98 @@ function ThreadCard({
   onLoadRemoteImages: (emailId: string) => void;
   onTrustRemoteImages: (email: EmailSummary) => void;
   scrollRef: React.RefObject<HTMLElement | null>;
+  onReply: () => void;
+  onReplyAll: () => void;
+  onForward: () => void;
+  canReplyAll: boolean;
+  replyEditorOpen: boolean;
+  relativeNow: number;
+  collapsible: boolean;
+  searchQuery: string;
 }) {
   const tr = useLocale();
   const [expanded, setExpanded] = useState(defaultExpanded);
+  const [detailsOpen, setDetailsOpen] = useState(false);
   const [lazyBody, setLazyBody] = useState<string | null>(null);
   const [lazyLoading, setLazyLoading] = useState(false);
+  const lazyLoadRequestedRef = useRef(false);
+  const detailsTriggerRef = useRef<HTMLButtonElement>(null);
+  const detailsPopoverRef = useRef<HTMLDivElement>(null);
+  const [detailsPosition, setDetailsPosition] = useState({ top: 0, left: 0, width: 0 });
 
-  const senderName = email.sender.split("<")[0].replace(/"/g, "").trim() || email.sender;
+  useEffect(() => {
+    if (!replyEditorOpen) return;
+    setExpanded(true);
+    if (isActive || lazyBody !== null || lazyLoadRequestedRef.current) return;
+    lazyLoadRequestedRef.current = true;
+    setLazyLoading(true);
+    void tauriApi.getEmailBody(email.id, email.account_id)
+      .then(body => setLazyBody(body || ""))
+      .catch(() => setLazyBody(""))
+      .finally(() => setLazyLoading(false));
+  }, [email.account_id, email.id, isActive, lazyBody, replyEditorOpen]);
+
+  const senderAddressMatch = email.sender.match(/<\s*([^>]+)\s*>/);
+  const senderAddress = (senderAddressMatch?.[1] ?? (email.sender.includes("@") ? email.sender : "")).trim();
+  const senderName = email.sender.split("<")[0].replace(/"/g, "").trim() || senderAddress || email.sender;
   const recipientDisplay = email.recipient
     ? email.recipient.split(",").map(r => r.split("<")[0].replace(/"/g, "").trim() || r.trim()).join(", ")
     : tr.mail.me;
+  const locale = tr === locales.tr ? "tr-TR" : "en-US";
+  const displayAddress = (raw: string) => raw
+    .split(",")
+    .map(value => {
+      const addressMatch = value.match(/<\s*([^>]+)\s*>/);
+      const address = (addressMatch?.[1] ?? (value.includes("@") ? value : "")).trim();
+      const name = value.split("<")[0].replace(/"/g, "").trim();
+      if (name && address && name.toLocaleLowerCase() !== address.toLocaleLowerCase()) return `${name} · ${address}`;
+      return address || name;
+    })
+    .filter(Boolean)
+    .join(", ");
+
+  const updateDetailsPosition = useCallback(() => {
+    const trigger = detailsTriggerRef.current;
+    if (!trigger) return;
+    const rect = trigger.getBoundingClientRect();
+    const viewportPadding = 12;
+    const desiredWidth = 620;
+    const width = Math.min(desiredWidth, window.innerWidth - viewportPadding * 2);
+    const left = Math.max(viewportPadding, Math.min(rect.left, window.innerWidth - width - viewportPadding));
+    const estimatedHeight = 250;
+    const top = Math.max(viewportPadding, Math.min(rect.bottom + 6, window.innerHeight - estimatedHeight - viewportPadding));
+    setDetailsPosition({ top, left, width });
+  }, []);
+
+  useLayoutEffect(() => {
+    if (!detailsOpen) return;
+    updateDetailsPosition();
+
+    const handlePointerDown = (event: PointerEvent) => {
+      const target = event.target as Node;
+      if (detailsTriggerRef.current?.contains(target) || detailsPopoverRef.current?.contains(target)) return;
+      setDetailsOpen(false);
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setDetailsOpen(false);
+    };
+    document.addEventListener("pointerdown", handlePointerDown);
+    document.addEventListener("keydown", handleKeyDown);
+    window.addEventListener("resize", updateDetailsPosition);
+    window.addEventListener("scroll", updateDetailsPosition, true);
+    return () => {
+      document.removeEventListener("pointerdown", handlePointerDown);
+      document.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener("resize", updateDetailsPosition);
+      window.removeEventListener("scroll", updateDetailsPosition, true);
+    };
+  }, [detailsOpen, updateDetailsPosition]);
 
   const toggle = async () => {
-    if (!expanded && !isActive && lazyBody === null && !lazyLoading) {
+    if (!collapsible) return;
+    if (expanded) setDetailsOpen(false);
+    if (!expanded && !isActive && lazyBody === null && !lazyLoadRequestedRef.current) {
+      lazyLoadRequestedRef.current = true;
       setLazyLoading(true);
       try {
         const raw = await tauriApi.getEmailBody(email.id, email.account_id);
@@ -97,39 +196,99 @@ function ThreadCard({
   return (
     <div className={`rounded-xl overflow-hidden border ${isActive ? "border-white/[0.10]" : "border-white/[0.06]"}`}>
       {/* Header — always visible, click to expand/collapse */}
-      <button
-        type="button"
-        onClick={toggle}
-        className={`w-full flex items-center gap-3 px-4 py-3 text-left transition-colors ${
-          expanded ? "hover:bg-white/[0.02]" : "hover:bg-white/[0.02]"
-        }`}
-      >
-        <div className="w-8 h-8 rounded-full bg-[var(--app-accent)] flex items-center justify-center text-white text-xs font-bold shrink-0">
+      <div className="flex w-full items-center gap-1 px-2 py-1 transition-colors hover:bg-white/[0.02]">
+        <div onClick={() => { if (collapsible) void toggle(); }} className={`flex min-w-0 flex-1 items-center gap-3 rounded-lg px-2 py-2 text-left ${collapsible ? "cursor-pointer" : ""}`}>
+          <div className="w-8 h-8 rounded-full bg-[var(--app-accent)] flex items-center justify-center text-white text-xs font-bold shrink-0">
           {(senderName[0] || "?").toUpperCase()}
-        </div>
-        <div className="min-w-0 flex-1">
+          </div>
+          <div className="min-w-0 flex-1">
           <div className="flex items-baseline justify-between gap-2">
-            <span className={`truncate text-sm font-medium ${isActive ? "text-zinc-100" : "text-zinc-300"}`}>
-              {senderName}
+            <div className="flex min-w-0 items-baseline gap-1.5">
+              <span className={`truncate text-sm font-medium ${isActive ? "text-zinc-100" : "text-zinc-300"}`}>
+                <SearchHighlightedText text={senderName} query={searchQuery} />
+              </span>
+              {senderAddress && senderAddress.toLocaleLowerCase() !== senderName.toLocaleLowerCase() && (
+                <span className="truncate text-[11px] font-normal text-zinc-500"><SearchHighlightedText text={senderAddress} query={searchQuery} /></span>
+              )}
+            </div>
+            <span className="shrink-0 whitespace-nowrap text-[11px] text-zinc-500">
+              {formatDateFull(email.date, locale)} <span className="text-zinc-600">({formatRelativeTime(email.date, relativeNow, locale)})</span>
             </span>
-            <span className="text-[11px] text-zinc-500 shrink-0">{formatDateFull(email.date)}</span>
           </div>
           {expanded ? (
-            <div className="text-[11px] text-zinc-600 mt-0.5 truncate">
-              <span className="text-zinc-700">{tr.mail.toShort}</span> {recipientDisplay}
-              {email.cc && <> · <span className="text-zinc-700">{tr.mail.ccShort}</span> {email.cc}</>}
-            </div>
+            <button
+              ref={detailsTriggerRef}
+              type="button"
+              onClick={event => {
+                event.stopPropagation();
+                setDetailsOpen(open => !open);
+              }}
+              aria-label={tr.mail.messageDetails}
+              aria-expanded={detailsOpen}
+              className="mt-0.5 flex max-w-full min-w-0 items-center rounded text-left text-[11px] text-zinc-600 transition-colors hover:text-zinc-300"
+            >
+              <span className="truncate"><span className="text-zinc-700">{tr.mail.toShort}</span> <SearchHighlightedText text={recipientDisplay} query={searchQuery} />
+                {email.cc && <> · <span className="text-zinc-700">{tr.mail.ccShort}</span> {email.cc}</>}
+              </span>
+              <ChevronDown className={`ml-0.5 h-3 w-3 shrink-0 transition-transform ${detailsOpen ? "rotate-180" : ""}`} />
+            </button>
           ) : (
-            <p className="text-[11px] text-zinc-600 truncate mt-0.5">{email.snippet}</p>
+            <p className="text-[11px] text-zinc-600 truncate mt-0.5"><SearchHighlightedText text={email.snippet} query={searchQuery} /></p>
           )}
+          </div>
         </div>
-        {lazyLoading
-          ? <RefreshCw className="w-3.5 h-3.5 text-zinc-600 animate-spin shrink-0" />
-          : expanded
-            ? <ChevronUp className="w-3.5 h-3.5 text-zinc-500 shrink-0" />
-            : <ChevronDown className="w-3.5 h-3.5 text-zinc-600 shrink-0" />
-        }
-      </button>
+        <ToolbarTip label={tr.mail.replyTo}>
+          <button
+            type="button"
+            onClick={() => {
+              onReply();
+            }}
+            className="rounded-md p-2 text-zinc-500 transition-colors hover:bg-white/[0.05] hover:text-zinc-200"
+            aria-label={tr.mail.replyTo}
+          >
+            <CornerUpLeft className="h-4 w-4" />
+          </button>
+        </ToolbarTip>
+        {collapsible && (
+          <button type="button" onClick={toggle} className="rounded-md p-2 text-zinc-500 transition-colors hover:bg-white/[0.05] hover:text-zinc-200">
+            {lazyLoading
+              ? <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+              : expanded
+                ? <ChevronUp className="w-3.5 h-3.5" />
+                : <ChevronDown className="w-3.5 h-3.5" />
+            }
+          </button>
+        )}
+      </div>
+
+      {expanded && detailsOpen && createPortal(
+        <div
+          ref={detailsPopoverRef}
+          role="dialog"
+          aria-label={tr.mail.messageDetails}
+          className="fixed z-[100] overflow-y-auto rounded-lg border border-white/[0.12] bg-[var(--color-surface-popover)] p-3 shadow-2xl shadow-black/60"
+          style={{
+            top: detailsPosition.top,
+            left: detailsPosition.left,
+            width: detailsPosition.width,
+            maxHeight: `calc(100vh - ${detailsPosition.top + 12}px)`,
+          }}
+        >
+            <div className="mb-2 text-xs font-semibold text-zinc-300">{tr.mail.messageDetails}</div>
+            <dl className="grid grid-cols-[max-content_minmax(0,1fr)] gap-x-3 gap-y-1.5 text-xs leading-relaxed">
+              <dt className="text-right text-zinc-600">{tr.mail.fromDetails}</dt>
+              <dd className="min-w-0 break-words text-zinc-300">{senderName}{senderAddress ? ` · ${senderAddress}` : ""}</dd>
+              <dt className="text-right text-zinc-600">{tr.mail.toDetails}</dt>
+              <dd className="min-w-0 break-words text-zinc-300">{displayAddress(email.recipient) || tr.mail.me}</dd>
+              {email.cc && <><dt className="text-right text-zinc-600">{tr.mail.ccDetails}</dt><dd className="min-w-0 break-words text-zinc-300">{displayAddress(email.cc)}</dd></>}
+              {email.reply_to && email.reply_to !== email.sender && <><dt className="text-right text-zinc-600">{tr.mail.replyToDetails}</dt><dd className="min-w-0 break-words text-zinc-300">{displayAddress(email.reply_to)}</dd></>}
+              <dt className="text-right text-zinc-600">{tr.mail.dateDetails}</dt>
+              <dd className="min-w-0 break-words text-zinc-300">{formatDateFull(email.date, locale)} ({formatRelativeTime(email.date, relativeNow, locale)})</dd>
+              <dt className="text-right text-zinc-600">{tr.mail.subjectDetails}</dt>
+              <dd className="min-w-0 break-words text-zinc-300">{email.subject}</dd>
+            </dl>
+        </div>
+      , document.body)}
 
       {/* Body — shown when expanded */}
       {expanded && (
@@ -181,6 +340,7 @@ function ThreadCard({
                 onFitScaleChange={onFitScaleChange ?? (() => {})}
                 onOpenUrl={onOpenUrl}
                 scrollRef={scrollRef}
+                searchQuery={searchQuery}
               />
             </div>
           ) : (
@@ -188,6 +348,19 @@ function ThreadCard({
               {tr.mail.preparingBody}
             </div>
           )}
+          {!replyEditorOpen && <div className="flex flex-wrap items-center gap-2 border-t border-white/[0.05] bg-[var(--color-surface-subtle)] px-3 py-2 sm:px-4">
+            <button type="button" onClick={onReply} className="flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-xs text-zinc-400 transition-colors hover:bg-white/[0.05] hover:text-zinc-200">
+              <CornerUpLeft className="h-3.5 w-3.5" /> {tr.mail.replyTo}
+            </button>
+            {canReplyAll && (
+              <button type="button" onClick={onReplyAll} className="flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-xs text-zinc-400 transition-colors hover:bg-white/[0.05] hover:text-zinc-200">
+                <Users className="h-3.5 w-3.5" /> {tr.mail.replyAll}
+              </button>
+            )}
+            <button type="button" onClick={onForward} className="flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-xs text-zinc-400 transition-colors hover:bg-white/[0.05] hover:text-zinc-200">
+              <Forward className="h-3.5 w-3.5" /> {tr.mail.forward}
+            </button>
+          </div>}
         </div>
       )}
     </div>
@@ -208,12 +381,14 @@ interface EmailReaderProps {
 
   showReply: boolean;
   setShowReply: (v: boolean) => void;
+  replyTarget: EmailSummary | null;
+  setReplyTarget: React.Dispatch<React.SetStateAction<EmailSummary | null>>;
   replyMode: "reply" | "reply-all";
   setReplyMode: (v: "reply" | "reply-all") => void;
   replyText: string;
   setReplyText: (v: string) => void;
   isSending: boolean;
-  onSendReply: (attachments: AttachmentPayload[], body: string) => void;
+  onSendReply: (request: ReplySendRequest) => Promise<boolean>;
 
   mailZoom: MailZoom;
   setMailFitScale: (scale: number) => void;
@@ -234,14 +409,16 @@ interface EmailReaderProps {
   setVerificationCopyState: (v: "idle" | "copied") => void;
 
   showArchiveBtn: boolean;
+  showSpamBtn: boolean;
   showRestoreBtn: boolean;
   showTrashToBinBtn: boolean;
 
-  onArchive: () => void;
-  onTrash: () => void;
-  onMoveToInbox: () => void;
-  onMarkAsUnread: () => void;
-  onForward: () => void;
+  onArchive: (mail: EmailSummary) => void;
+  onReportSpam: (mail: EmailSummary) => void;
+  onTrash: (mail: EmailSummary) => void;
+  onMoveToInbox: (mail: EmailSummary) => void;
+  onMarkAsUnread: (mail: EmailSummary) => void;
+  onForward: (mail: EmailSummary) => void;
   onOpenUrl: (url: string) => void;
   mailScrollRef: React.RefObject<HTMLDivElement | null>;
   relayoutKey: string;
@@ -252,6 +429,7 @@ interface EmailReaderProps {
   onLoadOlderThread: () => void;
   accessToken: string | null;
   showToast: (msg: string, kind: "success" | "error" | "info") => void;
+  searchQuery: string;
 }
 
 // ── Main component ─────────────────────────────────────────────────────────────
@@ -259,16 +437,17 @@ export function EmailReader({
   className, activeMail, activeMailBody,
   isBodyLoading, bodyError, hasLoadedActiveBody,
   mailViewMode, activeTab, closeReader,
-  showReply, setShowReply, replyMode, setReplyMode, replyText, setReplyText,
+  showReply, setShowReply, replyTarget, setReplyTarget, replyMode, setReplyMode, replyText, setReplyText,
   isSending, onSendReply,
   mailZoom, setMailFitScale, stepMailZoom, persistMailZoom, effectiveZoomPct,
   readingToolsOpen, setReadingToolsOpen, renderMode, setRenderMode,
   remoteImagesAllowedForEmail, onLoadRemoteImages, onTrustRemoteImages,
   verificationCode, verificationCopyState, setVerificationCopyState,
-  showArchiveBtn, showRestoreBtn, showTrashToBinBtn,
-  onArchive, onTrash, onMoveToInbox, onMarkAsUnread, onForward,
+  showArchiveBtn, showSpamBtn, showRestoreBtn, showTrashToBinBtn,
+  onArchive, onReportSpam, onTrash, onMoveToInbox, onMarkAsUnread, onForward,
   onOpenUrl, mailScrollRef, relayoutKey, threadEmails, hasMoreThreadEmails, isLoadingOlderThread,
   threadMemoryLimitReached, onLoadOlderThread, accessToken, showToast,
+  searchQuery,
 }: EmailReaderProps) {
   const tr = useLocale();
   const replyEditableRef = useRef<HTMLDivElement>(null);
@@ -296,10 +475,30 @@ export function EmailReader({
   const [replyAttachments, setReplyAttachments] = useState<(AttachmentPayload & { size: number })[]>([]);
   const [replyAttachError, setReplyAttachError] = useState<string | null>(null);
   const [pendingReplyAttachmentReads, setPendingReplyAttachmentReads] = useState(0);
+  const [replyPortalHost, setReplyPortalHost] = useState<HTMLDivElement | null>(null);
+  const [replyTargetBody, setReplyTargetBody] = useState<string | null>(null);
+  const [replyDraftId, setReplyDraftId] = useState<string | null>(null);
+  const [replyVerificationMessageId, setReplyVerificationMessageId] = useState<string | null>(null);
+  const [replyDraftStatus, setReplyDraftStatus] = useState<"idle" | "saving" | "saved" | "error">("idle");
+  const [replyDraftError, setReplyDraftError] = useState<string | null>(null);
+  const [replyDraftHydrated, setReplyDraftHydrated] = useState(false);
+  const replySaveTimerRef = useRef<number | null>(null);
+  const replyDraftIdRef = useRef<string | null>(null);
+  const replyVerificationMessageIdRef = useRef<string | null>(null);
+  const replyDraftSaveQueueRef = useRef<Promise<SavedDraft | null>>(Promise.resolve(null));
+  const replyTargetKeyRef = useRef<string | null>(null);
+  const dismissedReplyKeyRef = useRef<string | null>(null);
+  const inlineDraftLookupRef = useRef<string | null>(null);
 
   const [attachments, setAttachments] = useState<AttachmentInfo[]>([]);
   const [thumbnails, setThumbnails] = useState<Record<string, string>>({});
   const [downloadingId, setDownloadingId] = useState<string | null>(null);
+  const [relativeNow, setRelativeNow] = useState(() => Date.now());
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setRelativeNow(Date.now()), 60_000);
+    return () => window.clearInterval(timer);
+  }, []);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -307,11 +506,68 @@ export function EmailReader({
       mountedRef.current = false;
       if (replyFocusTimerRef.current) clearTimeout(replyFocusTimerRef.current);
       if (copyResetTimerRef.current) clearTimeout(copyResetTimerRef.current);
+      if (replySaveTimerRef.current) clearTimeout(replySaveTimerRef.current);
       for (const reader of replyAttachmentReadersRef.current) reader.abort();
       replyAttachmentReadersRef.current.clear();
       pendingReplyAttachmentBytesRef.current = 0;
     };
   }, []);
+
+  useEffect(() => {
+    if (!replyTarget) {
+      replyTargetKeyRef.current = null;
+      replyDraftIdRef.current = null;
+      replyVerificationMessageIdRef.current = null;
+      setReplyTargetBody(null);
+      setReplyDraftId(null);
+      setReplyVerificationMessageId(null);
+      setReplyDraftStatus("idle");
+      setReplyDraftError(null);
+      setReplyDraftHydrated(false);
+      return;
+    }
+    const targetKey = inlineReplyStorageKey(replyTarget);
+    replyTargetKeyRef.current = targetKey;
+    let cancelled = false;
+    let stored: StoredInlineReplyDraft | null = null;
+    try {
+      stored = parseStoredInlineReplyDraft(localStorage.getItem(inlineReplyStorageKey(replyTarget)));
+    } catch {
+      stored = null;
+    }
+    setReplyText(stored?.body ?? "");
+    if (stored?.mode) setReplyMode(stored.mode);
+    replyDraftIdRef.current = stored?.draftId ?? null;
+    replyVerificationMessageIdRef.current = stored?.verificationMessageId ?? null;
+    setReplyDraftId(stored?.draftId ?? null);
+    setReplyVerificationMessageId(stored?.verificationMessageId ?? null);
+    setReplyDraftStatus(stored?.draftId ? "saved" : "idle");
+    setReplyDraftError(null);
+    setReplyAttachments([]);
+    setReplyDraftHydrated(!stored?.draftId);
+    void tauriApi.getEmailBody(replyTarget.id, replyTarget.account_id)
+      .then(body => { if (!cancelled) setReplyTargetBody(body || replyTarget.snippet); })
+      .catch(() => { if (!cancelled) setReplyTargetBody(replyTarget.snippet); });
+    if (stored?.draftId) {
+      void tauriApi.getDraft(replyTarget.account_id, stored.draftId)
+        .then(draft => {
+          if (cancelled) return;
+          setReplyAttachments(draft.attachments.map(attachment => ({
+            ...attachment,
+            size: Math.ceil(attachment.data.length * 0.75),
+          })));
+        })
+        .catch(() => {
+          if (cancelled) return;
+          replyDraftIdRef.current = null;
+          replyVerificationMessageIdRef.current = null;
+          setReplyDraftId(null);
+          setReplyVerificationMessageId(null);
+        })
+        .finally(() => { if (!cancelled) setReplyDraftHydrated(true); });
+    }
+    return () => { cancelled = true; };
+  }, [replyTarget?.account_id, replyTarget?.id]);
 
   useEffect(() => {
     for (const reader of replyAttachmentReadersRef.current) reader.abort();
@@ -441,10 +697,9 @@ export function EmailReader({
   }, [showReply]);
 
   useEffect(() => {
-    if (replyText === "" && replyEditableRef.current) {
-      replyEditableRef.current.innerHTML = "";
-      setReplyEmpty(true);
-    }
+    if (!replyEditableRef.current || replyEditableRef.current.innerHTML === replyText) return;
+    replyEditableRef.current.innerHTML = replyText;
+    setReplyEmpty(!replyEditableRef.current.innerText.trim());
   }, [replyText]);
 
   const syncUndoRedo = () => {
@@ -456,6 +711,7 @@ export function EmailReader({
     replyEditableRef.current?.focus();
     document.execCommand(command, false, value);
     setReplyEmpty(!(replyEditableRef.current?.innerText.trim()));
+    setReplyText(replyEditableRef.current?.innerHTML ?? "");
     syncUndoRedo();
   };
 
@@ -593,22 +849,260 @@ export function EmailReader({
     document.execCommand("insertText", false, safeText);
   };
 
+  const replyRecipientSet = replyTarget
+    ? (replyMode === "reply-all"
+        ? calculateReplyAllRecipients(replyTarget)
+        : calculateReplyRecipients(replyTarget))
+    : { to: [], cc: [] };
+
+  const buildReplyDraftBody = useCallback((body: string) => {
+    if (!replyTarget) return body;
+    return buildReplyBody(replyTarget, body, replyTargetBody || replyTarget.snippet, tr.compose.wroteOn);
+  }, [replyTarget, replyTargetBody, tr.compose.wroteOn]);
+
+  const persistReplyDraft = useCallback((): Promise<SavedDraft | null> => {
+    if (!replyTarget || replyTargetBody === null || !replyDraftHydrated) return Promise.resolve(null);
+    const body = replyEditableRef.current?.innerHTML ?? replyText;
+    const hasContent = Boolean(body.replace(/<[^>]*>/g, "").trim() || replyAttachments.length > 0);
+    if (!hasContent && !replyDraftIdRef.current) return Promise.resolve(null);
+    const storageKey = inlineReplyStorageKey(replyTarget);
+    const localSnapshot: StoredInlineReplyDraft = {
+      body,
+      mode: replyMode,
+      draftId: replyDraftIdRef.current,
+      verificationMessageId: replyVerificationMessageIdRef.current,
+    };
+    try { localStorage.setItem(storageKey, JSON.stringify(localSnapshot)); } catch { /* Gmail save remains authoritative. */ }
+    setReplyDraftStatus("saving");
+    setReplyDraftError(null);
+    const saveOperation = replyDraftSaveQueueRef.current
+      .catch(() => null)
+      .then(async () => {
+        const saved = await tauriApi.saveDraft({
+        accountId: replyTarget.account_id,
+        draftId: replyDraftIdRef.current,
+        to: replyRecipientSet.to.join(", "),
+        cc: replyRecipientSet.cc.join(", "),
+        bcc: "",
+        subject: `Re: ${replyTarget.subject.replace(/^(Re:\s*)+/i, "")}`,
+        body: buildReplyDraftBody(body),
+        attachments: replyAttachments.length > 0
+          ? replyAttachments.map(({ filename, mimeType, data }) => ({ filename, mimeType, data }))
+          : null,
+        threadId: replyTarget.thread_id || replyTarget.id,
+        inReplyTo: replyTarget.message_id || null,
+        references: replyTarget.references || null,
+      });
+        if (!mountedRef.current || replyTargetKeyRef.current !== storageKey) return saved;
+        replyDraftIdRef.current = saved.id;
+        replyVerificationMessageIdRef.current = saved.verificationMessageId;
+        setReplyDraftId(saved.id);
+        setReplyVerificationMessageId(saved.verificationMessageId);
+        setReplyDraftStatus("saved");
+        try {
+          localStorage.setItem(storageKey, JSON.stringify({
+            ...localSnapshot,
+            draftId: saved.id,
+            verificationMessageId: saved.verificationMessageId,
+          } satisfies StoredInlineReplyDraft));
+        } catch { /* The Gmail draft was still saved successfully. */ }
+        return saved;
+      })
+      .catch(error => {
+        if (mountedRef.current && replyTargetKeyRef.current === storageKey) {
+          setReplyDraftStatus("error");
+          setReplyDraftError(String(error).replace(/^Error:\s*/i, ""));
+        }
+        throw error;
+      });
+    replyDraftSaveQueueRef.current = saveOperation;
+    return saveOperation;
+  }, [buildReplyDraftBody, replyAttachments, replyDraftHydrated, replyDraftId, replyMode, replyRecipientSet.cc.join("\u0000"), replyRecipientSet.to.join("\u0000"), replyTarget, replyTargetBody, replyText, replyVerificationMessageId]);
+
+  useEffect(() => {
+    if (!showReply || !replyTarget) return;
+    const storageKey = inlineReplyStorageKey(replyTarget);
+    try {
+      localStorage.setItem(storageKey, JSON.stringify({
+        body: replyText,
+        mode: replyMode,
+        draftId: replyDraftId,
+        verificationMessageId: replyVerificationMessageId,
+      } satisfies StoredInlineReplyDraft));
+    } catch { /* Autosave continues through Gmail. */ }
+    if (replyTargetBody === null || !replyDraftHydrated || (!replyText.trim() && replyAttachments.length === 0 && !replyDraftId)) return;
+    if (replySaveTimerRef.current) clearTimeout(replySaveTimerRef.current);
+    replySaveTimerRef.current = window.setTimeout(() => {
+      void persistReplyDraft().catch(() => undefined);
+    }, 900);
+    return () => {
+      if (replySaveTimerRef.current) clearTimeout(replySaveTimerRef.current);
+    };
+  }, [showReply, replyTarget, replyText, replyMode, replyAttachments, replyTargetBody, replyDraftHydrated]);
+
+  const sendInlineReply = async () => {
+    if (!replyTarget || !areValidRecipients([...replyRecipientSet.to, ...replyRecipientSet.cc])) {
+      setReplyDraftError(tr.messages.replySendFailed);
+      return;
+    }
+    if (replySaveTimerRef.current) {
+      clearTimeout(replySaveTimerRef.current);
+      replySaveTimerRef.current = null;
+    }
+    let saved;
+    try {
+      saved = await persistReplyDraft();
+    } catch {
+      return;
+    }
+    const body = replyEditableRef.current?.innerHTML ?? replyText;
+    const sent = await onSendReply({
+      target: replyTarget,
+      to: replyRecipientSet.to,
+      cc: replyRecipientSet.cc,
+      body: buildReplyDraftBody(body),
+      attachments: replyAttachments.map(({ filename, mimeType, data }) => ({ filename, mimeType, data })),
+      draftId: saved?.id ?? replyDraftId,
+      verificationMessageId: saved?.verificationMessageId ?? replyVerificationMessageId,
+    });
+    if (sent) {
+      localStorage.removeItem(inlineReplyStorageKey(replyTarget));
+      setReplyText("");
+      setReplyTarget(null);
+    }
+  };
+
+  const deleteInlineReplyDraft = async () => {
+    if (!replyTarget) return;
+    try {
+      if (replySaveTimerRef.current) {
+        clearTimeout(replySaveTimerRef.current);
+        replySaveTimerRef.current = null;
+      }
+      await replyDraftSaveQueueRef.current.catch(() => null);
+      if (replyDraftIdRef.current) await tauriApi.deleteDraft(replyTarget.account_id, replyDraftIdRef.current);
+      localStorage.removeItem(inlineReplyStorageKey(replyTarget));
+      setReplyText("");
+      setReplyTarget(null);
+      setShowReply(false);
+    } catch (error) {
+      setReplyDraftStatus("error");
+      setReplyDraftError(String(error).replace(/^Error:\s*/i, ""));
+    }
+  };
+
+  const closeReaderWithDraft = () => {
+    if (!replyTarget || (!replyText.trim() && replyAttachments.length === 0 && !replyDraftId)) {
+      closeReader();
+      return;
+    }
+    void persistReplyDraft().catch(() => undefined).finally(closeReader);
+  };
+
   // All emails to render: full thread if available, otherwise just activeMail
   const allEmails = threadEmails.length > 0 ? threadEmails : [activeMail];
+  const threadMessageKey = allEmails
+    .map(email => `${email.id}:${email.message_id}`)
+    .join("\u0000");
 
-  const openReply = (mode: "reply" | "reply-all") => {
-    setReplyMode(mode);
-    setShowReply(true);
-    if (replyFocusTimerRef.current) clearTimeout(replyFocusTimerRef.current);
-    replyFocusTimerRef.current = window.setTimeout(() => replyEditableRef.current?.focus(), 100);
+  useEffect(() => {
+    dismissedReplyKeyRef.current = null;
+    inlineDraftLookupRef.current = null;
+  }, [activeMail.account_id, activeMail.thread_id]);
+
+  useEffect(() => {
+    if (showReply || replyTarget) return;
+    const savedTarget = [...allEmails].reverse().find(email => {
+      const key = inlineReplyStorageKey(email);
+      if (dismissedReplyKeyRef.current === key) return false;
+      try {
+        const stored = parseStoredInlineReplyDraft(localStorage.getItem(key));
+        return Boolean(stored && (stored.body.trim() || stored.draftId));
+      } catch {
+        return false;
+      }
+    });
+    if (savedTarget) {
+      const stored = parseStoredInlineReplyDraft(localStorage.getItem(inlineReplyStorageKey(savedTarget)));
+      if (!stored) return;
+      setReplyTarget(savedTarget);
+      setReplyMode(stored.mode ?? "reply");
+      setShowReply(true);
+      return;
+    }
+
+    const threadId = activeMail.thread_id || activeMail.id;
+    const lookupKey = `${activeMail.account_id}:${threadId}:${threadMessageKey}`;
+    if (inlineDraftLookupRef.current === lookupKey) return;
+    inlineDraftLookupRef.current = lookupKey;
+    let cancelled = false;
+    void (async () => {
+      let pageToken: string | null = null;
+      for (let pageNumber = 0; pageNumber < 10; pageNumber += 1) {
+        const page = await tauriApi.listDrafts(activeMail.account_id, pageToken);
+        const candidate = page.drafts.find(draft => {
+          if (draft.threadId !== threadId || !draft.inReplyTo) return false;
+          const replyId = draft.inReplyTo.trim().toLowerCase();
+          return allEmails.some(email => email.message_id.trim().toLowerCase() === replyId);
+        });
+        if (candidate) {
+          const target = allEmails.find(email =>
+            email.message_id.trim().toLowerCase() === candidate.inReplyTo.trim().toLowerCase());
+          if (!target || cancelled) return;
+          const content = await tauriApi.getDraft(activeMail.account_id, candidate.id);
+          if (cancelled) return;
+          const stored: StoredInlineReplyDraft = {
+            body: extractInlineReplyBody(content.body),
+            mode: content.cc.trim() ? "reply-all" : "reply",
+            draftId: content.id,
+            verificationMessageId: content.rfcMessageId || candidate.rfcMessageId || null,
+          };
+          localStorage.setItem(inlineReplyStorageKey(target), JSON.stringify(stored));
+          setReplyTarget(target);
+          setReplyMode(stored.mode);
+          setShowReply(true);
+          return;
+        }
+        pageToken = page.nextPageToken;
+        if (!pageToken) return;
+      }
+    })().catch(() => {
+      if (!cancelled) inlineDraftLookupRef.current = null;
+    });
+    return () => { cancelled = true; };
+  }, [activeMail.account_id, activeMail.id, activeMail.thread_id, replyTarget, showReply, threadMessageKey]);
+
+  const openReply = (email: EmailSummary, mode: "reply" | "reply-all") => {
+    const activate = (target: EmailSummary) => {
+      dismissedReplyKeyRef.current = null;
+      setReplyTarget(target);
+      setReplyMode(mode);
+      setShowReply(true);
+      if (replyFocusTimerRef.current) clearTimeout(replyFocusTimerRef.current);
+      replyFocusTimerRef.current = window.setTimeout(() => replyEditableRef.current?.focus(), 100);
+    };
+    const activateAndRefresh = () => {
+      activate(email);
+      void tauriApi.refreshEmailFromGmail(email.account_id, email.id)
+        .then(refreshed => {
+          setReplyTarget(current => current && current.id === email.id && current.account_id === email.account_id
+            ? refreshed
+            : current);
+        })
+        .catch(() => undefined);
+    };
+    if (replyTarget && (replyTarget.id !== email.id || replyTarget.account_id !== email.account_id)) {
+      void persistReplyDraft().catch(() => undefined).finally(activateAndRefresh);
+    } else activateAndRefresh();
   };
+  const captureReplyHost = useCallback((node: HTMLDivElement | null) => setReplyPortalHost(node), []);
 
   return (
     <main className={className}>
       {/* Mobile Back Button */}
       <div className="md:hidden h-12 flex items-center px-4 border-b border-white/5 shrink-0">
         <button
-          onClick={closeReader}
+          onClick={closeReaderWithDraft}
           className="flex items-center gap-2 text-xs text-zinc-400 hover:text-zinc-200"
         >
           <CornerUpLeft className="w-3.5 h-3.5" /> Back
@@ -621,7 +1115,7 @@ export function EmailReader({
           {mailViewMode !== "split" && (
             <button
               type="button"
-              onClick={closeReader}
+              onClick={closeReaderWithDraft}
               aria-label={tr.common.close}
               className="mr-1 shrink-0 rounded-md p-1.5 text-zinc-500 transition-colors hover:bg-white/5 hover:text-zinc-200"
             >
@@ -638,55 +1132,35 @@ export function EmailReader({
           </span>
         </div>
         <div className="flex shrink-0 items-center gap-0.5" style={{ WebkitAppRegion: "no-drag" } as CSSProperties}>
-          <ToolbarTip label={tr.mail.replyTo}>
-            <button
-              type="button"
-              onClick={() => openReply("reply")}
-              className={`p-2 rounded-md hover:bg-white/5 transition-colors ${
-                showReply && replyMode === "reply" ? "text-blue-400 bg-blue-500/10" : "text-zinc-400 hover:text-zinc-200"
-              }`}
-            >
-              <CornerUpLeft className="w-4 h-4" />
-            </button>
-          </ToolbarTip>
-          <ToolbarTip label={tr.mail.replyAll}>
-            <button
-              type="button"
-              onClick={() => openReply("reply-all")}
-              className={`p-2 rounded-md hover:bg-white/5 transition-colors ${
-                showReply && replyMode === "reply-all" ? "text-blue-400 bg-blue-500/10" : "text-zinc-400 hover:text-zinc-200"
-              }`}
-            >
-              <Users className="w-4 h-4" />
-            </button>
-          </ToolbarTip>
-          <ToolbarTip label={tr.mail.forward}>
-            <button type="button" onClick={onForward} className="p-2 rounded-md hover:bg-white/5 text-zinc-400 hover:text-zinc-200 transition-colors">
-              <Forward className="w-4 h-4" />
-            </button>
-          </ToolbarTip>
           <ToolbarTip label={tr.mail.markAsUnread}>
-            <button type="button" onClick={onMarkAsUnread} className="p-2 rounded-md hover:bg-white/5 text-zinc-400 hover:text-zinc-200 transition-colors">
+            <button type="button" onClick={() => onMarkAsUnread(activeMail)} className="p-2 rounded-md hover:bg-white/5 text-zinc-400 hover:text-zinc-200 transition-colors">
               <Eye className="w-4 h-4" />
             </button>
           </ToolbarTip>
           {showRestoreBtn && (
             <ToolbarTip label={activeTab === "spam" ? tr.actions.notSpam : tr.actions.restoreInbox}>
-              <button type="button" onClick={onMoveToInbox} className="p-2 rounded-md hover:bg-white/5 text-zinc-400 hover:text-emerald-400 transition-colors">
+              <button type="button" onClick={() => onMoveToInbox(activeMail)} className="p-2 rounded-md hover:bg-white/5 text-zinc-400 hover:text-emerald-400 transition-colors">
                 <RotateCcw className="w-4 h-4" />
               </button>
             </ToolbarTip>
           )}
           {showArchiveBtn && (
             <ToolbarTip label={tr.actions.archive}>
-              <button type="button" onClick={onArchive} className="p-2 rounded-md hover:bg-white/5 text-zinc-400 hover:text-amber-400 transition-colors">
+              <button type="button" onClick={() => onArchive(activeMail)} className="p-2 rounded-md hover:bg-white/5 text-zinc-400 hover:text-amber-400 transition-colors">
                 <Archive className="w-4 h-4" />
+              </button>
+            </ToolbarTip>
+          )}
+          {showSpamBtn && (
+            <ToolbarTip label={tr.actions.reportSpam}>
+              <button type="button" onClick={() => onReportSpam(activeMail)} className="p-2 rounded-md hover:bg-white/5 text-zinc-400 hover:text-orange-400 transition-colors">
+                <ShieldAlert className="w-4 h-4" />
               </button>
             </ToolbarTip>
           )}
           {showTrashToBinBtn && (
             <ToolbarTip label={tr.actions.moveTrash}>
-              <button type="button" onClick={onTrash} className="p-2 rounded-md hover:bg-white/5 text-zinc-400 hover:text-red-400 transition-colors">
+              <button type="button" onClick={() => onTrash(activeMail)} className="p-2 rounded-md hover:bg-white/5 text-zinc-400 hover:text-red-400 transition-colors">
                 <Trash2 className="w-4 h-4" />
               </button>
             </ToolbarTip>
@@ -702,6 +1176,7 @@ export function EmailReader({
               <button
                 type="button"
                 onClick={() => persistMailZoom("fit")}
+                aria-pressed={mailZoom === "fit"}
                 className={`flex h-7 min-w-[3.25rem] items-center justify-center gap-1 px-1 text-[11px] font-medium tabular-nums transition-colors ${
                   mailZoom === "fit" ? "text-[var(--app-accent)]" : "text-zinc-300 hover:text-zinc-100"
                 }`}
@@ -732,7 +1207,7 @@ export function EmailReader({
 
       {/* Reading Tools Panel */}
       <aside
-        className={`absolute bottom-0 right-0 top-12 z-20 hidden w-72 border-l border-[var(--color-border-default)] bg-[color:var(--color-surface-sidebar)]/95 p-4 shadow-2xl shadow-black/30 backdrop-blur-xl transition-transform duration-200 md:block ${
+        className={`absolute bottom-0 right-0 top-12 z-20 hidden w-72 border-l border-[var(--color-border-default)] bg-[var(--color-surface-sidebar)] p-4 shadow-2xl shadow-black/40 transition-transform duration-200 md:block ${
           readingToolsOpen ? "translate-x-0" : "translate-x-full"
         }`}
         aria-hidden={!readingToolsOpen}
@@ -760,6 +1235,7 @@ export function EmailReader({
               <button
                 type="button"
                 onClick={() => persistMailZoom("fit")}
+                aria-pressed={mailZoom === "fit"}
                 className={`flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs transition-colors ${
                   mailZoom === "fit" ? "border-[var(--app-accent)] bg-[var(--app-accent-soft)] text-zinc-100" : "border-[var(--color-border-default)] bg-[var(--color-surface-app)] text-zinc-400 hover:text-zinc-200"
                 }`}
@@ -779,7 +1255,7 @@ export function EmailReader({
                   onClick={() => { setRenderMode(mode); localStorage.setItem("fursoy_render_mode", mode); }}
                   className={`px-3 py-1.5 text-xs rounded-md transition-colors ${renderMode === mode ? "bg-white/10 text-zinc-100" : "text-zinc-500 hover:text-zinc-300"}`}
                 >
-                  {mode === "full" ? "Full HTML" : "Simple"}
+                  {mode === "full" ? tr.settings.fullHtml : tr.settings.simpleHtml}
                 </button>
               ))}
             </div>
@@ -792,7 +1268,7 @@ export function EmailReader({
         <div className="mx-auto w-full max-w-[1040px] min-w-0">
 
           {/* Subject heading */}
-          <h1 className="text-xl font-bold text-zinc-100 mb-5 leading-snug">{activeMail.subject}</h1>
+          <h1 className="text-xl font-bold text-zinc-100 mb-5 leading-snug"><SearchHighlightedText text={activeMail.subject} query={searchQuery} /></h1>
 
           {/* Received email attachments */}
           {attachments.length > 0 && (
@@ -838,7 +1314,7 @@ export function EmailReader({
           )}
 
           {/* OTP Banner */}
-          {verificationCode && (
+          {verificationCode && allEmails.length === 1 && (
             <div className="mb-5 flex items-center justify-between px-4 py-3 rounded-lg bg-blue-500/10 border border-blue-500/20">
               <div className="flex items-center gap-3">
                 <div className="w-8 h-8 rounded-lg bg-blue-500/20 flex items-center justify-center">
@@ -885,6 +1361,8 @@ export function EmailReader({
             ) : null}
             {allEmails.map((email) => {
               const isActive = email.id === activeMail.id;
+              const isReplyTarget = replyTarget?.id === email.id && replyTarget.account_id === email.account_id;
+              const canReplyAll = calculateReplyRecipients(email).canReplyAll;
               return (
                 <div key={email.id} id={`tc-${email.id}`}>
                   <ThreadCard
@@ -904,7 +1382,16 @@ export function EmailReader({
                     onLoadRemoteImages={onLoadRemoteImages}
                     onTrustRemoteImages={onTrustRemoteImages}
                     scrollRef={mailScrollRef as React.RefObject<HTMLElement | null>}
+                    onReply={() => openReply(email, "reply")}
+                    onReplyAll={() => openReply(email, "reply-all")}
+                    onForward={() => onForward(email)}
+                    canReplyAll={canReplyAll}
+                    replyEditorOpen={isReplyTarget && showReply}
+                    relativeNow={relativeNow}
+                    collapsible={allEmails.length > 1}
+                    searchQuery={searchQuery}
                   />
+                  {isReplyTarget && <div ref={captureReplyHost} className="mt-2" />}
                 </div>
               );
             })}
@@ -912,28 +1399,30 @@ export function EmailReader({
 
           {/* Mobile action buttons */}
           <div className="flex md:hidden items-center gap-1 mt-4">
-            <ToolbarTip label={tr.mail.replyTo}>
-              <button type="button" onClick={() => setShowReply(!showReply)} className="p-2 rounded-md hover:bg-white/5 text-zinc-400">
-                <CornerUpLeft className="w-4 h-4" />
-              </button>
-            </ToolbarTip>
             {showRestoreBtn && (
               <ToolbarTip label={activeTab === "spam" ? tr.actions.notSpam : tr.mail.inbox}>
-                <button type="button" onClick={onMoveToInbox} className="p-2 rounded-md hover:bg-white/5 text-zinc-400">
+                <button type="button" onClick={() => onMoveToInbox(activeMail)} className="p-2 rounded-md hover:bg-white/5 text-zinc-400">
                   <RotateCcw className="w-4 h-4" />
                 </button>
               </ToolbarTip>
             )}
             {showArchiveBtn && (
               <ToolbarTip label={tr.actions.archive}>
-                <button type="button" onClick={onArchive} className="p-2 rounded-md hover:bg-white/5 text-zinc-400">
+                <button type="button" onClick={() => onArchive(activeMail)} className="p-2 rounded-md hover:bg-white/5 text-zinc-400">
                   <Archive className="w-4 h-4" />
+                </button>
+              </ToolbarTip>
+            )}
+            {showSpamBtn && (
+              <ToolbarTip label={tr.actions.reportSpam}>
+                <button type="button" onClick={() => onReportSpam(activeMail)} className="p-2 rounded-md hover:bg-white/5 text-zinc-400 hover:text-orange-400">
+                  <ShieldAlert className="w-4 h-4" />
                 </button>
               </ToolbarTip>
             )}
             {showTrashToBinBtn && (
               <ToolbarTip label={tr.actions.moveTrash}>
-                <button type="button" onClick={onTrash} className="p-2 rounded-md hover:bg-white/5 text-zinc-400">
+                <button type="button" onClick={() => onTrash(activeMail)} className="p-2 rounded-md hover:bg-white/5 text-zinc-400">
                   <Trash2 className="w-4 h-4" />
                 </button>
               </ToolbarTip>
@@ -941,7 +1430,7 @@ export function EmailReader({
           </div>
 
           {/* Reply Box */}
-          {showReply && (
+          {showReply && replyTarget && replyPortalHost && createPortal((
             <div className="mt-4 rounded-xl border border-white/10 bg-white/[0.02] overflow-hidden">
               {/* To: header */}
               <div className="px-4 py-2.5 border-b border-white/5 flex items-center gap-2">
@@ -951,11 +1440,16 @@ export function EmailReader({
                 }
                 <span className="text-xs text-zinc-400 truncate">
                   {replyMode === "reply-all" ? (
-                    <>{tr.mail.replyAllPrefix} <span className="text-zinc-300">{activeMail.sender.split("<")[0].replace(/"/g, "").trim()}{activeMail.cc ? `, ${activeMail.cc}` : ""}</span></>
+                    <>{tr.mail.replyAllPrefix} <span className="text-zinc-300">{[...replyRecipientSet.to, ...replyRecipientSet.cc].join(", ")}</span></>
                   ) : (
-                    <>{tr.mail.replyTo} <span className="text-zinc-300">{activeMail.sender.split("<")[0].replace(/"/g, "").trim()}</span></>
+                    <>{tr.mail.replyTo} <span className="text-zinc-300">{replyRecipientSet.to.join(", ")}</span></>
                   )}
                 </span>
+                {replyDraftStatus !== "idle" && (
+                  <span className={`ml-auto shrink-0 text-[10px] ${replyDraftStatus === "error" ? "text-red-400" : "text-zinc-600"}`}>
+                    {replyDraftStatus === "saving" ? tr.compose.savingDraft : replyDraftStatus === "saved" ? tr.compose.draftSaved : tr.compose.draftSaveFailed}
+                  </span>
+                )}
               </div>
 
               {/* Editable area */}
@@ -975,6 +1469,7 @@ export function EmailReader({
                   onPaste={handleReplyPaste}
                   onInput={() => {
                     setReplyEmpty(!(replyEditableRef.current?.innerText.trim()));
+                    setReplyText(replyEditableRef.current?.innerHTML ?? "");
                     syncUndoRedo();
                   }}
                   className="outline-none text-sm text-zinc-200 min-h-[96px] [&_a]:text-blue-400 [&_a]:underline [&_b]:font-bold [&_strong]:font-bold [&_i]:italic [&_em]:italic [&_u]:underline [&_s]:line-through [&_ol]:list-decimal [&_ol]:pl-5 [&_ul]:list-disc [&_ul]:pl-5"
@@ -984,7 +1479,7 @@ export function EmailReader({
 
               {/* Quote attribution */}
               <div className="px-4 pb-2 text-[11px] text-zinc-700 italic truncate border-t border-white/[0.03] pt-2">
-                — {activeMail.sender.split("<")[0].replace(/"/g, "").trim()}, {formatDateFull(activeMail.date)}
+                — {replyTarget.sender.split("<")[0].replace(/"/g, "").trim()}, {formatDateFull(replyTarget.date)}
               </div>
 
               {/* Formatting toolbar — visible when showFormatBar */}
@@ -1110,10 +1605,10 @@ export function EmailReader({
                   ))}
                 </div>
               )}
-              {replyAttachError && (
+              {(replyAttachError || replyDraftError) && (
                 <div className="mx-3 mb-1.5 flex items-center gap-2 text-xs text-red-400 bg-red-400/10 border border-red-400/20 rounded-lg px-2.5 py-1.5">
-                  <span className="min-w-0">{replyAttachError}</span>
-                  <button type="button" aria-label={tr.common.close} onClick={() => setReplyAttachError(null)} className="ml-auto shrink-0 text-red-400/60 hover:text-red-400"><X className="w-3 h-3" /></button>
+                  <span className="min-w-0">{replyAttachError || replyDraftError}</span>
+                  <button type="button" aria-label={tr.common.close} onClick={() => { setReplyAttachError(null); setReplyDraftError(null); }} className="ml-auto shrink-0 text-red-400/60 hover:text-red-400"><X className="w-3 h-3" /></button>
                 </div>
               )}
 
@@ -1150,15 +1645,30 @@ export function EmailReader({
                 <div className="flex items-center gap-2">
                   <button
                     type="button"
-                    onClick={() => { setShowReply(false); setReplyText(""); }}
+                    onClick={() => { void deleteInlineReplyDraft(); }}
+                    title={tr.compose.deleteDraft}
+                    aria-label={tr.compose.deleteDraft}
+                    className="rounded-md p-1.5 text-zinc-600 transition-colors hover:bg-red-500/10 hover:text-red-400"
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      dismissedReplyKeyRef.current = inlineReplyStorageKey(replyTarget);
+                      void persistReplyDraft().catch(() => undefined).finally(() => {
+                        setShowReply(false);
+                        setReplyTarget(null);
+                      });
+                    }}
                     className="text-xs text-zinc-500 hover:text-zinc-300 transition-colors"
                   >
                     {tr.mail.cancel}
                   </button>
                   <button
                     type="button"
-                    onClick={() => onSendReply(replyAttachments, replyEditableRef.current?.innerHTML ?? "")}
-                    disabled={(replyEmpty && replyAttachments.length === 0) || isSending || pendingReplyAttachmentReads > 0}
+                    onClick={() => { void sendInlineReply(); }}
+                    disabled={(replyEmpty && replyAttachments.length === 0) || !replyDraftHydrated || replyTargetBody === null || isSending || pendingReplyAttachmentReads > 0}
                     className="px-4 py-1.5 bg-blue-500 hover:bg-blue-600 disabled:opacity-40 text-white text-xs font-medium rounded-md transition-colors flex items-center gap-2"
                   >
                     {isSending ? <RefreshCw className="w-3 h-3 animate-spin" /> : <Send className="w-3 h-3" />}
@@ -1167,7 +1677,7 @@ export function EmailReader({
                 </div>
               </div>
             </div>
-          )}
+          ), replyPortalHost)}
         </div>
       </div>
     </main>

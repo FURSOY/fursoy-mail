@@ -1,13 +1,13 @@
 # Google OAuth release checklist
 
-This file tracks the external steps required before FURSOY Mail's Google OAuth app is made broadly available. The privacy policy is maintained in `PRIVACY.md`, with English first and Turkish second.
+This file tracks the external steps required before FURSOY Mail's Google OAuth app is made broadly available. The English privacy policy is maintained in `PRIVACY.md`.
 
 ## Repository work
 
 - [x] Request one Gmail scope that matches the current feature set: `gmail.modify`.
 - [x] Remove the redundant `gmail.send` scope.
 - [x] Explain local storage, Google access, remote images, and update traffic in-product.
-- [x] Publish an English-first privacy policy in the repository.
+- [x] Publish an English privacy policy in the repository.
 - [ ] Host the product homepage and privacy policy on a domain controlled by the developer.
 - [ ] Replace the in-app repository policy link with the final policy URL.
 

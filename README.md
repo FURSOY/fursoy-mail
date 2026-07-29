@@ -56,6 +56,10 @@ FURSOY Mail connects directly to Google services and does not operate a server t
 
 See the full [Privacy Policy](PRIVACY.md) for details.
 
+## Security
+
+Do not disclose suspected vulnerabilities or sensitive user data in a public issue. Read the [Security Policy](SECURITY.md) and report vulnerabilities through [GitHub Private Vulnerability Reporting](https://github.com/FURSOY/FURSOY-Mail/security/advisories/new) or [support@fursoy.com](mailto:support@fursoy.com).
+
 ## License
 
 FURSOY Mail is free software licensed under the [GNU General Public License version 3 only](LICENSE) (`GPL-3.0-only`). You may use, study, modify, and redistribute it under the terms of that license. Distributed modified versions must remain under GPLv3 and make their corresponding source code available.
@@ -95,6 +99,7 @@ Create `src-tauri/.env` for local Google OAuth builds:
 
 ```env
 GOOGLE_CLIENT_ID=your-google-client-id
+GOOGLE_CLIENT_SECRET=your-google-client-secret
 ```
 
 Never commit OAuth credentials or `.env` files.

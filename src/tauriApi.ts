@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Account, AppControls, AttachmentPayload, AuthInfo, DraftContent, DraftPage, EmailSummary, SavedDraft, SendOutcome } from "./types";
+import type { Account, AppControls, AttachmentPayload, AuthInfo, DraftContent, DraftPage, EmailSummary, SavedDraft, SendOutcome, ThreadGroup } from "./types";
 
 export interface MailboxDownloadStatus {
   running: boolean;
@@ -51,6 +51,24 @@ export interface CustomNotificationInput {
   copyFailedLabel?: string;
 }
 
+export interface ThreadPageInput {
+  label: string;
+  accountId: string | null;
+  limit?: number;
+  beforeDate?: number | null;
+  beforeAccountId?: string | null;
+  beforeThreadId?: string | null;
+}
+
+export interface ThreadSearchInput {
+  query: string;
+  accountId: string | null;
+  limit?: number;
+  beforeDate?: number | null;
+  beforeAccountId?: string | null;
+  beforeThreadId?: string | null;
+}
+
 export const tauriApi = {
   getAccounts: () => invoke<Account[]>("get_accounts"),
   getAccountAuth: (accountId: string) =>
@@ -65,8 +83,13 @@ export const tauriApi = {
     invoke<void>("reorder_accounts", { orderedIds }),
   getEmailsByLabel: (input: EmailPageInput) =>
     invoke<EmailSummary[]>("get_emails_by_label", { ...input }),
+  getThreadGroupsByLabel: (input: ThreadPageInput) =>
+    invoke<ThreadGroup[]>("get_thread_groups_by_label", { ...input }),
   searchLocalEmails: (query: string, accountId: string | null, limit: number) =>
     invoke<EmailSummary[]>("search_local_emails", { query, accountId, limit }),
+  searchLocalThreadGroups: (input: ThreadSearchInput) =>
+    invoke<ThreadGroup[]>("search_local_thread_groups", { ...input }),
+  cancelLocalSearch: () => invoke<void>("cancel_local_search"),
   searchContacts: (query: string, accountId: string) =>
     invoke<ContactSuggestion[]>("search_contacts", { query, accountId }),
   getMailboxDownloadStatus: (accountId: string | null) =>
@@ -86,26 +109,30 @@ export const tauriApi = {
   saveAndRevealAttachment: (emailId: string, accountId: string, attachmentDbId: string) =>
     invoke<SavedAttachment>("save_and_reveal_attachment", { emailId, accountId, attachmentDbId }),
   refreshEmailFromGmail: (accountId: string, messageId: string) =>
-    invoke<void>("refresh_email_from_gmail", { accountId, messageId }),
+    invoke<EmailSummary>("refresh_email_from_gmail", { accountId, messageId }),
   getThreadEmails: (threadId: string, accountId: string, limit = 20, offset = 0) =>
     invoke<EmailSummary[]>("get_thread_emails", { threadId, accountId, limit, offset }),
   markAsRead: (accountId: string, messageId: string) =>
     invoke<void>("mark_as_read", { accountId, messageId }),
-  markAsUnread: (accountId: string, messageId: string) =>
-    invoke<void>("mark_as_unread", { accountId, messageId }),
-  archiveEmail: (accountId: string, messageId: string) =>
-    invoke<void>("archive_email", { accountId, messageId }),
-  trashEmail: (accountId: string, messageId: string) =>
-    invoke<void>("trash_email", { accountId, messageId }),
-  moveToInbox: (accountId: string, messageId: string) =>
-    invoke<void>("move_to_inbox", { accountId, messageId }),
+  markAsUnread: (accountId: string, threadId: string) =>
+    invoke<void>("mark_as_unread", { accountId, threadId }),
+  archiveEmail: (accountId: string, threadId: string) =>
+    invoke<void>("archive_email", { accountId, threadId }),
+  reportSpam: (accountId: string, threadId: string) =>
+    invoke<void>("report_spam", { accountId, threadId }),
+  trashEmail: (accountId: string, threadId: string) =>
+    invoke<void>("trash_email", { accountId, threadId }),
+  moveToInbox: (accountId: string, threadId: string) =>
+    invoke<void>("move_to_inbox", { accountId, threadId }),
   sendReply: (input: {
     accountId: string;
     to: string;
+    cc: string;
     subject: string;
     body: string;
     threadId: string;
-    messageId: string;
+    inReplyTo: string;
+    references: string;
     attachments: AttachmentPayload[] | null;
   }) => invoke<SendOutcome>("send_reply", { ...input }),
   sendEmail: (input: {
@@ -130,7 +157,15 @@ export const tauriApi = {
     subject: string;
     body: string;
     attachments: AttachmentPayload[] | null;
-  }) => invoke<SavedDraft>("save_draft", { ...input }),
+    threadId?: string | null;
+    inReplyTo?: string | null;
+    references?: string | null;
+  }) => invoke<SavedDraft>("save_draft", {
+    ...input,
+    threadId: input.threadId ?? null,
+    inReplyTo: input.inReplyTo ?? null,
+    references: input.references ?? null,
+  }),
   sendDraft: (accountId: string, draftId: string, verificationMessageId: string) =>
     invoke<SendOutcome>("send_draft", { accountId, draftId, verificationMessageId }),
   deleteDraft: (accountId: string, draftId: string) =>

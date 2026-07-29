@@ -22,11 +22,11 @@ describe("typed Tauri boundary", () => {
     ]);
   });
 
-  it("scopes trash actions to both account and message", async () => {
-    await tauriApi.trashEmail("account-a", "shared-message-id");
+  it("scopes toolbar trash actions to both account and conversation", async () => {
+    await tauriApi.trashEmail("account-a", "shared-thread-id");
 
     expect(invokeMock.mock.calls).toEqual([
-      ["trash_email", { accountId: "account-a", messageId: "shared-message-id" }],
+      ["trash_email", { accountId: "account-a", threadId: "shared-thread-id" }],
     ]);
   });
 
@@ -50,6 +50,46 @@ describe("typed Tauri boundary", () => {
     });
   });
 
+  it("pages grouped conversations with a stable thread cursor", async () => {
+    await tauriApi.getThreadGroupsByLabel({
+      label: "inbox",
+      accountId: null,
+      limit: 100,
+      beforeDate: 123,
+      beforeAccountId: "account-a",
+      beforeThreadId: "thread-a",
+    });
+
+    expect(invokeMock).toHaveBeenCalledWith("get_thread_groups_by_label", {
+      label: "inbox",
+      accountId: null,
+      limit: 100,
+      beforeDate: 123,
+      beforeAccountId: "account-a",
+      beforeThreadId: "thread-a",
+    });
+  });
+
+  it("pages local search by conversation instead of using a fixed result cap", async () => {
+    await tauriApi.searchLocalThreadGroups({
+      query: "atlas",
+      accountId: "account-a",
+      limit: 100,
+      beforeDate: 55,
+      beforeAccountId: "account-a",
+      beforeThreadId: "thread-b",
+    });
+
+    expect(invokeMock).toHaveBeenCalledWith("search_local_thread_groups", {
+      query: "atlas",
+      accountId: "account-a",
+      limit: 100,
+      beforeDate: 55,
+      beforeAccountId: "account-a",
+      beforeThreadId: "thread-b",
+    });
+  });
+
   it("verifies an uncertain send by account and generated message ID", async () => {
     await tauriApi.verifySentMessage(
       "account-a",
@@ -59,6 +99,15 @@ describe("typed Tauri boundary", () => {
     expect(invokeMock).toHaveBeenCalledWith("verify_sent_message", {
       accountId: "account-a",
       messageId: "<fursoy-0123456789abcdef@mail.invalid>",
+    });
+  });
+
+  it("reports the selected Gmail conversation as spam", async () => {
+    await tauriApi.reportSpam("account-a", "thread-42");
+
+    expect(invokeMock).toHaveBeenCalledWith("report_spam", {
+      accountId: "account-a",
+      threadId: "thread-42",
     });
   });
 
@@ -82,5 +131,54 @@ describe("typed Tauri boundary", () => {
       body: "<p>Hello</p>",
       attachments: null,
     });
+  });
+
+  it("sends a reply with its selected message RFC headers and Cc recipients", async () => {
+    await tauriApi.sendReply({
+      accountId: "me@example.test",
+      to: "alice@example.test",
+      cc: "team@example.test",
+      subject: "Status",
+      body: "<p>Reply</p>",
+      threadId: "gmail-thread",
+      inReplyTo: "<child@example.test>",
+      references: "<root@example.test>",
+      attachments: null,
+    });
+
+    expect(invokeMock).toHaveBeenCalledWith("send_reply", {
+      accountId: "me@example.test",
+      to: "alice@example.test",
+      cc: "team@example.test",
+      subject: "Status",
+      body: "<p>Reply</p>",
+      threadId: "gmail-thread",
+      inReplyTo: "<child@example.test>",
+      references: "<root@example.test>",
+      attachments: null,
+    });
+  });
+
+  it("binds an autosaved inline reply draft to its Gmail thread", async () => {
+    await tauriApi.saveDraft({
+      accountId: "me@example.test",
+      draftId: null,
+      to: "unfinished-address",
+      cc: "",
+      bcc: "",
+      subject: "Re: Status",
+      body: "<p>Draft</p>",
+      attachments: null,
+      threadId: "gmail-thread",
+      inReplyTo: "<child@example.test>",
+      references: "<root@example.test>",
+    });
+
+    expect(invokeMock).toHaveBeenCalledWith("save_draft", expect.objectContaining({
+      to: "unfinished-address",
+      threadId: "gmail-thread",
+      inReplyTo: "<child@example.test>",
+      references: "<root@example.test>",
+    }));
   });
 });

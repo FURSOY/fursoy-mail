@@ -15,10 +15,9 @@ import {
   type MailZoom, type DensityMode, type MailViewMode, type MailViewPreference,
   type RemoteImageMode, DEFAULT_APP_CONTROLS,
 } from "./types";
-import { useMemo } from "react";
 import {
   MAIL_TABS, STARTUP_NETWORK_DELAY_MS,
-  MAX_ACTIVE_EMAILS, MAX_LABEL_CACHE, MAIL_PAGE_SIZE, ZOOM_STEPS,
+  MAX_LABEL_CACHE, MAIL_PAGE_SIZE, ZOOM_STEPS,
   isAuthFailure, extractVerificationCode,
   readMailZoom, readThemePreset, getAutoMailViewMode, parseMailtoUrl,
 } from "./utils";
@@ -68,6 +67,33 @@ function emailKey(email: EmailSummary): string {
   return mailKey(email.account_id, email.id);
 }
 
+function threadKey(group: ThreadGroup): string {
+  const email = group.latestEmail;
+  return `${email.account_id}\u0000${email.thread_id || email.id}`;
+}
+
+function applyRecentlyRead(group: ThreadGroup, recentlyRead: Set<string>): ThreadGroup {
+  if (!recentlyRead.has(emailKey(group.latestEmail))) return group;
+  const unreadCount = group.latestEmail.unread ? Math.max(0, group.unreadCount - 1) : group.unreadCount;
+  return {
+    ...group,
+    latestEmail: { ...group.latestEmail, unread: false },
+    unreadCount,
+    hasUnread: unreadCount > 0,
+  };
+}
+
+function updateGroupUnread(group: ThreadGroup, mail: EmailSummary, unread: boolean): ThreadGroup {
+  if (!sameEmail(group.latestEmail, mail) || group.latestEmail.unread === unread) return group;
+  const unreadCount = Math.max(0, group.unreadCount + (unread ? 1 : -1));
+  return {
+    ...group,
+    latestEmail: { ...group.latestEmail, unread },
+    unreadCount,
+    hasUnread: unreadCount > 0,
+  };
+}
+
 function sameEmail(left: EmailSummary, right: EmailSummary): boolean {
   return left.id === right.id && left.account_id === right.account_id;
 }
@@ -80,7 +106,8 @@ function App() {
   // Settings
   const [syncIntervalValue, setSyncIntervalValue] = useState(() => {
     const saved = localStorage.getItem("fursoy_sync_interval");
-    return saved ? parseInt(saved, 10) : 2;
+    const parsed = saved ? parseInt(saved, 10) : 30;
+    return Number.isFinite(parsed) ? Math.max(15, parsed) : 30;
   });
   const [notifDuration, setNotifDuration] = useState(() => {
     const saved = localStorage.getItem("fursoy_notif_duration");
@@ -126,6 +153,7 @@ function App() {
   const [windowWidth, setWindowWidth] = useState(() => window.innerWidth);
   const [singlePanelView, setSinglePanelView] = useState<"list" | "reader">("list");
   const [emails, setEmails] = useState<EmailSummary[]>([]);
+  const [mailThreadGroups, setMailThreadGroups] = useState<ThreadGroup[]>([]);
   const {
     accounts, accountsLoaded, isConnecting, accountTokens, activeAccountId,
     tokenExpired, expiredAccountIds,
@@ -135,7 +163,13 @@ function App() {
   } = useAccounts();
 
   const [searchQuery, setSearchQuery] = useState("");
+  const [activeSearchQuery, setActiveSearchQuery] = useState("");
+  const [isSearchLoading, setIsSearchLoading] = useState(false);
+  const [searchFailed, setSearchFailed] = useState(false);
+  const [searchSubmitVersion, setSearchSubmitVersion] = useState(0);
   const [searchResults, setSearchResults] = useState<EmailSummary[] | null>(null);
+  const [searchIndexVersion, setSearchIndexVersion] = useState(0);
+  const [searchThreadGroups, setSearchThreadGroups] = useState<ThreadGroup[] | null>(null);
   const [hasMoreEmails, setHasMoreEmails] = useState(true);
   const [isLoadingMoreEmails, setIsLoadingMoreEmails] = useState(false);
   const [mailAppendVersion, setMailAppendVersion] = useState(0);
@@ -168,11 +202,13 @@ function App() {
   const recentlyReadRef = useRef<Set<string>>(new Set());
   const mailMutationQueueRef = useRef<MailMutationQueue>(new Map());
   const pendingUnreadBadgeDeltasRef = useRef<Map<string, { delta: number; expiresAt: number }>>(new Map());
-  const mailPageCursorRef = useRef<EmailSummary | null>(null);
+  const mailPageCursorRef = useRef<ThreadGroup | null>(null);
   const mailListRequestIdRef = useRef(0);
   const searchRequestIdRef = useRef(0);
+  const activeSearchQueryRef = useRef("");
+  const handledSearchSubmitVersionRef = useRef(0);
   const isLoadingMoreEmailsRef = useRef(false);
-  const tabEmailCacheRef = useRef<Partial<Record<string, EmailSummary[]>>>({});
+  const tabEmailCacheRef = useRef<Partial<Record<string, ThreadGroup[]>>>({});
   const [, startTabTransition] = useTransition();
   const [, startDataTransition] = useTransition();
   const activeTabRef = useRef(activeTab);
@@ -397,30 +433,29 @@ function App() {
   const mailCacheKey = (label: string, accountId: string | null) =>
     `${accountId ?? "__all_accounts__"}\u0000${label}`;
 
-  const loadEmails = async (tab?: string, options?: { append?: boolean; cursor?: EmailSummary | null }) => {
+  const loadEmails = async (tab?: string, options?: { append?: boolean; cursor?: ThreadGroup | null }) => {
     try {
       const label = tab || activeTabRef.current;
       if (!MAIL_TABS.has(label)) {
         startDataTransition(() => setEmails([]));
+        setMailThreadGroups([]);
         return [];
       }
       const accountId = activeAccountIdRef.current; // null = all accounts
       const cursor = options?.cursor ?? null;
       const requestId = ++mailListRequestIdRef.current;
-      const result = await tauriApi.getEmailsByLabel({
+      const result = await tauriApi.getThreadGroupsByLabel({
         label,
         accountId,
         limit: MAIL_PAGE_SIZE,
-        beforeDate: cursor?.date ?? null,
-        beforeAccountId: cursor?.account_id ?? null,
-        beforeId: cursor?.id ?? null,
+        beforeDate: cursor?.latestEmail.date ?? null,
+        beforeAccountId: cursor?.latestEmail.account_id ?? null,
+        beforeThreadId: cursor ? (cursor.latestEmail.thread_id || cursor.latestEmail.id) : null,
       });
       if (requestId !== mailListRequestIdRef.current || !isMailContextCurrent(label, accountId)) {
         return [];
       }
-      const adjusted = result.map(m =>
-        recentlyReadRef.current.has(emailKey(m)) ? { ...m, unread: false } : m
-      );
+      const adjusted = result.map(group => applyRecentlyRead(group, recentlyReadRef.current));
       if (!options?.append) {
         setHasMoreEmails(adjusted.length === MAIL_PAGE_SIZE);
       }
@@ -428,26 +463,25 @@ function App() {
         mailPageCursorRef.current = adjusted[adjusted.length - 1];
       }
       const cacheKey = mailCacheKey(label, accountId);
-      tabEmailCacheRef.current[cacheKey] = (options?.append
-        ? [...(tabEmailCacheRef.current[cacheKey] ?? []), ...adjusted]
-        : adjusted).slice(0, 2_000);
+      const cachedGroups = tabEmailCacheRef.current[cacheKey] ?? [];
+      const cachedKeys = new Set(cachedGroups.map(threadKey));
+      const nextGroups = options?.append
+        ? [...cachedGroups, ...adjusted.filter(group => !cachedKeys.has(threadKey(group)))]
+        : adjusted;
+      tabEmailCacheRef.current[cacheKey] = nextGroups;
       const cacheKeys = Object.keys(tabEmailCacheRef.current);
       while (cacheKeys.length > MAX_LABEL_CACHE) {
         const oldest = cacheKeys.shift();
         if (oldest && oldest !== cacheKey) delete tabEmailCacheRef.current[oldest];
       }
       startDataTransition(() => {
-        setEmails(previous => {
-          if (!options?.append) return adjusted;
-          const seen = new Set(previous.map(emailKey));
-          return [...previous, ...adjusted.filter(email => !seen.has(emailKey(email)))]
-            .slice(0, MAX_ACTIVE_EMAILS);
-        });
+        setMailThreadGroups(nextGroups);
+        setEmails(nextGroups.map(group => group.latestEmail));
         if (options?.append && adjusted.length > 0) {
           setMailAppendVersion(version => version + 1);
         }
       });
-      return adjusted;
+      return adjusted.map(group => group.latestEmail);
     } catch (e) {
       console.error("Failed to load emails:", e);
       return [];
@@ -465,16 +499,40 @@ function App() {
   const loadOlderEmails = async () => {
     const label = activeTabRef.current;
     const accountId = activeAccountIdRef.current;
-    if (!MAIL_TABS.has(label) || !hasMoreEmails || emails.length >= MAX_ACTIVE_EMAILS || isLoadingMoreEmailsRef.current) return false;
+    if (!MAIL_TABS.has(label) || !hasMoreEmails || isLoadingMoreEmailsRef.current) return false;
 
     isLoadingMoreEmailsRef.current = true;
     setIsLoadingMoreEmails(true);
     try {
-      const page = await loadEmails(label, { append: true, cursor: mailPageCursorRef.current });
+      const query = activeSearchQueryRef.current;
+      let pageLength = 0;
+      if (query) {
+        const cursor = mailPageCursorRef.current;
+        const page = await tauriApi.searchLocalThreadGroups({
+          query,
+          accountId,
+          limit: MAIL_PAGE_SIZE,
+          beforeDate: cursor?.latestEmail.date ?? null,
+          beforeAccountId: cursor?.latestEmail.account_id ?? null,
+          beforeThreadId: cursor ? (cursor.latestEmail.thread_id || cursor.latestEmail.id) : null,
+        });
+        if (query !== searchQuery.trim() || accountId !== activeAccountIdRef.current) return false;
+        const adjusted = page.map(group => applyRecentlyRead(group, recentlyReadRef.current));
+        if (adjusted.length > 0) mailPageCursorRef.current = adjusted[adjusted.length - 1];
+        const current = searchThreadGroups ?? [];
+        const seen = new Set(current.map(threadKey));
+        const next = [...current, ...adjusted.filter(group => !seen.has(threadKey(group)))];
+        setSearchThreadGroups(next);
+        setSearchResults(next.map(group => group.latestEmail));
+        if (adjusted.length > 0) setMailAppendVersion(version => version + 1);
+        pageLength = adjusted.length;
+      } else {
+        pageLength = (await loadEmails(label, { append: true, cursor: mailPageCursorRef.current })).length;
+      }
       const status = await tauriApi.getMailboxDownloadStatus(accountId)
         .catch(() => ({ running: false, pending: false, state: "completed" as const, retryAfter: null }));
       if (!isMailContextCurrent(label, accountId)) return false;
-      if (page.length === 0 && status.pending && !status.running) {
+      if (pageLength === 0 && status.pending && !status.running) {
         // Never block the list on Gmail. Request a safe per-account sync and
         // let the existing background worker populate SQLite asynchronously.
         const targets = accountId
@@ -489,9 +547,8 @@ function App() {
       setIsMailboxBackfilling(status.running);
       setMailboxDownloadPending(status.pending);
       setMailboxDownloadState(status.state);
-      const reachedMemoryLimit = emails.length + page.length >= MAX_ACTIVE_EMAILS;
-      setHasMoreEmails(!reachedMemoryLimit && (page.length === MAIL_PAGE_SIZE || status.running || status.pending));
-      return page.length > 0;
+      setHasMoreEmails(pageLength === MAIL_PAGE_SIZE || (!query && (status.running || status.pending)));
+      return pageLength > 0;
     } catch (error) {
       console.error("Failed to load older emails:", error);
       showToast(tr.mail.loadOlderFailed, "error");
@@ -515,6 +572,7 @@ function App() {
           // current list is loaded again below instead of leaving stale rows up.
           tabEmailCacheRef.current = {};
           setEmails([]);
+          setMailThreadGroups([]);
           setSelectedMail(null);
           setSelectedMailBody("");
           setSelectedMailBodyId(null);
@@ -729,11 +787,15 @@ function App() {
   useEffect(() => {
     if (!MAIL_TABS.has(activeTab)) {
       startDataTransition(() => setEmails([]));
+      setMailThreadGroups([]);
       return;
     }
     resetMailPagination();
     const cached = tabEmailCacheRef.current[mailCacheKey(activeTab, activeAccountId)];
-    if (cached !== undefined) setEmails(cached);
+    if (cached !== undefined) {
+      setMailThreadGroups(cached);
+      setEmails(cached.map(group => group.latestEmail));
+    }
     void loadEmails(activeTab);
   }, [activeTab, activeAccountId]);
 
@@ -749,15 +811,15 @@ function App() {
         setIsMailboxBackfilling(status.running);
         setMailboxDownloadPending(status.pending);
         setMailboxDownloadState(status.state);
-        if (!status.running && !status.pending && MAIL_TABS.has(label)) {
+        if (!searchQuery.trim() && !status.running && !status.pending && MAIL_TABS.has(label)) {
           const cursor = mailPageCursorRef.current;
-          const nextPage = await tauriApi.getEmailsByLabel({
+          const nextPage = await tauriApi.getThreadGroupsByLabel({
             label,
             accountId,
             limit: 1,
-            beforeDate: cursor?.date ?? null,
-            beforeAccountId: cursor?.account_id ?? null,
-            beforeId: cursor?.id ?? null,
+            beforeDate: cursor?.latestEmail.date ?? null,
+            beforeAccountId: cursor?.latestEmail.account_id ?? null,
+            beforeThreadId: cursor ? (cursor.latestEmail.thread_id || cursor.latestEmail.id) : null,
           }).catch(() => []);
           if (!cancelled && isMailContextCurrent(label, accountId)) setHasMoreEmails(nextPage.length > 0);
         }
@@ -769,35 +831,88 @@ function App() {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [accountsLoaded, activeAccountId, activeTab]);
+  }, [accountsLoaded, activeAccountId, activeTab, searchQuery]);
+
+  useEffect(() => {
+    const unlistenPromise = listen("mail-search-index-ready", () => {
+      setSearchIndexVersion(version => version + 1);
+    });
+    return () => { void unlistenPromise.then(unlisten => unlisten()); };
+  }, []);
 
   useEffect(() => {
     const query = searchQuery.trim();
     const requestId = ++searchRequestIdRef.current;
+    const submitImmediately = searchSubmitVersion !== handledSearchSubmitVersionRef.current;
+    handledSearchSubmitVersionRef.current = searchSubmitVersion;
     if (!query) {
+      void tauriApi.cancelLocalSearch().catch(() => {});
+      activeSearchQueryRef.current = "";
+      setActiveSearchQuery("");
+      setIsSearchLoading(false);
+      setSearchFailed(false);
       setSearchResults(null);
+      setSearchThreadGroups(null);
+      resetMailPagination();
+      const groups = tabEmailCacheRef.current[mailCacheKey(activeTabRef.current, activeAccountIdRef.current)] ?? mailThreadGroups;
+      if (groups.length > 0) mailPageCursorRef.current = groups[groups.length - 1];
+      setHasMoreEmails(groups.length === 0 || groups.length % MAIL_PAGE_SIZE === 0);
       return;
     }
 
     const accountId = activeAccountId;
+    mailPageCursorRef.current = null;
+    setHasMoreEmails(false);
+    let searchTimeout = 0;
     const timer = window.setTimeout(() => {
-      void tauriApi.searchLocalEmails(query, accountId, 500)
-        .then(results => {
+      void (async () => {
+        if (searchRequestIdRef.current !== requestId) return;
+        activeSearchQueryRef.current = query;
+        setActiveSearchQuery(query);
+        setIsSearchLoading(true);
+        setSearchFailed(false);
+        searchTimeout = window.setTimeout(() => {
+          if (searchRequestIdRef.current !== requestId) return;
+          searchRequestIdRef.current += 1;
+          void tauriApi.cancelLocalSearch().catch(() => {});
+          console.error("Local email search timed out.");
+          setSearchResults([]);
+          setSearchThreadGroups([]);
+          setHasMoreEmails(false);
+          setIsSearchLoading(false);
+          setSearchFailed(true);
+        }, 8_000);
+        try {
+          const results = await tauriApi.searchLocalThreadGroups({ query, accountId, limit: MAIL_PAGE_SIZE });
           if (
             searchRequestIdRef.current !== requestId ||
             activeAccountIdRef.current !== accountId
           ) return;
-          setSearchResults(results);
-        })
-        .catch(error => {
+          const adjusted = results.map(group => applyRecentlyRead(group, recentlyReadRef.current));
+          setSearchThreadGroups(adjusted);
+          setSearchResults(adjusted.map(group => group.latestEmail));
+          mailPageCursorRef.current = adjusted[adjusted.length - 1] ?? null;
+          setHasMoreEmails(adjusted.length === MAIL_PAGE_SIZE);
+          setSearchFailed(false);
+        } catch (error) {
           if (searchRequestIdRef.current !== requestId) return;
           console.error("Local email search failed:", error);
           setSearchResults([]);
-        });
-    }, 150);
+          setSearchThreadGroups([]);
+          setHasMoreEmails(false);
+          setSearchFailed(true);
+        } finally {
+          window.clearTimeout(searchTimeout);
+          if (searchRequestIdRef.current === requestId) setIsSearchLoading(false);
+        }
+      })();
+    }, submitImmediately ? 0 : 400);
 
-    return () => window.clearTimeout(timer);
-  }, [searchQuery, activeAccountId]);
+    return () => {
+      window.clearTimeout(timer);
+      window.clearTimeout(searchTimeout);
+    };
+  }, [searchQuery, activeAccountId, searchIndexVersion, searchSubmitVersion]);
 
   useEffect(() => {
     if (activeTab !== "settings") return;
@@ -868,6 +983,7 @@ function App() {
         clearPeriodicSync();
         setSessionExpired(false);
         setEmails([]);
+        setMailThreadGroups([]);
         setSelectedMail(null);
         setSelectedMailBody("");
         setSelectedMailBodyId(null);
@@ -928,11 +1044,14 @@ function App() {
     setSelectedMail(emailKey(mail));
     if (mailViewMode !== "split") setSinglePanelView("reader");
     setShowReply(false);
+    setReplyTarget(null);
     setReplyText("");
     if (mail.unread) {
       addBoundedSetValue(recentlyReadRef.current, emailKey(mail), MAX_RECENTLY_READ_EMAILS);
       setEmails(prev => prev.map(m => sameEmail(m, mail) ? { ...m, unread: false } : m));
       setSearchResults(prev => prev?.map(m => sameEmail(m, mail) ? { ...m, unread: false } : m) ?? null);
+      setMailThreadGroups(prev => prev.map(group => updateGroupUnread(group, mail, false)));
+      setSearchThreadGroups(prev => prev?.map(group => updateGroupUnread(group, mail, false)) ?? null);
       adjustUnreadBadge(mail.account_id, -1);
       try {
         await enqueueMailMutation(
@@ -947,6 +1066,8 @@ function App() {
         recentlyReadRef.current.delete(emailKey(mail));
         setEmails(prev => prev.map(m => sameEmail(m, mail) ? { ...m, unread: true } : m));
         setSearchResults(prev => prev?.map(m => sameEmail(m, mail) ? { ...m, unread: true } : m) ?? null);
+        setMailThreadGroups(prev => prev.map(group => updateGroupUnread(group, mail, true)));
+        setSearchThreadGroups(prev => prev?.map(group => updateGroupUnread(group, mail, true)) ?? null);
         setThreadEmails(prev => prev.map(m => sameEmail(m, mail) ? { ...m, unread: true } : m));
         adjustUnreadBadge(mail.account_id, 1);
       }
@@ -986,8 +1107,9 @@ function App() {
   }, [handleLoadRemoteImages]);
 
   // --- Derived state ---
-  const hasSearchQuery = searchQuery.trim().length > 0;
+  const hasSearchQuery = activeSearchQuery.length > 0;
   const displayEmails = hasSearchQuery ? (searchResults ?? []) : emails;
+  const threadGroups = hasSearchQuery ? (searchThreadGroups ?? []) : mailThreadGroups;
   const activeMail = [...displayEmails, ...emails].find(m => emailKey(m) === selectedMail);
   const activeMailKey = activeMail ? emailKey(activeMail) : null;
   const selectedMailViewMode = mailViewPreference === "auto" ? getAutoMailViewMode(windowWidth) : mailViewPreference;
@@ -1023,20 +1145,18 @@ function App() {
   });
 
   const {
-    showReply, setShowReply, replyMode, setReplyMode, replyText, setReplyText,
+    showReply, setShowReply, replyTarget, setReplyTarget, replyMode, setReplyMode, replyText, setReplyText,
     isSending, showCompose, setShowCompose, confirmModal, setConfirmModal,
     composeTo, setComposeTo, composeSubject, setComposeSubject, composeBody, setComposeBody,
     composeHtmlAppend, setComposeHtmlAppend, composeAccountId, setComposeAccountId,
     composeSendError, setComposeSendError,
-    handleArchive, handleTrash, handleMoveToInbox,
+    handleArchive, handleTrash, handleReportSpam, handleMoveToInbox,
     handleReply, handleComposeSend, handleMarkAsUnread, handleForward,
   } = useMailActions({
     locale: tr,
     accounts,
     accountTokens,
     activeAccountId,
-    activeMail,
-    selectedMailBody,
     activeTabRef,
     recentlyReadRef,
     mailMutationQueueRef,
@@ -1135,12 +1255,25 @@ function App() {
   const closeReader = () => {
     if (selectedMailViewMode !== "single-toggle") setSelectedMail(null);
     setShowReply(false);
+    setReplyTarget(null);
     setSinglePanelView("list");
   };
 
+  const previousFixedMailZoomRef = useRef<Exclude<MailZoom, "fit">>(1);
+
+  useEffect(() => {
+    if (mailZoom !== "fit") previousFixedMailZoomRef.current = mailZoom;
+  }, [mailZoom]);
+
   const persistMailZoom = useCallback((zoom: MailZoom) => {
-    setMailZoom(zoom);
-    localStorage.setItem("fursoy_mail_zoom", zoom === "fit" ? "fit" : String(zoom));
+    setMailZoom(current => {
+      const next = zoom === "fit" && current === "fit"
+        ? previousFixedMailZoomRef.current
+        : zoom;
+      if (next !== "fit") previousFixedMailZoomRef.current = next;
+      localStorage.setItem("fursoy_mail_zoom", next === "fit" ? "fit" : String(next));
+      return next;
+    });
   }, []);
 
   const stepMailZoom = useCallback((direction: 1 | -1) => {
@@ -1159,26 +1292,6 @@ function App() {
   const effectiveZoomPct = Math.round((mailZoom === "fit" ? mailFitScale : mailZoom) * 100);
 
   useEffect(() => { setVerificationCopyState("idle"); }, [selectedMail]);
-  const threadGroups = useMemo((): ThreadGroup[] => {
-    const map = new Map<string, ThreadGroup>();
-    for (const email of displayEmails) {
-      const key = `${email.account_id}\u0000${email.thread_id || email.id}`;
-      const name = email.sender.split("<")[0].replace(/"/g, "").trim() || email.sender;
-      const ex = map.get(key);
-      if (!ex) {
-        map.set(key, { latestEmail: email, hasUnread: email.unread, count: 1, participants: [name] });
-      } else {
-        map.set(key, {
-          latestEmail: email.date > ex.latestEmail.date ? email : ex.latestEmail,
-          hasUnread: ex.hasUnread || email.unread,
-          count: ex.count + 1,
-          participants: ex.participants.includes(name) ? ex.participants : [...ex.participants, name],
-        });
-      }
-    }
-    return Array.from(map.values()).sort((a, b) => b.latestEmail.date - a.latestEmail.date);
-  }, [displayEmails]);
-
   const unreadCount = inboxUnread;
   const hasLoadedActiveBody = !!activeMail && selectedMailBodyId === selectedMail;
   const verificationCode = activeMail && hasLoadedActiveBody
@@ -1186,6 +1299,7 @@ function App() {
     : null;
   const activeMailTab = activeMail?.label ?? activeTab;
   const showArchiveBtn = activeMailTab === "inbox" || activeMailTab === "sent";
+  const showSpamBtn = activeMailTab === "inbox" || activeMailTab === "archive";
   const showRestoreBtn = activeMailTab === "trash" || activeMailTab === "spam" || activeMailTab === "archive";
   const showTrashToBinBtn = activeMailTab !== "trash";
   const isCompactSidebarMode =
@@ -1356,7 +1470,11 @@ function App() {
               isUserSyncing={isUserSyncing}
               isBackgroundSyncing={isBackgroundSyncing}
               searchQuery={searchQuery}
+              highlightQuery={searchQuery.trim()}
+              isSearchLoading={isSearchLoading}
+              searchFailed={searchFailed}
               setSearchQuery={setSearchQuery}
+              onSearchSubmit={() => setSearchSubmitVersion(version => version + 1)}
               searchInputRef={searchInputRef}
               activeTab={activeTab}
               usesOverlaySidebar={usesOverlaySidebar}
@@ -1365,8 +1483,7 @@ function App() {
               onViewPreferenceChange={handleMailViewPreferenceChange}
               onRefresh={handleRefresh}
               onLoadMore={loadOlderEmails}
-              hasMoreEmails={hasSearchQuery ? false : hasMoreEmails}
-              mailMemoryLimitReached={!hasSearchQuery && emails.length >= MAX_ACTIVE_EMAILS}
+              hasMoreEmails={hasMoreEmails}
               isLoadingMoreEmails={isLoadingMoreEmails}
               mailAppendVersion={mailAppendVersion}
               notificationFocusVersion={notificationFocusVersion}
@@ -1389,6 +1506,7 @@ function App() {
                 activeTab={activeMailTab}
                 closeReader={closeReader}
                 showReply={showReply} setShowReply={setShowReply}
+                replyTarget={replyTarget} setReplyTarget={setReplyTarget}
                 replyMode={replyMode} setReplyMode={setReplyMode}
                 replyText={replyText} setReplyText={setReplyText}
                 isSending={isSending}
@@ -1407,13 +1525,15 @@ function App() {
                 verificationCopyState={verificationCopyState}
                 setVerificationCopyState={setVerificationCopyState}
                 showArchiveBtn={showArchiveBtn}
+                showSpamBtn={showSpamBtn}
                 showRestoreBtn={showRestoreBtn}
                 showTrashToBinBtn={showTrashToBinBtn}
-                onArchive={() => handleArchive(activeMail)}
-                onTrash={() => handleTrash(activeMail)}
-                onMoveToInbox={() => handleMoveToInbox(activeMail)}
-                onMarkAsUnread={() => handleMarkAsUnread(activeMail)}
-                onForward={() => handleForward(activeMail)}
+                onArchive={handleArchive}
+                onReportSpam={handleReportSpam}
+                onTrash={handleTrash}
+                onMoveToInbox={handleMoveToInbox}
+                onMarkAsUnread={handleMarkAsUnread}
+                onForward={(mail) => { void handleForward(mail); }}
                 onOpenUrl={openExternalMailUrl}
                 mailScrollRef={mailScrollRef}
                 relayoutKey={`${mailViewMode}|${singlePanelView}|${windowWidth}`}
@@ -1424,6 +1544,7 @@ function App() {
                 onLoadOlderThread={() => { void loadOlderThreadEmails(); }}
                 accessToken={getTokenForEmail(activeMail) ?? null}
                 showToast={showToast}
+                searchQuery={activeSearchQuery}
               />
             ) : (
               <main

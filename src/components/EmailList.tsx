@@ -1,8 +1,9 @@
 import { Search, X, RefreshCw, Settings, Columns2, PanelLeft, Rows3, Menu } from "lucide-react";
 import { useLayoutEffect, useRef } from "react";
+import { useVirtualizer } from "@tanstack/react-virtual";
 import { useLocale } from "../i18n";
 import type { Account, EmailSummary, ThreadGroup, MailViewPreference } from "../types";
-import { formatDate } from "../utils";
+import { formatDate, splitSearchHighlight } from "../utils";
 import { ToolbarTip } from "./ToolbarTip";
 
 interface EmailListProps {
@@ -13,7 +14,11 @@ interface EmailListProps {
   isUserSyncing: boolean;
   isBackgroundSyncing: boolean;
   searchQuery: string;
+  highlightQuery: string;
+  isSearchLoading: boolean;
+  searchFailed: boolean;
   setSearchQuery: (q: string) => void;
+  onSearchSubmit: () => void;
   searchInputRef: React.RefObject<HTMLInputElement | null>;
   activeTab: string;
   usesOverlaySidebar: boolean;
@@ -23,7 +28,6 @@ interface EmailListProps {
   onRefresh: () => void;
   onLoadMore: () => Promise<boolean>;
   hasMoreEmails: boolean;
-  mailMemoryLimitReached: boolean;
   isLoadingMoreEmails: boolean;
   mailAppendVersion: number;
   notificationFocusVersion: number;
@@ -35,13 +39,20 @@ interface EmailListProps {
   activeAccountId?: string | null;
 }
 
+function HighlightedText({ text, query }: { text: string; query: string }) {
+  return <>{splitSearchHighlight(text, query).map((segment, index) => segment.match
+    ? <mark key={`${index}-${segment.text}`} className="rounded-sm bg-yellow-300 px-px text-zinc-950">{segment.text}</mark>
+    : <span key={`${index}-${segment.text}`}>{segment.text}</span>
+  )}</>;
+}
+
 export function EmailList({
   className, threadGroups, selectedMail, onMailClick,
   isUserSyncing, isBackgroundSyncing,
-  searchQuery, setSearchQuery, searchInputRef,
+  searchQuery, highlightQuery, isSearchLoading, searchFailed, setSearchQuery, onSearchSubmit, searchInputRef,
   activeTab, usesOverlaySidebar, onMenuOpen,
   mailViewPreference, onViewPreferenceChange,
-  onRefresh, onLoadMore, hasMoreEmails, mailMemoryLimitReached, isLoadingMoreEmails, mailAppendVersion, notificationFocusVersion, isMailboxBackfilling, mailboxDownloadPending, mailboxDownloadState, accessToken,
+  onRefresh, onLoadMore, hasMoreEmails, isLoadingMoreEmails, mailAppendVersion, notificationFocusVersion, isMailboxBackfilling, mailboxDownloadPending, mailboxDownloadState, accessToken,
   accounts, activeAccountId,
 }: EmailListProps) {
   const tr = useLocale();
@@ -58,6 +69,16 @@ export function EmailList({
   const loadRequestInFlight = useRef(false);
   const ignoreAutoLoadUntil = useRef(0);
   const completedNotificationFocusVersion = useRef(0);
+  const rowVirtualizer = useVirtualizer({
+    count: threadGroups.length,
+    getScrollElement: () => listRef.current,
+    estimateSize: () => showAccountBadge ? 98 : 76,
+    overscan: 10,
+    getItemKey: index => {
+      const mail = threadGroups[index]?.latestEmail;
+      return mail ? `${mail.account_id}\u0000${mail.thread_id || mail.id}` : index;
+    },
+  });
 
   const requestOlderEmails = async () => {
     if (loadRequestInFlight.current || isLoadingMoreEmails) return;
@@ -96,11 +117,11 @@ export function EmailList({
       notificationFocusVersion === completedNotificationFocusVersion.current ||
       !selectedMail
     ) return;
-    const selectedRow = listRef.current?.querySelector<HTMLElement>('[data-mail-selected="true"]');
-    if (!selectedRow) return;
-    selectedRow.scrollIntoView({ block: "center", inline: "nearest", behavior: "smooth" });
+    const index = threadGroups.findIndex(group => `${group.latestEmail.account_id}\u0000${group.latestEmail.id}` === selectedMail);
+    if (index < 0) return;
+    rowVirtualizer.scrollToIndex(index, { align: "center", behavior: "smooth" });
     completedNotificationFocusVersion.current = notificationFocusVersion;
-  }, [notificationFocusVersion, selectedMail, threadGroups]);
+  }, [notificationFocusVersion, selectedMail, threadGroups, rowVirtualizer]);
 
   return (
     <section className={className}>
@@ -173,6 +194,9 @@ export function EmailList({
             type="text"
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") onSearchSubmit();
+            }}
             placeholder={tr.mail.searchPlaceholder}
             aria-label={tr.mail.searchPlaceholder}
             className="w-full bg-white/[0.03] border border-white/5 rounded-lg pl-8 pr-7 py-1.5 text-xs outline-none focus:border-blue-500/40 focus:bg-white/[0.02] transition-colors text-zinc-200 placeholder:text-zinc-600 select-text"
@@ -186,6 +210,9 @@ export function EmailList({
             >
               <X className="w-3 h-3" />
             </button>
+          )}
+          {isSearchLoading && (
+            <span className="absolute right-7 top-1/2 h-2 w-2 -translate-y-1/2 animate-pulse rounded-full bg-blue-500" />
           )}
         </div>
       </div>
@@ -208,14 +235,20 @@ export function EmailList({
       >
         {threadGroups.length === 0 && !isUserSyncing && !isBackgroundSyncing && (
           <div className="p-8 text-center text-zinc-600 text-xs">
-            {searchQuery
+            {isSearchLoading
+              ? tr.mail.searching
+              : searchFailed
+              ? tr.mail.searchFailed
+              : searchQuery
               ? tr.mail.searchEmpty
               : activeTab === "inbox"
               ? tr.mail.emptyInbox
               : tr.mail.emptyFolder}
           </div>
         )}
-        {threadGroups.map((group) => {
+        <div className="relative w-full" style={{ height: `${rowVirtualizer.getTotalSize()}px` }}>
+        {rowVirtualizer.getVirtualItems().map((virtualRow) => {
+          const group = threadGroups[virtualRow.index];
           const mail = group.latestEmail;
           const isSelected = selectedMail === `${mail.account_id}\u0000${mail.id}`;
           const senderDisplay = activeTab === "sent"
@@ -226,9 +259,15 @@ export function EmailList({
             : "";
 
           return (
+            <div
+              key={`${mail.account_id}\u0000${mail.thread_id || mail.id}`}
+              data-index={virtualRow.index}
+              ref={rowVirtualizer.measureElement}
+              className="absolute left-0 top-0 w-full"
+              style={{ transform: `translateY(${virtualRow.start}px)` }}
+            >
             <button
               type="button"
-              key={`${mail.account_id}\u0000${mail.thread_id || mail.id}`}
               data-mail-selected={isSelected ? "true" : undefined}
               onClick={() => onMailClick(mail)}
               aria-pressed={isSelected}
@@ -249,7 +288,7 @@ export function EmailList({
                   className={`min-w-0 truncate text-xs ${group.hasUnread ? "font-semibold text-zinc-100" : "text-zinc-400"}`}
                   title={senderDisplay}
                 >
-                  {senderDisplay}
+                  <HighlightedText text={senderDisplay} query={highlightQuery} />
                 </span>
                 <div className="flex items-center gap-1.5 shrink-0">
                   {group.count > 1 && (
@@ -266,12 +305,12 @@ export function EmailList({
                 className={`min-w-0 truncate text-xs ${group.hasUnread ? "text-zinc-200 font-medium" : "text-zinc-500"}`}
                 title={mail.subject}
               >
-                {mail.subject}
+                <HighlightedText text={mail.subject} query={highlightQuery} />
               </h3>
 
               {/* Row 3: snippet */}
               <p className="mt-0.5 min-w-0 truncate text-[length:var(--font-size-metadata)] text-zinc-600" title={mail.snippet}>
-                {snippetPrefix}{mail.snippet}
+                <HighlightedText text={`${snippetPrefix}${mail.snippet}`} query={highlightQuery} />
               </p>
 
               {/* Account badge (multi-account "all" view) */}
@@ -292,8 +331,10 @@ export function EmailList({
                 );
               })()}
             </button>
+            </div>
           );
         })}
+        </div>
         {(threadGroups.length > 0 || ["error", "paused", "relogin_required", "rate_limited"].includes(mailboxDownloadState)) && (
           <div className="flex min-h-14 items-center justify-center px-4 text-xs text-zinc-600">
             {isLoadingMoreEmails ? (
@@ -308,8 +349,6 @@ export function EmailList({
               <span>{tr.mail.historyDownloadFailed}</span>
             ) : mailboxDownloadPending ? (
               <span>{tr.mail.historyDownloadPending}</span>
-            ) : mailMemoryLimitReached ? (
-              <span>{tr.mail.loadedMemoryLimit}</span>
             ) : hasMoreEmails ? (
               <button
                 type="button"

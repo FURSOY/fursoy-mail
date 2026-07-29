@@ -431,7 +431,7 @@ export function SettingsPanel({
               <div>
                 <div className="mb-2 text-xs font-medium text-[var(--color-text-secondary)]">{tr.settings.syncFrequencyTitle}</div>
                 <div className="flex items-center gap-3">
-                  <input type="number" min="1" max="300" value={syncIntervalValue} onChange={(e) => { const val = Math.max(1, parseInt(e.target.value, 10) || 1); setSyncIntervalValue(val); localStorage.setItem("fursoy_sync_interval", val.toString()); }} className="w-24 rounded-[var(--radius-md)] border border-[var(--color-border-default)] bg-[var(--color-surface-app)] px-3 py-1.5 text-sm text-[var(--color-text-secondary)] outline-none focus:border-[var(--app-accent)]/50" />
+                  <input type="number" min="15" max="300" value={syncIntervalValue} onChange={(e) => { const val = Math.max(15, parseInt(e.target.value, 10) || 15); setSyncIntervalValue(val); localStorage.setItem("fursoy_sync_interval", val.toString()); }} className="w-24 rounded-[var(--radius-md)] border border-[var(--color-border-default)] bg-[var(--color-surface-app)] px-3 py-1.5 text-sm text-[var(--color-text-secondary)] outline-none focus:border-[var(--app-accent)]/50" />
                   <span className="text-sm text-[var(--color-text-subtle)]">{tr.common.seconds}</span>
                 </div>
               </div>

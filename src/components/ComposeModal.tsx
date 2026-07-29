@@ -150,6 +150,10 @@ export function ComposeModal({
     const summary: DraftSummary = {
       id,
       messageId: "",
+      rfcMessageId: "",
+      threadId: "",
+      inReplyTo: "",
+      references: "",
       to: composeTo,
       cc: composeCc,
       bcc: composeBcc,
@@ -1084,8 +1088,7 @@ export function ComposeModal({
         </div>
         </div>
 
-        {!composeHtmlAppend && (
-          <aside className="hidden sm:flex w-72 shrink-0 flex-col border-l border-[var(--color-border-default)] bg-[var(--color-surface-app)]">
+          <aside className="hidden md:flex w-72 shrink-0 flex-col border-l border-[var(--color-border-default)] bg-[var(--color-surface-app)]">
             <div className="px-4 py-3 border-b border-[var(--color-border-subtle)] flex items-center justify-between gap-2">
               <div>
                 <div className="text-[length:var(--font-size-compact)] font-semibold text-[var(--color-text-secondary)]">{tr.compose.recentDrafts}</div>
@@ -1145,7 +1148,6 @@ export function ComposeModal({
               )}
             </div>
           </aside>
-        )}
       </div>
 
       {confirmDiscard && (

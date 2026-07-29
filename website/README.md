@@ -7,7 +7,7 @@ Dependency-free static website for FURSOY Mail.
 - `/` — product overview and Windows download
 - `/download/` — resolves and downloads the latest GitHub release installer
 - `/privacy/` — public Google user-data privacy policy
-- `/terms/` — public application terms of service
+- `/terms/` — public software license and legal notices
 
 ## Local preview
 

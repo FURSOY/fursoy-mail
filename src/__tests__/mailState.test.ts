@@ -10,6 +10,9 @@ function mail(id: string, accountId = "account-a", overrides: Partial<EmailSumma
     sender: "Sender <sender@example.test>",
     recipient: accountId,
     cc: "",
+    reply_to: "",
+    message_id: `<${id}@example.test>`,
+    references: "",
     subject: `Subject ${id}`,
     snippet: "",
     date: 1,
@@ -139,6 +142,7 @@ describe("inbox unread deltas", () => {
     const trashMail = mail("trash-mail", "account-a", { label: "trash" });
     expect(inboxUnreadDelta(inboxMail, "trash")).toBe(-1);
     expect(inboxUnreadDelta(inboxMail, "archive")).toBe(-1);
+    expect(inboxUnreadDelta(inboxMail, "spam")).toBe(-1);
     expect(inboxUnreadDelta(trashMail, "inbox")).toBe(1);
   });
 

@@ -1,6 +1,6 @@
 # FURSOY Mail Privacy Policy
 
-Last updated: July 17, 2026
+Last updated: July 26, 2026
 
 FURSOY Mail is a desktop Gmail client focused on fast notifications and one-click copying of verification codes. This policy explains what data the app accesses, why it accesses that data, where the data is stored, and the choices available to users.
 
@@ -48,58 +48,4 @@ This policy may be updated when the app's data practices or features change. Mat
 
 ## Contact
 
-Privacy questions and requests can be submitted through the [FURSOY Mail issue tracker](https://github.com/FURSOY/FURSOY-Mail/issues).
-
----
-
-# FURSOY Mail Gizlilik Politikası
-
-Son güncelleme: 17 Temmuz 2026
-
-FURSOY Mail, hızlı bildirimlere ve doğrulama kodlarının tek tıkla kopyalanmasına odaklanan bir masaüstü Gmail istemcisidir. Bu politika, uygulamanın hangi verilere neden eriştiğini, verileri nerede sakladığını ve kullanıcıların sahip olduğu seçenekleri açıklar.
-
-## Uygulamanın eriştiği veriler
-
-Bir Google hesabı bağladığınızda FURSOY Mail, Google OAuth aracılığıyla şunlara erişir:
-
-- e-posta adresi, görünen ad ve profil fotoğrafı gibi temel Google profil bilgileri;
-- mailleri görüntülemek, aramak, senkronize etmek ve doğrulama kodlarını algılamak için gereken Gmail ileti üst verileri ve içerikleri;
-- bir eki görüntülemeyi veya indirmeyi seçtiğinizde ek verileri;
-- mail gönderme ve bir iletinin posta kutusu durumunu ya da etiketlerini değiştirme gibi açıkça başlattığınız Gmail işlemleri.
-
-FURSOY Mail; mail istemcisi özellikleri iletileri okumayı, mail göndermeyi ve iletileri düzenlemeyi gerektirdiği için Gmail `gmail.modify` kapsamını ister. Bağlı hesapların uygulamada tanınabilmesi için temel profil ve e-posta kimliği kapsamlarını da ister.
-
-## Verilerin kullanım amacı
-
-Google kullanıcı verileri yalnızca FURSOY Mail'in kullanıcıya sunduğu özellikleri sağlamak için kullanılır. Bunlar; mailleri senkronize etme, bildirim gösterme, doğrulama kodlarını algılama, isteğiniz üzerine kod kopyalama, iletileri görüntüleme, ekleri indirme ve başlattığınız mail işlemlerini gerçekleştirmedir.
-
-FURSOY Mail, Google kullanıcı verilerini satmaz; reklam için kullanmaz ve reklam profili oluşturmaz. FURSOY Mail; çökme raporları, tanılama verileri, kullanım istatistikleri veya telemetri toplamaz.
-
-FURSOY Mail'in Google API'lerinden aldığı bilgileri kullanması ve aktarması, Sınırlı Kullanım şartları dâhil [Google API Hizmetleri Kullanıcı Verileri Politikası'na](https://developers.google.com/terms/api-services-user-data-policy) uyar.
-
-## Saklama ve aktarımlar
-
-- FURSOY Mail, posta kutusu verilerinizi alan veya saklayan bir sunucu işletmez.
-- OAuth erişim ve yenileme belirteçleri işletim sisteminin kimlik bilgisi kasasında saklanır.
-- Hesap bilgileri, mail önbelleği, ileti içeriği, ek üst verileri ve uygulama tercihleri cihazınızda yerel olarak saklanır.
-- Uygulama, kimlik doğrulama ve Gmail özellikleri için cihazınızdan doğrudan Google hizmetlerine bağlanır.
-- Ayarlarınız uzak görsellere izin veriyorsa bir ileti görseli yüklenirken görselin ait olduğu üçüncü taraf sunucuya bağlanılabilir. Bu sunucu IP adresiniz gibi olağan ağ bilgilerini alabilir.
-- Yerleşik güncelleyici, uygulama güncellemelerini kontrol etmek ve indirmek için projenin GitHub Releases dağıtımına bağlanır.
-
-## Saklama süresi ve silme
-
-Yerel mail verileri; hesabı FURSOY Mail'den kaldırana, yerel posta kutusunu sıfırlayana veya uygulama verilerini silene kadar cihazınızda kalır. Bir hesabı uygulamadan kaldırmak, o hesaba ait yerel önbelleği ve saklanan OAuth kimlik bilgilerini siler. Ayrıca bir Gmail silme işlemi yapmadığınız sürece bu işlem Google hesabınızdaki iletileri silmez.
-
-FURSOY Mail'in Google erişimini Google Hesabınızdaki üçüncü taraf bağlantıları sayfasından istediğiniz zaman iptal edebilirsiniz.
-
-## Güvenlik
-
-FURSOY Mail, Google parolanızı istemek yerine OAuth kullanır. Belirteçler işletim sisteminin kimlik bilgisi kasasında tutulur ve uygulama, istediği Google izinlerini mevcut özellikleri için gerekenlerle sınırlar. Hiçbir yerel saklama veya ağ aktarımı yönteminin tamamen güvenli olduğu garanti edilemez.
-
-## Bu politikadaki değişiklikler
-
-Uygulamanın veri uygulamaları veya özellikleri değiştiğinde bu politika güncellenebilir. Önemli değişiklikler, bu sayfanın başındaki tarihin güncellenmesiyle belirtilir.
-
-## İletişim
-
-Gizlilik soruları ve talepleri [FURSOY Mail sorun takipçisi](https://github.com/FURSOY/FURSOY-Mail/issues) üzerinden iletilebilir.
+Privacy questions and requests can be sent to [support@fursoy.com](mailto:support@fursoy.com). Do not post email addresses, OAuth tokens, message contents, or other personal data in a public GitHub issue.

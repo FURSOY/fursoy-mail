@@ -669,4 +669,5 @@ mod tests {
         };
         assert!(validate_token_response(&missing_scope, true).is_err());
     }
+
 }

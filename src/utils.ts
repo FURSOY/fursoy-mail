@@ -8,7 +8,6 @@ export const FIXED_LAYOUT_MIN_WIDTH = 460;
 export const IMAGE_PROXY_BASE = "http://mailimg.localhost/?url=";
 export const MAX_LABEL_CACHE = 5;
 export const MAIL_PAGE_SIZE = 100;
-export const MAX_ACTIVE_EMAILS = 2_000;
 export const STARTUP_NETWORK_DELAY_MS = 5000;
 export const STARTUP_UPDATE_DELAY_MS = 9000;
 export const MAIL_TABS = new Set(["inbox", "sent", "archive", "spam", "trash"]);
@@ -69,6 +68,90 @@ export function escapeHtml(text: string): string {
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#39;");
+}
+
+const HTML_CONTENT_RE = /<(?:!doctype|html|head|body|style|table|tbody|thead|tr|td|th|div|p|br|span|a|img|ul|ol|li|blockquote|h[1-6]|font|section|article)\b/i;
+
+export function isHtmlEmailBody(value: string): boolean {
+  return HTML_CONTENT_RE.test(value);
+}
+
+export function htmlToReadablePlainText(html: string): string {
+  const withLinkTargets = html
+    .replace(/<script\b[\s\S]*?<\/script>/gi, "")
+    .replace(/<style\b[\s\S]*?<\/style>/gi, "")
+    .replace(/<img\b[^>]*>/gi, "")
+    .replace(/<a\b[^>]*href\s*=\s*(["'])(https?:\/\/[^"']+)\1[^>]*>([\s\S]*?)<\/a>/gi, (_match, _quote, url, label) => {
+      const text = stripHtml(label);
+      return text && text !== url ? `${text} (${url})` : url;
+    })
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<li\b[^>]*>/gi, "\n• ")
+    .replace(/<\/(?:p|div|li|tr|table|blockquote|section|article|h[1-6])\s*>/gi, "\n")
+    .replace(/<[^>]+>/g, " ");
+
+  return decodeBasicHtmlEntities(withLinkTargets)
+    .replace(/\r\n?/g, "\n")
+    .split("\n")
+    .map(line => line.replace(/[\t ]+/g, " ").trim())
+    .join("\n")
+    .replace(/\n[\t ]+\n/g, "\n\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+export function linkifyPlainText(text: string): string {
+  const pattern = /\[([^\]\r\n]+)\]\((https?:\/\/[^\s)]+)\)|(https?:\/\/[^\s<>"'\])]+)|([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})/gi;
+  let result = "";
+  let cursor = 0;
+  for (const match of text.matchAll(pattern)) {
+    const index = match.index ?? 0;
+    result += escapeHtml(text.slice(cursor, index));
+    const markdownLabel = match[1];
+    const url = match[2] || match[3];
+    const email = match[4];
+    const href = email ? `mailto:${email}` : url;
+    const label = markdownLabel || email || url;
+    result += `<a href="${escapeHtml(href)}">${escapeHtml(label)}</a>`;
+    cursor = index + match[0].length;
+  }
+  return result + escapeHtml(text.slice(cursor));
+}
+
+export function renderPlainTextEmail(text: string): string {
+  const normalized = decodeBasicHtmlEntities(text || "")
+    .replace(/\r\n?/g, "\n")
+    .replace(/\n{4,}/g, "\n\n\n")
+    .trim();
+  return `<div class="plain-text">${linkifyPlainText(normalized)}</div>`;
+}
+
+export function isSimpleDocumentHtml(html: string): boolean {
+  if (/<(?:style|link|img|picture|svg|video|audio|table|form|input|button|canvas)\b/i.test(html)) {
+    return false;
+  }
+  if (/\b(?:display|position|float|grid|flex|width|height|font-family|font-size|background-image)\s*:/i.test(html)) {
+    return false;
+  }
+  const tags = Array.from(html.matchAll(/<\/?([a-z][a-z0-9-]*)\b/gi), match => match[1].toLowerCase());
+  const documentTags = new Set([
+    "a", "b", "blockquote", "br", "code", "del", "div", "em", "i", "li",
+    "ol", "p", "pre", "s", "span", "strong", "u", "ul",
+  ]);
+  return tags.length > 0 && tags.every(tag => documentTags.has(tag));
+}
+
+export function renderSimpleDocumentHtml(html: string): string {
+  const safe = sanitizeComposerHtml(html)
+    .replace(
+      /\[<a\b[^>]*>(https?:\/\/[^\]<]+)\]\((https?:\/\/[^)<]+)\)<\/a>/gi,
+      (_match, label, url) => `<a href="${escapeHtml(url)}">${escapeHtml(label)}</a>`,
+    )
+    .replace(
+      /\[<a\b[^>]*>(https?:\/\/[^<]+)<\/a>\]\((https?:\/\/[^)<]+)\)/gi,
+      (_match, label, url) => `<a href="${escapeHtml(url)}">${escapeHtml(label)}</a>`,
+    );
+  return `<div class="simple-document">${safe}</div>`;
 }
 
 const COMPOSER_ALLOWED_TAGS = new Set([
@@ -203,9 +286,19 @@ export function buildRenderableEmailHtml(
   mode: RenderMode,
   loadRemoteImages = true,
 ): string {
-  if (mode === "simple" || byteLength(html) > LARGE_BODY_RENDER_LIMIT) {
-    const plain = stripHtml(html || fallback);
-    return `<div class="plain-text">${escapeHtml(plain || fallback || "").replace(/\n/g, "<br/>")}</div>`;
+  const source = (html || fallback || "").trim();
+  const sourceIsHtml = isHtmlEmailBody(source);
+
+  if (!sourceIsHtml) {
+    return renderPlainTextEmail(source);
+  }
+
+  if (isSimpleDocumentHtml(source)) {
+    return renderSimpleDocumentHtml(source);
+  }
+
+  if (mode === "simple" || byteLength(source) > LARGE_BODY_RENDER_LIMIT) {
+    return renderPlainTextEmail(htmlToReadablePlainText(source) || fallback);
   }
 
   const sanitized = sanitizeEmailHtml(html, fallback)
@@ -214,7 +307,8 @@ export function buildRenderableEmailHtml(
     new RegExp(`\\s(src|href)\\s*=\\s*(["'])data:([^"']{${MAX_INLINE_DATA_URI},})\\2`, "gi"),
     ""
   );
-  return loadRemoteImages ? proxifyEmailImages(sanitized) : blockRemoteEmailImages(sanitized);
+  const withReaderGutter = `<div class="full-html">${sanitized}</div>`;
+  return loadRemoteImages ? proxifyEmailImages(withReaderGutter) : blockRemoteEmailImages(withReaderGutter);
 }
 
 export function normalizeOtpPlaintext(text: string): string {
@@ -460,6 +554,39 @@ export function findEmailUrl(eventTarget: EventTarget | null): string | null {
   );
 }
 
+export function searchHighlightTerms(query: string): string[] {
+  const seen = new Set<string>();
+  return query
+    .trim()
+    .split(/\s+/u)
+    .map(term => term.trim())
+    .filter(term => {
+      if (!term) return false;
+      const key = term.toLocaleLowerCase();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .sort((left, right) => right.length - left.length)
+    .slice(0, 20);
+}
+
+export function splitSearchHighlight(text: string, query: string): Array<{ text: string; match: boolean }> {
+  const terms = searchHighlightTerms(query);
+  if (!text || terms.length === 0) return [{ text, match: false }];
+  const pattern = new RegExp(terms.map(term => term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|"), "giu");
+  const segments: Array<{ text: string; match: boolean }> = [];
+  let cursor = 0;
+  for (const match of text.matchAll(pattern)) {
+    const index = match.index ?? 0;
+    if (index > cursor) segments.push({ text: text.slice(cursor, index), match: false });
+    segments.push({ text: match[0], match: true });
+    cursor = index + match[0].length;
+  }
+  if (cursor < text.length) segments.push({ text: text.slice(cursor), match: false });
+  return segments.length > 0 ? segments : [{ text, match: false }];
+}
+
 export function buildEmailSrcDoc(html: string): string {
   return `<!DOCTYPE html><html><head><meta charset="utf-8"/>
     <meta http-equiv="Content-Security-Policy" content="default-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none'; object-src 'none'; script-src 'none'; connect-src 'none'; media-src 'none'; img-src data: http://mailimg.localhost; style-src 'unsafe-inline'; font-src data:"/>
@@ -471,9 +598,37 @@ export function buildEmailSrcDoc(html: string): string {
         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
         font-size: 15px; line-height: 1.6; color: #1a1a1a;
       }
-      .mail-root > .plain-text { padding: 20px 24px; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; max-width: 720px; }
+      .mail-root > .plain-text {
+        width: 100%; padding: 24px clamp(20px, 3.5vw, 48px);
+        white-space: pre-wrap; overflow-wrap: anywhere; word-break: normal;
+        font-size: 15px; line-height: 1.65;
+      }
+      .mail-root > .simple-document {
+        width: 100%; padding: 24px clamp(20px, 3.5vw, 48px);
+        overflow-wrap: anywhere; font-size: 15px; line-height: 1.65;
+      }
+      .mail-root > .simple-document p { margin: 0 0 1em; }
+      .mail-root > .simple-document p:last-child { margin-bottom: 0; }
+      .mail-root > .simple-document blockquote { margin: 1em 0; padding-left: 14px; border-left: 3px solid #d4d4d8; color: #52525b; }
+      .mail-root > .simple-document ul, .mail-root > .simple-document ol { margin: 0 0 1em; padding-left: 1.5em; }
+      .mail-root > .full-html {
+        width: 100%; padding: 16px 18px;
+        overflow-wrap: anywhere; word-break: normal;
+      }
+      .mail-root > .full-html pre {
+        max-width: 100%; white-space: pre-wrap !important;
+        overflow-wrap: anywhere !important; word-break: normal;
+      }
+      .mail-root > .full-html code,
+      .mail-root > .full-html a {
+        overflow-wrap: anywhere; word-break: normal;
+      }
       img, video { height: auto; }
       a { color: #2563eb; }
+      mark.mail-search-highlight {
+        background: #fde047; color: #18181b; border-radius: 2px;
+        padding: 0 1px; box-decoration-break: clone;
+      }
       ::selection { background: rgba(59, 130, 246, 0.25); }
     </style></head>
     <body><div class="mail-root">${html}</div></body></html>`;
@@ -523,13 +678,28 @@ export function formatDate(timestamp: number): string {
   return date.toLocaleDateString("tr-TR", { month: "short", day: "numeric" });
 }
 
-export function formatDateFull(timestamp: number): string {
+export function formatDateFull(timestamp: number, locale = "tr-TR"): string {
   const date = new Date(timestamp);
-  return date.toLocaleDateString("tr-TR", {
+  return date.toLocaleDateString(locale, {
     month: "long",
     day: "numeric",
     year: "numeric",
     hour: "2-digit",
     minute: "2-digit",
   });
+}
+
+export function formatRelativeTime(timestamp: number, now = Date.now(), locale = "tr-TR"): string {
+  const delta = timestamp - now;
+  const absoluteDelta = Math.abs(delta);
+  const units: Array<[Intl.RelativeTimeFormatUnit, number]> = [
+    ["year", 365 * 24 * 60 * 60 * 1_000],
+    ["month", 30 * 24 * 60 * 60 * 1_000],
+    ["day", 24 * 60 * 60 * 1_000],
+    ["hour", 60 * 60 * 1_000],
+    ["minute", 60 * 1_000],
+  ];
+  const [unit, unitMilliseconds] = units.find(([, milliseconds]) => absoluteDelta >= milliseconds) ?? ["second", 1_000];
+  const value = Math.round(delta / unitMilliseconds);
+  return new Intl.RelativeTimeFormat(locale, { numeric: "always" }).format(value, unit);
 }

@@ -3,7 +3,19 @@ import type { AppLocale } from "../i18n";
 import type { Account, AttachmentPayload, EmailSummary } from "../types";
 import { tauriApi } from "../tauriApi";
 import { enqueueMailMutation, inboxUnreadDelta, runAuthenticatedMailAction, type MailMutationQueue } from "../mailActionState";
-import { escapeHtml, formatDateFull, isAuthFailure, sanitizeComposerHtml } from "../utils";
+import { isAuthFailure } from "../utils";
+import { areValidRecipients } from "../mailRecipients";
+import { buildForwardBody } from "../mailCompose";
+
+export interface ReplySendRequest {
+  target: EmailSummary;
+  to: string[];
+  cc: string[];
+  body: string;
+  attachments: AttachmentPayload[];
+  draftId: string | null;
+  verificationMessageId: string | null;
+}
 
 export interface ConfirmModalState {
   message: string;
@@ -15,8 +27,6 @@ interface UseMailActionsOptions {
   accounts: Account[];
   accountTokens: Record<string, string>;
   activeAccountId: string | null;
-  activeMail: EmailSummary | undefined;
-  selectedMailBody: string;
   activeTabRef: MutableRefObject<string>;
   recentlyReadRef: MutableRefObject<Set<string>>;
   mailMutationQueueRef: MutableRefObject<MailMutationQueue>;
@@ -82,7 +92,7 @@ async function verifyUncertainSend(accountId: string, messageId: string, signal:
 
 export function useMailActions(options: UseMailActionsOptions) {
   const {
-    locale, accounts, accountTokens, activeAccountId, activeMail, selectedMailBody,
+    locale, accounts, accountTokens, activeAccountId,
     activeTabRef, recentlyReadRef, mailMutationQueueRef, setEmails, setSelectedMail,
     setThreadRefreshKey, getTokenForEmail, loadEmails, refreshUnreadCount,
     adjustUnreadBadge, refreshAccessToken, upsertToken, clearExpiredAccount,
@@ -90,6 +100,7 @@ export function useMailActions(options: UseMailActionsOptions) {
   } = options;
 
   const [showReply, setShowReply] = useState(false);
+  const [replyTarget, setReplyTarget] = useState<EmailSummary | null>(null);
   const [replyMode, setReplyMode] = useState<"reply" | "reply-all">("reply");
   const [replyText, setReplyText] = useState("");
   const [isSending, setIsSending] = useState(false);
@@ -136,7 +147,7 @@ export function useMailActions(options: UseMailActionsOptions) {
     setEmails(previous => previous.map(email => sameEmail(email, mail) ? { ...email, label: "archive" } : email));
     setSelectedMail(null);
     try {
-      await runAuthenticatedAction(mail, () => tauriApi.archiveEmail(mail.account_id, mail.id));
+      await runAuthenticatedAction(mail, () => tauriApi.archiveEmail(mail.account_id, mail.thread_id || mail.id));
       await loadEmails(activeTabRef.current);
       await refreshUnreadCount();
     } catch (error) {
@@ -154,13 +165,31 @@ export function useMailActions(options: UseMailActionsOptions) {
     setEmails(previous => previous.map(email => sameEmail(email, mail) ? { ...email, label: "trash" } : email));
     setSelectedMail(null);
     try {
-      await runAuthenticatedAction(mail, () => tauriApi.trashEmail(mail.account_id, mail.id));
+      await runAuthenticatedAction(mail, () => tauriApi.trashEmail(mail.account_id, mail.thread_id || mail.id));
       await loadEmails(activeTabRef.current);
       await refreshUnreadCount();
     } catch (error) {
       if (unreadDelta) adjustUnreadBadge(mail.account_id, -unreadDelta);
       console.error("Trash email failed:", error);
       showToast(actionFailureMessage(locale.messages.deleteFailed, error), "error");
+      void loadEmails(activeTabRef.current);
+    }
+  }, [activeTabRef, adjustUnreadBadge, getTokenForEmail, loadEmails, locale, refreshUnreadCount, runAuthenticatedAction, setEmails, setSelectedMail, showToast]);
+
+  const handleReportSpam = useCallback(async (mail: EmailSummary) => {
+    if (!getTokenForEmail(mail)) return;
+    const unreadDelta = inboxUnreadDelta(mail, "spam");
+    if (unreadDelta) adjustUnreadBadge(mail.account_id, unreadDelta);
+    setEmails(previous => previous.map(email => sameEmail(email, mail) ? { ...email, label: "spam" } : email));
+    setSelectedMail(null);
+    try {
+      await runAuthenticatedAction(mail, () => tauriApi.reportSpam(mail.account_id, mail.thread_id || mail.id));
+      await loadEmails(activeTabRef.current);
+      await refreshUnreadCount();
+    } catch (error) {
+      if (unreadDelta) adjustUnreadBadge(mail.account_id, -unreadDelta);
+      console.error("Report spam failed:", error);
+      showToast(actionFailureMessage(locale.messages.spamReportFailed, error), "error");
       void loadEmails(activeTabRef.current);
     }
   }, [activeTabRef, adjustUnreadBadge, getTokenForEmail, loadEmails, locale, refreshUnreadCount, runAuthenticatedAction, setEmails, setSelectedMail, showToast]);
@@ -172,7 +201,7 @@ export function useMailActions(options: UseMailActionsOptions) {
     setEmails(previous => previous.filter(email => !sameEmail(email, mail)));
     setSelectedMail(null);
     try {
-      await runAuthenticatedAction(mail, () => tauriApi.moveToInbox(mail.account_id, mail.id));
+      await runAuthenticatedAction(mail, () => tauriApi.moveToInbox(mail.account_id, mail.thread_id || mail.id));
       showToast(locale.messages.movedToInbox, "success");
       void loadEmails(activeTabRef.current);
       void refreshUnreadCount();
@@ -184,59 +213,50 @@ export function useMailActions(options: UseMailActionsOptions) {
     }
   }, [activeTabRef, adjustUnreadBadge, getTokenForEmail, loadEmails, locale, refreshUnreadCount, runAuthenticatedAction, setEmails, setSelectedMail, showToast]);
 
-  const handleReply = useCallback(async (attachments: AttachmentPayload[] = [], body = "") => {
-    if (!activeMail || (!body.trim() && attachments.length === 0)) return;
-    const accessToken = getTokenForEmail(activeMail);
-    if (!accessToken) return;
+  const handleReply = useCallback(async (request: ReplySendRequest): Promise<boolean> => {
+    const { target, to, cc, body, attachments, draftId, verificationMessageId } = request;
+    if ((!body.trim() && attachments.length === 0) || !areValidRecipients([...to, ...cc])) {
+      showToast(locale.messages.replySendFailed, "error");
+      return false;
+    }
+    const accessToken = getTokenForEmail(target);
+    if (!accessToken) return false;
     setIsSending(true);
     try {
-      const extractAddress = (raw: string) => raw.match(/<([^>]+)>/)?.[1].trim() ?? raw.trim();
-      const senderAddress = extractAddress(activeMail.sender);
-      let to: string;
-      if (replyMode === "reply-all") {
-        const ownAddress = activeMail.account_id ?? "";
-        const recipients = activeMail.recipient.split(",")
-          .map(value => extractAddress(value.trim()))
-          .filter(value => value && value.toLowerCase() !== ownAddress.toLowerCase());
-        const ccRecipients = activeMail.cc.split(",")
-          .map(value => extractAddress(value.trim()))
-          .filter(value => value && value.toLowerCase() !== ownAddress.toLowerCase());
-        to = [senderAddress, ...recipients, ...ccRecipients].join(", ");
-      } else {
-        to = senderAddress;
-      }
-      const quoteHeading = locale.compose.wroteOn
-        .replace("{date}", escapeHtml(formatDateFull(activeMail.date)))
-        .replace("{sender}", `<b>${escapeHtml(activeMail.sender)}</b>`);
-      const quotedBody = sanitizeComposerHtml(selectedMailBody || activeMail.snippet);
-      const quotedHtml = `<br/><br/><blockquote><div>${quoteHeading}</div>${quotedBody}</blockquote>`;
-      const outcome = await tauriApi.sendReply({
-        accountId: activeMail.account_id,
-        to,
-        subject: activeMail.subject,
-        body: body + quotedHtml,
-        threadId: activeMail.thread_id || activeMail.id,
-        messageId: activeMail.id,
-        attachments: attachments.length > 0 ? attachments : null,
-      });
+      const outcome = draftId && verificationMessageId
+        ? await tauriApi.sendDraft(target.account_id, draftId, verificationMessageId)
+        : await tauriApi.sendReply({
+            accountId: target.account_id,
+            to: to.join(", "),
+            cc: cc.join(", "),
+            subject: target.subject,
+            body,
+            threadId: target.thread_id || target.id,
+            inReplyTo: target.message_id,
+            references: target.references,
+            attachments: attachments.length > 0 ? attachments : null,
+          });
       if (outcome.status === "outcome_unknown") {
         showToast(locale.messages.sendOutcomeUnknown, "info");
-        const verified = await verifyUncertainSend(activeMail.account_id, outcome.messageId, verificationAbortRef.current.signal);
+        const verified = await verifyUncertainSend(target.account_id, outcome.messageId, verificationAbortRef.current.signal);
         if (!verified) {
           showToast(locale.messages.sendOutcomeUnresolved, "error");
-          return;
+          return false;
         }
         showToast(locale.messages.sendOutcomeVerified, "success");
       }
       setReplyText("");
       setShowReply(false);
+      setReplyTarget(null);
       setThreadRefreshKey(current => current + 1);
+      return true;
     } catch {
       showToast(locale.messages.replySendFailed, "error");
+      return false;
     } finally {
       setIsSending(false);
     }
-  }, [activeMail, getTokenForEmail, locale, replyMode, selectedMailBody, setThreadRefreshKey, showToast]);
+  }, [getTokenForEmail, locale, setThreadRefreshKey, showToast]);
 
   const handleComposeSend = useCallback(async (
     cc: string,
@@ -331,7 +351,7 @@ export function useMailActions(options: UseMailActionsOptions) {
       await enqueueMailMutation(
         mailMutationQueueRef.current,
         emailKey(mail),
-        () => runAuthenticatedAction(mail, () => tauriApi.markAsUnread(mail.account_id, mail.id)),
+        () => runAuthenticatedAction(mail, () => tauriApi.markAsUnread(mail.account_id, mail.thread_id || mail.id)),
       );
     } catch (error) {
       console.error("Mark email as unread failed:", error);
@@ -341,24 +361,28 @@ export function useMailActions(options: UseMailActionsOptions) {
     }
   }, [activeTabRef, adjustUnreadBadge, getTokenForEmail, loadEmails, locale, recentlyReadRef, runAuthenticatedAction, setEmails, showToast]);
 
-  const handleForward = useCallback((mail: EmailSummary) => {
-    const header = `<br/><br/><div><b>---------- ${escapeHtml(locale.compose.forwardedMessage)} ----------</b><br/>${escapeHtml(locale.compose.senderLabel)}: ${escapeHtml(mail.sender)}<br/>${escapeHtml(locale.compose.subject)}: ${escapeHtml(mail.subject)}<br/>${escapeHtml(locale.compose.dateLabel)}: ${escapeHtml(formatDateFull(mail.date))}<br/><br/></div>`;
-    const forwardedBody = sanitizeComposerHtml(selectedMailBody || mail.snippet);
+  const handleForward = useCallback(async (mail: EmailSummary) => {
+    const exactBody = await tauriApi.getEmailBody(mail.id, mail.account_id).catch(() => mail.snippet);
     setComposeTo("");
     setComposeSubject(`Fwd: ${mail.subject.replace(/^(Fwd:\s*)+/i, "")}`);
     setComposeBody("");
-    setComposeHtmlAppend(header + forwardedBody);
+    setComposeHtmlAppend(buildForwardBody(mail, exactBody, {
+      forwardedMessage: locale.compose.forwardedMessage,
+      sender: locale.compose.senderLabel,
+      subject: locale.compose.subject,
+      date: locale.compose.dateLabel,
+    }));
     setComposeAccountId(mail.account_id ?? activeAccountId ?? accounts[0]?.id ?? null);
     setShowCompose(true);
-  }, [accounts, activeAccountId, locale, selectedMailBody]);
+  }, [accounts, activeAccountId, locale]);
 
   return {
-    showReply, setShowReply, replyMode, setReplyMode, replyText, setReplyText,
+    showReply, setShowReply, replyTarget, setReplyTarget, replyMode, setReplyMode, replyText, setReplyText,
     isSending, showCompose, setShowCompose, confirmModal, setConfirmModal,
     composeTo, setComposeTo, composeSubject, setComposeSubject, composeBody, setComposeBody,
     composeHtmlAppend, setComposeHtmlAppend, composeAccountId, setComposeAccountId,
     composeSendError, setComposeSendError,
-    handleArchive, handleTrash, handleMoveToInbox,
+    handleArchive, handleTrash, handleReportSpam, handleMoveToInbox,
     handleReply, handleComposeSend, handleMarkAsUnread, handleForward,
   };
 }

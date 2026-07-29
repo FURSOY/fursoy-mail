@@ -238,6 +238,7 @@ pub fn run() {
         .manage(auth::OAuthFlowState::default())
         .manage(notify::PendingNotification::default())
         .manage(settings::AppControlsState::default())
+        .manage(db::SearchCoordinator::default())
         .on_window_event(|window, event| match event {
             tauri::WindowEvent::Moved(_) | tauri::WindowEvent::Resized(_) => {
                 if let Err(error) = window_state::save_window_state(window) {
@@ -264,6 +265,14 @@ pub fn run() {
             let _ = dotenvy::dotenv();
 
             db::init_db(app.handle()).expect("Failed to initialize database");
+            let search_index_app = app.handle().clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                if let Err(error) = db::backfill_email_search_text(&search_index_app) {
+                    eprintln!("[MAIL_SEARCH] body index backfill failed: {error}");
+                } else if let Err(error) = search_index_app.emit("mail-search-index-ready", ()) {
+                    eprintln!("[MAIL_SEARCH] index-ready event failed: {error}");
+                }
+            });
             #[cfg(all(target_os = "windows", not(debug_assertions)))]
             if let Err(error) = settings::ensure_default_mail_registration() {
                 eprintln!("Default mail registration failed: {error}");
@@ -430,6 +439,9 @@ pub fn run() {
             db::get_local_emails,
             db::search_local_emails,
             db::get_emails_by_label,
+            db::get_thread_groups_by_label,
+            db::search_local_thread_groups,
+            db::cancel_local_search,
             db::get_orphaned_cache_counts,
             db::reset_local_mail_cache,
             db::get_email_body,
@@ -441,6 +453,7 @@ pub fn run() {
             gmail::mark_as_read,
             gmail::mark_as_unread,
             gmail::archive_email,
+            gmail::report_spam,
             gmail::trash_email,
             gmail::move_to_inbox,
             gmail::send_reply,

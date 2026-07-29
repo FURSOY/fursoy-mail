@@ -20,6 +20,9 @@ export interface EmailSummary {
   sender: string;
   recipient: string;
   cc: string;
+  reply_to: string;
+  message_id: string;
+  references: string;
   subject: string;
   snippet: string;
   date: number;
@@ -31,6 +34,7 @@ export interface EmailSummary {
 export interface ThreadGroup {
   latestEmail: EmailSummary;
   hasUnread: boolean;
+  unreadCount: number;
   count: number;
   participants: string[];
 }
@@ -60,6 +64,10 @@ export interface AttachmentPayload {
 export interface DraftSummary {
   id: string;
   messageId: string;
+  rfcMessageId: string;
+  threadId: string;
+  inReplyTo: string;
+  references: string;
   to: string;
   cc: string;
   bcc: string;

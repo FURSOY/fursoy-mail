@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
   buildRenderableEmailHtml,
+  buildEmailSrcDoc,
   extractVerificationCode,
+  formatRelativeTime,
   isAuthFailure,
   isNoUpdateError,
   minutesFromTime,
@@ -10,6 +12,8 @@ import {
   resolveEmailUrl,
   sanitizeComposerHtml,
   sanitizeEmailHtml,
+  searchHighlightTerms,
+  splitSearchHighlight,
 } from "../utils";
 
 describe("error classification", () => {
@@ -60,6 +64,14 @@ describe("verification code extraction", () => {
 });
 
 describe("email HTML safety", () => {
+  it("wraps pathological technical lines before fit-to-width measures HTML mail", () => {
+    const sourceDocument = buildEmailSrcDoc('<div class="full-html"><pre>very-long-technical-line</pre></div>');
+
+    expect(sourceDocument).toContain("white-space: pre-wrap !important");
+    expect(sourceDocument).toContain("overflow-wrap: anywhere !important");
+    expect(sourceDocument).toContain(".mail-root > .full-html a");
+  });
+
   it("keeps received HTML inert at the privileged composer boundary", () => {
     const sanitized = sanitizeComposerHtml(
       '<img src=x onerror="alert(1)"><script>alert(2)</script><b>Safe</b>',
@@ -91,9 +103,64 @@ describe("email HTML safety", () => {
     expect(rendered).toContain("http://mailimg.localhost/?url=");
     expect(rendered).not.toContain('src="https://images.example.test');
   });
+
+  it("renders native plain-text mail with paragraphs and safe links in normal mode", () => {
+    const rendered = buildRenderableEmailHtml(
+      "Hello team,\r\n\r\nRead [the guide](https://example.test/guide).\r\nNext paragraph.",
+      "",
+      "full",
+    );
+
+    expect(rendered).toContain('class="plain-text"');
+    expect(rendered).toContain("Hello team,\n\nRead ");
+    expect(rendered).toContain('<a href="https://example.test/guide">the guide</a>');
+  });
+
+  it("keeps useful block structure while simplifying HTML mail", () => {
+    const rendered = buildRenderableEmailHtml(
+      '<style>p{color:red}</style><p>First paragraph</p><p>Second <a href="https://example.test">link</a></p><img src="https://tracker.test/pixel">',
+      "",
+      "simple",
+    );
+
+    expect(rendered).toContain("First paragraph\nSecond link (");
+    expect(rendered).toContain('<a href="https://example.test">https://example.test</a>');
+    expect(rendered).not.toMatch(/<style|<img/i);
+  });
+
+  it("renders plain-looking document HTML identically in normal and simplified modes", () => {
+    const source = '<div dir="ltr"><p>Hello team,</p><p>A normal paragraph with <b>emphasis</b>.</p></div>';
+    const normal = buildRenderableEmailHtml(source, "", "full");
+    const simplified = buildRenderableEmailHtml(source, "", "simple");
+
+    expect(normal).toBe(simplified);
+    expect(normal).toContain('class="simple-document"');
+  });
 });
 
 describe("small input helpers", () => {
+  it("splits visible text into search-highlight segments", () => {
+    expect(searchHighlightTerms(" fin  FIN weekly ")).toEqual(["weekly", "fin"]);
+    expect(splitSearchHighlight("Fin weekly finance", "fin")).toEqual([
+      { text: "Fin", match: true },
+      { text: " weekly ", match: false },
+      { text: "fin", match: true },
+      { text: "ance", match: false },
+    ]);
+    expect(splitSearchHighlight("Fin", "")).toEqual([{ text: "Fin", match: false }]);
+    expect(splitSearchHighlight("Open https://myaccount.google.com/notifications", "myaccount")).toEqual([
+      { text: "Open https://", match: false },
+      { text: "myaccount", match: true },
+      { text: ".google.com/notifications", match: false },
+    ]);
+  });
+
+  it("formats relative message times in the selected language", () => {
+    const now = new Date("2026-07-28T15:30:00Z").getTime();
+    expect(formatRelativeTime(now - 60 * 60 * 1_000, now, "tr-TR")).toBe("1 saat önce");
+    expect(formatRelativeTime(now - 2 * 24 * 60 * 60 * 1_000, now, "en-US")).toBe("2 days ago");
+  });
+
   it("only permits supported email link protocols", () => {
     expect(resolveEmailUrl("/mail/u/0/#inbox")).toBe("https://mail.google.com/mail/u/0/#inbox");
     expect(resolveEmailUrl("mailto:user@example.test")).toBe("mailto:user@example.test");

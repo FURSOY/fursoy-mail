@@ -3,7 +3,7 @@ use crate::db::{
     get_active_full_sync, get_all_mailbox_sync_states, get_history_id, get_mailbox_cursor_state,
     get_mailbox_sync_state, has_pending_mailbox_pages, load_tokens, next_full_sync_generation,
     set_gmail_inbox_unread_stats, set_history_id, set_mailbox_cursor, set_mailbox_sync_state,
-    upsert_sync_mail_batch, Email,
+    upsert_sync_mail_batch, Email, EmailSummary,
 };
 use base64::Engine;
 use futures::stream::{self, StreamExt, TryStreamExt};
@@ -549,13 +549,17 @@ struct MessageBody {
 
 /// Determine the label for an email based on Gmail label IDs
 fn determine_label(label_ids: &[String]) -> String {
-    if label_ids.contains(&"SPAM".to_string()) {
+    if label_ids.iter().any(|label| label == "DRAFT") {
+        "draft".to_string()
+    } else if label_ids.iter().any(|label| label == "SPAM") {
         "spam".to_string()
-    } else if label_ids.contains(&"TRASH".to_string()) {
+    } else if label_ids.iter().any(|label| label == "TRASH") {
         "trash".to_string()
-    } else if label_ids.contains(&"SENT".to_string()) && !label_ids.contains(&"INBOX".to_string()) {
+    } else if label_ids.iter().any(|label| label == "SENT")
+        && !label_ids.iter().any(|label| label == "INBOX")
+    {
         "sent".to_string()
-    } else if label_ids.contains(&"INBOX".to_string()) {
+    } else if label_ids.iter().any(|label| label == "INBOX") {
         "inbox".to_string()
     } else {
         "archive".to_string()
@@ -567,6 +571,9 @@ fn parse_message_detail(detail: MessageDetail) -> (Email, Vec<crate::db::Attachm
     let mut sender = "Unknown Sender".to_string();
     let mut recipient = String::new();
     let mut cc = String::new();
+    let mut reply_to = String::new();
+    let mut message_id = String::new();
+    let mut references = String::new();
     let mut subject = "No Subject".to_string();
 
     for header in &detail.payload.headers {
@@ -576,6 +583,12 @@ fn parse_message_detail(detail: MessageDetail) -> (Email, Vec<crate::db::Attachm
             recipient = header.value.clone();
         } else if header.name.eq_ignore_ascii_case("cc") {
             cc = header.value.clone();
+        } else if header.name.eq_ignore_ascii_case("reply-to") {
+            reply_to = header.value.clone();
+        } else if header.name.eq_ignore_ascii_case("message-id") {
+            message_id = header.value.clone();
+        } else if header.name.eq_ignore_ascii_case("references") {
+            references = header.value.clone();
         } else if header.name.eq_ignore_ascii_case("subject") {
             subject = header.value.clone();
         }
@@ -634,6 +647,9 @@ fn parse_message_detail(detail: MessageDetail) -> (Email, Vec<crate::db::Attachm
         sender,
         recipient,
         cc,
+        reply_to,
+        message_id,
+        references,
         subject,
         snippet: detail.snippet,
         body_html,
@@ -1071,7 +1087,7 @@ pub async fn refresh_email_from_gmail(
     app: AppHandle,
     account_id: String,
     message_id: String,
-) -> Result<(), String> {
+) -> Result<EmailSummary, String> {
     crate::require_command_window(&window, &["main"])?;
     let access_token = crate::db::load_account_access_token(&account_id)?;
     let account_generation = get_account_cache_generation(&app, &account_id)?;
@@ -1081,6 +1097,22 @@ pub async fn refresh_email_from_gmail(
         .unwrap_or_default();
     let detail = fetch_message_detail(&client, &access_token, &message_id).await?;
     let (email, mut attachments) = parse_message_detail(detail);
+    let summary = EmailSummary {
+        id: email.id.clone(),
+        thread_id: email.thread_id.clone(),
+        sender: email.sender.clone(),
+        recipient: email.recipient.clone(),
+        cc: email.cc.clone(),
+        reply_to: email.reply_to.clone(),
+        message_id: email.message_id.clone(),
+        references: email.references.clone(),
+        subject: email.subject.clone(),
+        snippet: email.snippet.clone(),
+        date: email.date,
+        unread: email.unread,
+        label: email.label.clone(),
+        account_id: account_id.clone(),
+    };
     for attachment in &mut attachments {
         attachment.account_id = account_id.clone();
     }
@@ -1101,7 +1133,7 @@ pub async fn refresh_email_from_gmail(
     .await
     .map_err(|e| format!("Message refresh DB task failed: {e}"))??;
 
-    Ok(())
+    Ok(summary)
 }
 
 async fn cache_message_details(
@@ -1169,19 +1201,19 @@ pub async fn archive_email(
     window: tauri::WebviewWindow,
     app: AppHandle,
     account_id: String,
-    message_id: String,
+    thread_id: String,
 ) -> Result<(), String> {
     crate::require_command_window(&window, &["main"])?;
     let access_token = crate::db::load_account_access_token(&account_id)?;
-    validate_gmail_identifier("message ID", &message_id)?;
-    // Remove INBOX from Gmail before changing the local cache.
+    validate_gmail_identifier("thread ID", &thread_id)?;
+    // The reader toolbar represents the whole conversation, matching Gmail.
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .unwrap_or_default();
     let url = format!(
-        "https://gmail.googleapis.com/gmail/v1/users/me/messages/{}/modify",
-        message_id
+        "https://gmail.googleapis.com/gmail/v1/users/me/threads/{}/modify",
+        thread_id
     );
     let body = serde_json::json!({
         "removeLabelIds": ["INBOX"]
@@ -1199,7 +1231,7 @@ pub async fn archive_email(
         return Err(format!("Gmail archive error (HTTP {}).", res.status()));
     }
 
-    if let Err(error) = crate::db::update_email_label(&app, &message_id, &account_id, "archive") {
+    if let Err(error) = crate::db::archive_thread_local(&app, &thread_id, &account_id) {
         if let Err(sync_error) = sync_emails(window, app, account_id, Some(true)).await {
             eprintln!("[MAIL_CACHE] archive reconciliation failed: {sync_error}");
         }
@@ -1208,6 +1240,53 @@ pub async fn archive_email(
         ));
     }
 
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn report_spam(
+    window: tauri::WebviewWindow,
+    app: AppHandle,
+    account_id: String,
+    thread_id: String,
+) -> Result<(), String> {
+    crate::require_command_window(&window, &["main"])?;
+    let access_token = crate::db::load_account_access_token(&account_id)?;
+    validate_gmail_identifier("thread ID", &thread_id)?;
+    // Gmail applies spam classification to the whole conversation.
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap_or_default();
+    let url = format!(
+        "https://gmail.googleapis.com/gmail/v1/users/me/threads/{}/modify",
+        thread_id
+    );
+    let body = serde_json::json!({
+        "addLabelIds": ["SPAM"],
+        "removeLabelIds": ["INBOX"]
+    });
+    let response = client
+        .post(&url)
+        .bearer_auth(&access_token)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "Gmail spam report error (HTTP {}).",
+            response.status()
+        ));
+    }
+    if let Err(error) = crate::db::spam_thread_local(&app, &thread_id, &account_id) {
+        if let Err(sync_error) = sync_emails(window, app, account_id, Some(true)).await {
+            eprintln!("[MAIL_CACHE] spam reconciliation failed: {sync_error}");
+        }
+        return Err(format!(
+            "Gmail marked the conversation as spam, but the local cache could not be updated: {error}"
+        ));
+    }
     Ok(())
 }
 
@@ -1226,19 +1305,19 @@ pub async fn trash_email(
     window: tauri::WebviewWindow,
     app: AppHandle,
     account_id: String,
-    message_id: String,
+    thread_id: String,
 ) -> Result<(), String> {
     crate::require_command_window(&window, &["main"])?;
     let access_token = crate::db::load_account_access_token(&account_id)?;
-    validate_gmail_identifier("message ID", &message_id)?;
-    // Trash on Gmail before changing the local cache.
+    validate_gmail_identifier("thread ID", &thread_id)?;
+    // Trash the whole conversation, matching Gmail's top toolbar.
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .unwrap_or_default();
     let url = format!(
-        "https://gmail.googleapis.com/gmail/v1/users/me/messages/{}/trash",
-        message_id
+        "https://gmail.googleapis.com/gmail/v1/users/me/threads/{}/trash",
+        thread_id
     );
 
     let res = gmail_trash_request(&client, &url, &access_token)
@@ -1250,7 +1329,7 @@ pub async fn trash_email(
         return Err(format!("Gmail trash error (HTTP {}).", res.status()));
     }
 
-    if let Err(error) = crate::db::update_email_label(&app, &message_id, &account_id, "trash") {
+    if let Err(error) = crate::db::trash_thread_local(&app, &thread_id, &account_id) {
         if let Err(sync_error) = sync_emails(window, app, account_id, Some(true)).await {
             eprintln!("[MAIL_CACHE] trash reconciliation failed: {sync_error}");
         }
@@ -1267,19 +1346,19 @@ pub async fn move_to_inbox(
     window: tauri::WebviewWindow,
     app: AppHandle,
     account_id: String,
-    message_id: String,
+    thread_id: String,
 ) -> Result<(), String> {
     crate::require_command_window(&window, &["main"])?;
     let access_token = crate::db::load_account_access_token(&account_id)?;
-    validate_gmail_identifier("message ID", &message_id)?;
-    // Add INBOX and remove SPAM/TRASH on Gmail before changing the local cache.
+    validate_gmail_identifier("thread ID", &thread_id)?;
+    // Restore the whole conversation, matching the reader toolbar scope.
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .unwrap_or_default();
     let url = format!(
-        "https://gmail.googleapis.com/gmail/v1/users/me/messages/{}/modify",
-        message_id
+        "https://gmail.googleapis.com/gmail/v1/users/me/threads/{}/modify",
+        thread_id
     );
     let body = serde_json::json!({
         "addLabelIds": ["INBOX"],
@@ -1298,7 +1377,7 @@ pub async fn move_to_inbox(
         return Err(format!("Gmail move error (HTTP {}).", res.status()));
     }
 
-    if let Err(error) = crate::db::update_email_label(&app, &message_id, &account_id, "inbox") {
+    if let Err(error) = crate::db::move_thread_to_inbox_local(&app, &thread_id, &account_id) {
         if let Err(sync_error) = sync_emails(window, app, account_id, Some(true)).await {
             eprintln!("[MAIL_CACHE] inbox reconciliation failed: {sync_error}");
         }
@@ -1364,6 +1443,10 @@ struct SavedDraftMessage {
 pub struct DraftSummary {
     id: String,
     message_id: String,
+    rfc_message_id: String,
+    thread_id: String,
+    in_reply_to: String,
+    references: String,
     to: String,
     cc: String,
     bcc: String,
@@ -1384,6 +1467,10 @@ pub struct DraftPage {
 pub struct DraftContent {
     id: String,
     message_id: String,
+    rfc_message_id: String,
+    thread_id: String,
+    in_reply_to: String,
+    references: String,
     to: String,
     cc: String,
     bcc: String,
@@ -1415,6 +1502,20 @@ fn validate_optional_recipient_header(value: &str) -> Result<(), String> {
         return Ok(());
     }
     validate_recipient_header(value)
+}
+
+fn validate_draft_recipient_header(name: &str, value: &str) -> Result<(), String> {
+    validate_header_value(name, value, MAX_RECIPIENT_HEADER_BYTES)
+}
+
+fn build_reply_references(prior: &str, in_reply_to: &str) -> String {
+    if prior.split_whitespace().any(|value| value == in_reply_to) {
+        prior.trim().to_string()
+    } else if prior.trim().is_empty() {
+        in_reply_to.to_string()
+    } else {
+        format!("{} {}", prior.trim(), in_reply_to)
+    }
 }
 
 fn validate_gmail_identifier(name: &str, value: &str) -> Result<(), String> {
@@ -1667,10 +1768,12 @@ pub async fn send_reply(
     app: tauri::AppHandle,
     account_id: String,
     to: String,
+    cc: String,
     subject: String,
     body: String,
     thread_id: String,
-    message_id: String,
+    in_reply_to: String,
+    references: String,
     attachments: Option<Vec<AttachmentPayload>>,
 ) -> Result<SendOutcome, String> {
     crate::require_command_window(&window, &["main"])?;
@@ -1681,28 +1784,30 @@ pub async fn send_reply(
         .map_err(|_| "Gmail send client could not be created.".to_string())?;
     let atts = attachments.unwrap_or_default();
     validate_recipient_header(&to)?;
+    validate_optional_recipient_header(&cc)?;
     validate_header_value("Subject", &subject, MAX_SUBJECT_BYTES)?;
     validate_gmail_identifier("thread ID", &thread_id)?;
-    validate_gmail_identifier("message ID", &message_id)?;
     let outbound_message_id = generate_outbound_message_id();
 
     let clean_subject = subject
         .trim_start_matches("Re: ")
         .trim_start_matches("re: ");
-    let raw_email = build_raw_mime(
-        &[
-            ("To", to),
-            (
-                "Subject",
-                format!("Re: {}", mime_encode_header(clean_subject)),
-            ),
-            ("In-Reply-To", message_id.clone()),
-            ("References", message_id),
-            ("Message-ID", outbound_message_id.clone()),
-        ],
-        &body,
-        &atts,
-    )?;
+    let mut headers = vec![
+        ("To", to),
+        ("Subject", format!("Re: {}", mime_encode_header(clean_subject))),
+    ];
+    if !cc.trim().is_empty() {
+        headers.push(("Cc", cc));
+    }
+    if !in_reply_to.trim().is_empty() {
+        validate_header_value("In-Reply-To", &in_reply_to, MAX_RECIPIENT_HEADER_BYTES)?;
+        headers.push(("In-Reply-To", in_reply_to.clone()));
+        let combined_references = build_reply_references(&references, &in_reply_to);
+        validate_header_value("References", &combined_references, MAX_RECIPIENT_HEADER_BYTES)?;
+        headers.push(("References", combined_references));
+    }
+    headers.push(("Message-ID", outbound_message_id.clone()));
+    let raw_email = build_raw_mime(&headers, &body, &atts)?;
 
     let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw_email.as_bytes());
 
@@ -1867,6 +1972,10 @@ fn draft_summary(draft: &GmailDraft) -> DraftSummary {
     DraftSummary {
         id: draft.id.clone(),
         message_id: draft.message.id.clone(),
+        rfc_message_id: draft_header(&draft.message, "message-id"),
+        thread_id: draft.message.thread_id.clone().unwrap_or_default(),
+        in_reply_to: draft_header(&draft.message, "in-reply-to"),
+        references: draft_header(&draft.message, "references"),
         to: draft_header(&draft.message, "to"),
         cc: draft_header(&draft.message, "cc"),
         bcc: draft_header(&draft.message, "bcc"),
@@ -2010,7 +2119,7 @@ pub async fn list_drafts(
             async move {
                 validate_gmail_identifier("draft ID", &draft_ref.id)?;
                 let url = format!(
-                    "https://gmail.googleapis.com/gmail/v1/users/me/drafts/{}?format=metadata&metadataHeaders=To&metadataHeaders=Subject",
+                    "https://gmail.googleapis.com/gmail/v1/users/me/drafts/{}?format=metadata&metadataHeaders=To&metadataHeaders=Cc&metadataHeaders=Bcc&metadataHeaders=Subject&metadataHeaders=Message-ID&metadataHeaders=In-Reply-To&metadataHeaders=References",
                     draft_ref.id
                 );
                 let response = gmail_get_with_retry(&client, &access_token, url, "Draft could not be loaded").await?;
@@ -2067,6 +2176,10 @@ pub async fn get_draft(
     Ok(DraftContent {
         id: draft.id,
         message_id: draft.message.id.clone(),
+        rfc_message_id: draft_header(&draft.message, "message-id"),
+        thread_id: draft.message.thread_id.clone().unwrap_or_default(),
+        in_reply_to: draft_header(&draft.message, "in-reply-to"),
+        references: draft_header(&draft.message, "references"),
         to: draft_header(&draft.message, "to"),
         cc: draft_header(&draft.message, "cc"),
         bcc: draft_header(&draft.message, "bcc"),
@@ -2088,11 +2201,16 @@ pub async fn save_draft(
     subject: String,
     body: String,
     attachments: Option<Vec<AttachmentPayload>>,
+    thread_id: Option<String>,
+    in_reply_to: Option<String>,
+    references: Option<String>,
 ) -> Result<SavedDraft, String> {
     crate::require_command_window(&window, &["main"])?;
-    validate_optional_recipient_header(&to)?;
-    validate_optional_recipient_header(&cc)?;
-    validate_optional_recipient_header(&bcc)?;
+    // Drafts deliberately accept incomplete addresses. They are validated
+    // strictly only when the user sends the message.
+    validate_draft_recipient_header("To", &to)?;
+    validate_draft_recipient_header("Cc", &cc)?;
+    validate_draft_recipient_header("Bcc", &bcc)?;
     validate_header_value("Subject", &subject, MAX_SUBJECT_BYTES)?;
     if let Some(id) = &draft_id {
         validate_gmail_identifier("draft ID", id)?;
@@ -2111,10 +2229,23 @@ pub async fn save_draft(
         headers.push(("Bcc", bcc));
     }
     headers.push(("Subject", mime_encode_header(&subject)));
+    if let Some(in_reply_to) = in_reply_to.filter(|value| !value.trim().is_empty()) {
+        validate_header_value("In-Reply-To", &in_reply_to, MAX_RECIPIENT_HEADER_BYTES)?;
+        headers.push(("In-Reply-To", in_reply_to.clone()));
+        let prior = references.unwrap_or_default();
+        let combined = build_reply_references(&prior, &in_reply_to);
+        validate_header_value("References", &combined, MAX_RECIPIENT_HEADER_BYTES)?;
+        headers.push(("References", combined));
+    }
     headers.push(("Message-ID", verification_message_id.clone()));
     let raw_email = build_raw_mime(&headers, &body, &attachments.unwrap_or_default())?;
     let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw_email.as_bytes());
-    let payload = serde_json::json!({ "message": { "raw": encoded } });
+    let mut message = serde_json::json!({ "raw": encoded });
+    if let Some(thread_id) = thread_id.filter(|value| !value.trim().is_empty()) {
+        validate_gmail_identifier("thread ID", &thread_id)?;
+        message["threadId"] = serde_json::Value::String(thread_id);
+    }
+    let payload = serde_json::json!({ "message": message });
     let existing_draft_id = draft_id.clone();
     let request = if let Some(id) = draft_id {
         client
@@ -2394,19 +2525,19 @@ pub async fn mark_as_unread(
     window: tauri::WebviewWindow,
     app: AppHandle,
     account_id: String,
-    message_id: String,
+    thread_id: String,
 ) -> Result<(), String> {
     crate::require_command_window(&window, &["main"])?;
     let access_token = crate::db::load_account_access_token(&account_id)?;
-    validate_gmail_identifier("message ID", &message_id)?;
+    validate_gmail_identifier("thread ID", &thread_id)?;
     // Notify Gmail before changing the local cache.
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .unwrap_or_default();
     let url = format!(
-        "https://gmail.googleapis.com/gmail/v1/users/me/messages/{}/modify",
-        message_id
+        "https://gmail.googleapis.com/gmail/v1/users/me/threads/{}/modify",
+        thread_id
     );
     let body = serde_json::json!({
         "addLabelIds": ["UNREAD"]
@@ -2427,7 +2558,7 @@ pub async fn mark_as_unread(
         ));
     }
 
-    if let Err(error) = crate::db::mark_email_as_unread_local(&app, &message_id, &account_id) {
+    if let Err(error) = crate::db::mark_thread_as_unread_local(&app, &thread_id, &account_id) {
         if let Err(sync_error) = sync_emails(window, app, account_id, Some(true)).await {
             eprintln!("[MAIL_CACHE] unread-state reconciliation failed: {sync_error}");
         }
@@ -2732,11 +2863,13 @@ pub async fn save_and_reveal_attachment(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_raw_mime, execute_send, generate_outbound_message_id, gmail_get_with_retry,
-        gmail_retry_delay, gmail_trash_request, is_retryable_gmail_status, mailbox_failure_status,
-        parse_retry_after_delay, safe_attachment_filename, validate_optional_recipient_header,
-        validate_outbound_message_id, validate_recipient_header, AttachmentPayload,
-        DraftListResponse, GmailLabelStats, SendAttempt, GMAIL_GET_MAX_RETRY_AFTER_SECS,
+        build_raw_mime, build_reply_references, determine_label, execute_send,
+        generate_outbound_message_id, gmail_get_with_retry, gmail_retry_delay, gmail_trash_request,
+        is_retryable_gmail_status, mailbox_failure_status, parse_message_detail,
+        parse_retry_after_delay, safe_attachment_filename, validate_draft_recipient_header,
+        validate_optional_recipient_header, validate_outbound_message_id,
+        validate_recipient_header, AttachmentPayload, DraftListResponse, GmailLabelStats,
+        MessageDetail, SendAttempt, GMAIL_GET_MAX_RETRY_AFTER_SECS,
     };
     use reqwest::{Client, StatusCode};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2746,6 +2879,57 @@ mod tests {
         assert!(validate_optional_recipient_header("").is_ok());
         assert!(validate_optional_recipient_header("person@example.test").is_ok());
         assert!(validate_optional_recipient_header("not-an-address").is_err());
+    }
+
+    #[test]
+    fn gmail_drafts_are_not_classified_as_sent_or_archived_messages() {
+        assert_eq!(determine_label(&["DRAFT".to_string()]), "draft");
+        assert_eq!(
+            determine_label(&["DRAFT".to_string(), "SENT".to_string()]),
+            "draft"
+        );
+    }
+
+    #[test]
+    fn draft_recipient_fields_accept_incomplete_addresses_but_reject_header_injection() {
+        assert!(validate_draft_recipient_header("To", "unfinished-address").is_ok());
+        assert!(validate_draft_recipient_header("To", "person@example.test").is_ok());
+        assert!(validate_draft_recipient_header("To", "person@example.test\r\nBcc: attacker@example.test").is_err());
+    }
+
+    #[test]
+    fn message_parser_preserves_rfc_reply_headers() {
+        let detail: MessageDetail = serde_json::from_str(r#"{
+          "id":"gmail-message", "threadId":"gmail-thread", "snippet":"hello",
+          "internalDate":"123", "labelIds":["INBOX"],
+          "payload":{"headers":[
+            {"name":"From","value":"Alice <alice@example.test>"},
+            {"name":"To","value":"Me <me@example.test>"},
+            {"name":"Reply-To","value":"Help <help@example.test>"},
+            {"name":"Message-ID","value":"<child@example.test>"},
+            {"name":"References","value":"<root@example.test>"},
+            {"name":"Subject","value":"Hello"}
+          ],"body":{}}
+        }"#).expect("message detail");
+        let (email, _) = parse_message_detail(detail);
+        assert_eq!(email.reply_to, "Help <help@example.test>");
+        assert_eq!(email.message_id, "<child@example.test>");
+        assert_eq!(email.references, "<root@example.test>");
+    }
+
+    #[test]
+    fn reply_reference_chain_appends_the_selected_message_once() {
+        assert_eq!(
+            build_reply_references("<root@example.test>", "<child@example.test>"),
+            "<root@example.test> <child@example.test>"
+        );
+        assert_eq!(
+            build_reply_references(
+                "<root@example.test> <child@example.test>",
+                "<child@example.test>"
+            ),
+            "<root@example.test> <child@example.test>"
+        );
     }
 
     #[test]
