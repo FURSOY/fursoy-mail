@@ -29,12 +29,7 @@ dist-ssr
 src-tauri/.env
 src-tauri/target
 
-~/.tauri/fursoy-mail.key
+# Local signing keys
+*.key
 
 latest.json
-
-
-
-
-
-releaseyayınlamarehberi.txt
