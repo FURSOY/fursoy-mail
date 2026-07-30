@@ -1,23 +1,15 @@
-## Threaded conversations and drafts
+## Advanced search
 
-- Reply, Reply All, and Forward now operate on the selected message inside a conversation.
-- Added restorable inline Gmail drafts with correct recipients and RFC reply headers.
-- Improved draft reconciliation after sending or deleting a reply.
-- Added thread-aware archive, trash, unread, and spam actions.
+- Added a Gmail-style advanced search panel with sender, recipient, subject, word, date, location, attachment, unread, and starred filters.
+- Search results now preserve and clearly reflect their mailbox or nested-label context in the sidebar.
 
-## Search and synchronization
+## Mail organization
 
-- Added fast full-message search backed by SQLite FTS5, including in-message highlighting.
-- Virtualized long message lists and optimized incremental search to keep the interface responsive.
-- Added resumable background synchronization for mailboxes larger than the initial sync window.
+- Added multi-select actions for managing several conversations at once.
+- Added Starred and All Mail views with Gmail-compatible mailbox behavior.
+- Added Gmail label actions, nested label navigation, and automatic expansion of selected label groups.
 
-## Message reader
+## Reliability
 
-- Improved HTML and plain-text rendering, spacing, fit behavior, and message details.
-- Refined desktop and mobile layouts for multi-message conversations.
-
-## Reliability, security, and maintenance
-
-- Kept desktop OAuth protected with PKCE and compatible with the configured Google client credentials.
-- Updated frontend and Rust dependencies, license notices, privacy terms, and security guidance.
-- Added regression coverage for OAuth, search, sync, threads, recipients, replies, drafts, and rendering.
+- Corrected the minimum synchronization interval and safely normalized periodic timer delays.
+- Added regression coverage for advanced search, label hierarchy, mail-list caching, profile images, synchronization intervals, and the Tauri API bridge.
