@@ -3,16 +3,21 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>FURSOY Mail</title>
+    <title>FURSOY Mail – Local-First Windows Desktop Email Client &amp; OTP Notifier</title>
     <meta name="application-name" content="FURSOY Mail" />
     <meta
       name="description"
-      content="A lightweight, local-first Gmail client for Windows that detects verification codes and lets you copy them from notifications."
+      content="A lightweight, local-first Windows desktop email client supporting IMAP and all major email providers that detects verification codes and lets you copy them from notifications."
+    />
+    <meta
+      name="keywords"
+      content="windows email client, imap desktop client, verification code notification, copy otp notification, local-first mail app, fast windows mail, desktop email notifier"
     />
     <meta name="theme-color" content="#0a0c0e" />
     <meta name="robots" content="index, follow" />
     <link rel="canonical" href="https://fursoy.com/" />
     <link rel="icon" href="favicon.png" type="image/png" />
+    <link rel="preload" href="styles.css?v=20260717-1" as="style" />
     <link rel="stylesheet" href="styles.css?v=20260717-1" />
 
     <meta property="og:type" content="website" />
@@ -20,7 +25,7 @@
     <meta property="og:title" content="FURSOY Mail" />
     <meta
       property="og:description"
-      content="Verification codes from Gmail, ready to copy from a Windows notification."
+      content="Verification codes from your emails, ready to copy from a Windows notification."
     />
     <meta property="og:url" content="https://fursoy.com/" />
     <meta name="twitter:card" content="summary" />
@@ -32,11 +37,60 @@
         "name": "FURSOY Mail",
         "applicationCategory": "CommunicationApplication",
         "operatingSystem": "Windows 10, Windows 11",
-        "description": "A lightweight, local-first Gmail client that detects verification codes and lets users copy them from notifications.",
+        "description": "A lightweight, local-first Windows desktop email client supporting IMAP and major email providers that detects verification codes and lets users copy them from notifications.",
         "downloadUrl": "https://fursoy.com/download/",
         "isAccessibleForFree": true,
         "license": "https://github.com/FURSOY/FURSOY-Mail",
         "codeRepository": "https://github.com/FURSOY/FURSOY-Mail"
+      }
+    </script>
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "FAQPage",
+        "mainEntity": [
+          {
+            "@type": "Question",
+            "name": "How does FURSOY Mail handle verification codes?",
+            "acceptedAnswer": {
+              "@type": "Answer",
+              "text": "FURSOY Mail monitors your inbox locally over IMAP. When a verification code or OTP email arrives, it parses the code on your device and displays a native Windows notification with a one-click copy button."
+            }
+          },
+          {
+            "@type": "Question",
+            "name": "Which email providers are supported?",
+            "acceptedAnswer": {
+              "@type": "Answer",
+              "text": "FURSOY Mail supports all standard IMAP email providers including Gmail, Outlook, Yahoo, iCloud, Fastmail, and custom domain IMAP servers."
+            }
+          },
+          {
+            "@type": "Question",
+            "name": "Is my email data safe and private?",
+            "acceptedAnswer": {
+              "@type": "Answer",
+              "text": "Yes. FURSOY Mail is local-first and open source. Your credentials and emails stay on your computer. Mail data is never sent to third-party FURSOY servers."
+            }
+          },
+          {
+            "@type": "Question",
+            "name": "What Windows versions are supported?",
+            "acceptedAnswer": {
+              "@type": "Answer",
+              "text": "FURSOY Mail is optimized for 64-bit Windows 10 and Windows 11 desktop operating systems."
+            }
+          }
+        ]
+      }
+    </script>
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "WebSite",
+        "name": "FURSOY Mail",
+        "url": "https://fursoy.com/",
+        "description": "Local-first Windows desktop email client supporting IMAP and major email providers."
       }
     </script>
   </head>
@@ -44,7 +98,7 @@
     <div class="page-shell">
       <header class="site-header">
         <a class="brand" href="index.html" aria-label="FURSOY Mail home">
-          <img src="favicon.png" width="32" height="32" alt="" />
+          <img src="favicon.png" width="32" height="32" alt="FURSOY Mail logo" />
           <span>FURSOY Mail</span>
         </a>
         <a
@@ -58,15 +112,15 @@
 
       <main class="hero">
         <section class="hero-copy" aria-labelledby="hero-title">
-          <p class="hero-app-name">Windows Gmail client</p>
+          <p class="hero-app-name">Windows desktop email client</p>
           <h1 id="hero-title">FURSOY Mail</h1>
           <p class="hero-tagline">
             Your code is already
             <em>waiting.</em>
           </p>
           <p class="lead">
-            FURSOY Mail is a Windows desktop Gmail client. With your permission,
-            it synchronizes your Gmail messages to detect verification codes
+            FURSOY Mail is a fast, local-first Windows desktop email client. With your permission,
+            it synchronizes your email messages to detect verification codes
             locally and puts them in a notification—ready to copy in one click.
           </p>
 
@@ -75,14 +129,14 @@
               <span aria-hidden="true">↓</span>
               Download for Windows
             </a>
-            <span class="requirements">Windows 10 &amp; 11 · Gmail</span>
+            <span class="requirements">Windows 10 &amp; 11 · IMAP &amp; All Providers</span>
           </div>
         </section>
 
         <aside class="notification-demo" aria-label="Verification code notification example">
           <div class="notification-topline">
             <div class="notification-app">
-              <img src="favicon.png" width="28" height="28" alt="" />
+              <img src="favicon.png" width="28" height="28" alt="FURSOY Mail app icon" />
               <div>
                 <strong>FURSOY Mail</strong>
                 <span>Just now</span>
@@ -124,17 +178,58 @@
         <div class="purpose-copy">
           <h2 id="purpose-title">What FURSOY Mail does</h2>
           <p>
-            FURSOY Mail is a desktop Gmail client. With your permission, it
-            reads and synchronizes Gmail messages so it can detect verification
+            FURSOY Mail is a desktop email client supporting IMAP and major providers. With your permission, it
+            reads and synchronizes your email messages so it can detect verification
             codes locally, show new-mail notifications, and let you copy codes
             without searching through your inbox.
           </p>
           <p>
-            Gmail access also enables the mail actions you choose, including
+            Email account access enables the mail actions you choose, including
             sending messages, marking messages as read, and moving messages to
             trash. Mail data is processed on your device and is not sent to or
             stored on FURSOY servers.
           </p>
+        </div>
+      </section>
+
+      <section class="faq" aria-labelledby="faq-title">
+        <p class="faq-label">FAQ</p>
+        <div class="faq-copy">
+          <h2 id="faq-title">Frequently Asked Questions</h2>
+          <div class="faq-list">
+            <details class="faq-item" open>
+              <summary class="faq-question">How does FURSOY Mail handle verification codes?</summary>
+              <div class="faq-answer">
+                <p>
+                  FURSOY Mail monitors your inbox locally over IMAP and secure APIs. When a verification code or OTP (one-time password) email arrives, it parses the code on your device and sends a native Windows notification with a single-click copy button.
+                </p>
+              </div>
+            </details>
+            <details class="faq-item">
+              <summary class="faq-question">Which email providers are supported?</summary>
+              <div class="faq-answer">
+                <p>
+                  FURSOY Mail supports all standard IMAP email providers (including Gmail, Outlook, Yahoo, iCloud, Fastmail, and custom domain IMAP servers).
+                </p>
+              </div>
+            </details>
+            <details class="faq-item">
+              <summary class="faq-question">Is my email data safe and private?</summary>
+              <div class="faq-answer">
+                <p>
+                  Yes. FURSOY Mail is local-first and open source. Your credentials and emails stay on your computer. Your email data is never sent to or stored on third-party FURSOY servers, and there is zero telemetry or tracking.
+                </p>
+              </div>
+            </details>
+            <details class="faq-item">
+              <summary class="faq-question">What Windows versions are supported?</summary>
+              <div class="faq-answer">
+                <p>
+                  FURSOY Mail is optimized for 64-bit Windows 10 and Windows 11 desktop operating systems.
+                </p>
+              </div>
+            </details>
+          </div>
         </div>
       </section>
 

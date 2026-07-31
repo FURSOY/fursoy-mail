@@ -397,6 +397,97 @@ h1 {
   margin-top: 16px;
 }
 
+.faq {
+  padding: 72px 0;
+  display: grid;
+  grid-template-columns: minmax(120px, 0.45fr) minmax(0, 1.55fr);
+  gap: 48px;
+  border-bottom: 1px solid var(--border);
+}
+
+.faq-label {
+  margin: 6px 0 0;
+  color: var(--accent-bright);
+  font-size: 11px;
+  font-weight: 750;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.faq-copy {
+  max-width: 720px;
+}
+
+.faq h2 {
+  margin: 0 0 32px;
+  color: #e5e9ec;
+  font-size: clamp(30px, 4vw, 46px);
+  line-height: 1.05;
+  letter-spacing: -0.045em;
+}
+
+.faq-list {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.faq-item {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+  overflow: hidden;
+  transition: border-color 160ms ease, background-color 160ms ease;
+}
+
+.faq-item[open] {
+  background: var(--surface-raised);
+  border-color: rgba(42, 163, 172, 0.35);
+}
+
+.faq-question {
+  padding: 18px 22px;
+  color: var(--text);
+  font-size: 16px;
+  font-weight: 650;
+  letter-spacing: -0.015em;
+  cursor: pointer;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  user-select: none;
+}
+
+.faq-question::-webkit-details-marker {
+  display: none;
+}
+
+.faq-question::after {
+  content: "+";
+  font-size: 20px;
+  font-weight: 400;
+  color: var(--text-dim);
+  transition: transform 160ms ease, color 160ms ease;
+  margin-left: 12px;
+}
+
+.faq-item[open] .faq-question::after {
+  content: "−";
+  color: var(--accent-bright);
+}
+
+.faq-answer {
+  padding: 0 22px 20px;
+}
+
+.faq-answer p {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 14.5px;
+  line-height: 1.7;
+}
+
 footer {
   min-height: 94px;
   display: flex;
@@ -518,7 +609,8 @@ footer a:focus-visible,
     padding-left: 0;
   }
 
-  .purpose {
+  .purpose,
+  .faq {
     grid-template-columns: 1fr;
     gap: 20px;
   }
@@ -579,8 +671,18 @@ footer a:focus-visible,
     border-bottom: 0;
   }
 
-  .purpose {
+  .purpose,
+  .faq {
     padding: 52px 0;
+  }
+
+  .faq-question {
+    padding: 15px 18px;
+    font-size: 15px;
+  }
+
+  .faq-answer {
+    padding: 0 18px 18px;
   }
 
   footer {
