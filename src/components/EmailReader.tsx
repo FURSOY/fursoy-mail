@@ -879,7 +879,12 @@ export function EmailReader({
       draftId: replyDraftIdRef.current,
       verificationMessageId: replyVerificationMessageIdRef.current,
     };
-    try { localStorage.setItem(storageKey, JSON.stringify(localSnapshot)); } catch { /* Gmail save remains authoritative. */ }
+    try { localStorage.setItem(storageKey, JSON.stringify(localSnapshot)); } catch { /* Remote drafts remain authoritative where supported. */ }
+    if (replyTarget.id.startsWith("imap:")) {
+      setReplyDraftStatus("saved");
+      setReplyDraftError(null);
+      return Promise.resolve(null);
+    }
     setReplyDraftStatus("saving");
     setReplyDraftError(null);
     const saveOperation = replyDraftSaveQueueRef.current

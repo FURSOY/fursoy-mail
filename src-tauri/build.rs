@@ -40,5 +40,6 @@ fn emit_env_from_dotenv(key: &str) {
 fn main() {
     emit_env_from_dotenv("GOOGLE_CLIENT_ID");
     emit_env_from_dotenv("GOOGLE_CLIENT_SECRET");
+    emit_env_from_dotenv("MICROSOFT_CLIENT_ID");
     tauri_build::build()
 }

@@ -22,7 +22,7 @@ export function isNoUpdateError(error: unknown): boolean {
 
 export function isAuthFailure(error: unknown): boolean {
   const message = (error instanceof Error ? error.message : String(error)).toLowerCase();
-  return /401|unauthorized|invalid_grant|invalid credentials|unauthenticated|autherror|expected oauth 2 access token|no refresh token|oturum yenilenemedi|oturum bilgisi bulunamad/.test(message);
+  return /401|unauthorized|invalid_grant|invalid credentials|unauthenticated|autherror|expected oauth 2 access token|no refresh token|mail_account_auth_failed|mail_oauth_token_failed|session expired|oturum yenilenemedi|oturum bilgisi bulunamad/.test(message);
 }
 
 export function byteLength(text: string): number {

@@ -12,6 +12,18 @@ const invokeMock = vi.mocked(invoke);
 describe("typed Tauri boundary", () => {
   beforeEach(() => invokeMock.mockClear());
 
+  it("discovers a provider before starting a scoped browser sign-in", async () => {
+    await tauriApi.discoverMailProvider("person@gmail.com");
+    await tauriApi.startMailOAuth("person@gmail.com", "google");
+    await tauriApi.cancelMailOAuth();
+
+    expect(invokeMock.mock.calls).toEqual([
+      ["discover_mail_provider", { email: "person@gmail.com" }],
+      ["start_mail_oauth", { email: "person@gmail.com", provider: "google" }],
+      ["cancel_mail_oauth"],
+    ]);
+  });
+
   it("keeps credentials behind the Rust boundary during sync", async () => {
     await tauriApi.syncEmails("account-a", false);
     await tauriApi.syncEmails("account-b", true);
@@ -28,6 +40,14 @@ describe("typed Tauri boundary", () => {
     expect(invokeMock.mock.calls).toEqual([
       ["trash_email", { accountId: "account-a", threadId: "shared-thread-id" }],
     ]);
+  });
+
+  it("waits for IMAP mailbox changes without exposing credentials", async () => {
+    await tauriApi.waitForImapChange("account-a");
+
+    expect(invokeMock).toHaveBeenCalledWith("wait_for_imap_change", {
+      accountId: "account-a",
+    });
   });
 
   it("preserves all-account and cursor paging parameters", async () => {

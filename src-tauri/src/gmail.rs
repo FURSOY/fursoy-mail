@@ -1,11 +1,11 @@
 use crate::db::{
-    complete_full_sync, delete_emails_by_ids, finalize_full_sync, get_account_cache_generation,
-    get_active_full_sync, get_all_mailbox_sync_states, get_history_id, get_mailbox_cursor_state,
-    get_mailbox_sync_state, has_pending_mailbox_pages, load_tokens, next_full_sync_generation,
+    complete_full_sync, delete_emails_by_ids, delete_gmail_label_local, finalize_full_sync,
+    get_account_cache_generation, get_active_full_sync, get_all_mailbox_sync_states,
+    get_history_id, get_mailbox_cursor_state, get_mailbox_sync_state, gmail_label_exists,
+    has_pending_mailbox_pages, load_tokens, next_full_sync_generation, replace_gmail_labels,
     set_gmail_inbox_unread_stats, set_history_id, set_mailbox_cursor, set_mailbox_sync_state,
-    delete_gmail_label_local, gmail_label_exists, replace_gmail_labels,
-    set_thread_gmail_label_local, upsert_gmail_label,
-    upsert_sync_mail_batch, Email, EmailSummary, GmailLabel,
+    set_thread_gmail_label_local, upsert_gmail_label, upsert_sync_mail_batch, Email, EmailSummary,
+    GmailLabel,
 };
 use base64::Engine;
 use futures::stream::{self, StreamExt, TryStreamExt};
@@ -271,7 +271,10 @@ async fn sync_gmail_labels(
             id: label.id,
             account_id: account_id.to_string(),
             name: label.name,
-            background_color: label.color.as_ref().and_then(|color| color.background_color.clone()),
+            background_color: label
+                .color
+                .as_ref()
+                .and_then(|color| color.background_color.clone()),
             text_color: label.color.and_then(|color| color.text_color),
         })
         .collect();
@@ -351,7 +354,10 @@ fn gmail_label_from_api(account_id: &str, label: GmailLabelApi) -> GmailLabel {
         id: label.id,
         account_id: account_id.to_string(),
         name: label.name,
-        background_color: label.color.as_ref().and_then(|color| color.background_color.clone()),
+        background_color: label
+            .color
+            .as_ref()
+            .and_then(|color| color.background_color.clone()),
         text_color: label.color.and_then(|color| color.text_color),
     }
 }
@@ -1155,6 +1161,9 @@ pub async fn sync_emails(
     force: Option<bool>,
 ) -> Result<(), String> {
     crate::require_command_window(&window, &["main"])?;
+    if crate::db::get_account_provider(&app, &account_id)? == "imap" {
+        return crate::mail_account::sync_imap_account(&app, &account_id).await;
+    }
     let access_token = crate::db::load_account_access_token(&account_id)?;
     let account_generation = get_account_cache_generation(&app, &account_id)?;
     if !force.unwrap_or(false) {
@@ -1327,6 +1336,15 @@ pub async fn archive_email(
     thread_id: String,
 ) -> Result<(), String> {
     crate::require_command_window(&window, &["main"])?;
+    if crate::db::get_account_provider(&app, &account_id)? == "imap" {
+        return crate::mail_account::move_imap_thread(
+            &app,
+            &account_id,
+            &thread_id,
+            "archive",
+        )
+        .await;
+    }
     let access_token = crate::db::load_account_access_token(&account_id)?;
     validate_gmail_identifier("thread ID", &thread_id)?;
     // The reader toolbar represents the whole conversation, matching Gmail.
@@ -1395,7 +1413,10 @@ pub async fn create_gmail_label(
         .await
         .map_err(|error| error.to_string())?;
     if !response.status().is_success() {
-        return Err(format!("Gmail label creation error (HTTP {}).", response.status()));
+        return Err(format!(
+            "Gmail label creation error (HTTP {}).",
+            response.status()
+        ));
     }
     let created: GmailLabelApi = response.json().await.map_err(|error| error.to_string())?;
     let label = gmail_label_from_api(&account_id, created);
@@ -1436,11 +1457,17 @@ pub async fn rename_gmail_label(
         .await
         .map_err(|error| error.to_string())?;
     if !response.status().is_success() {
-        return Err(format!("Gmail label rename error (HTTP {}).", response.status()));
+        return Err(format!(
+            "Gmail label rename error (HTTP {}).",
+            response.status()
+        ));
     }
     let updated = gmail_label_from_api(
         &account_id,
-        response.json::<GmailLabelApi>().await.map_err(|error| error.to_string())?,
+        response
+            .json::<GmailLabelApi>()
+            .await
+            .map_err(|error| error.to_string())?,
     );
     upsert_gmail_label(&app, &updated)?;
     Ok(updated)
@@ -1483,11 +1510,17 @@ pub async fn set_gmail_label_color(
         .await
         .map_err(|error| error.to_string())?;
     if !response.status().is_success() {
-        return Err(format!("Gmail label color error (HTTP {}).", response.status()));
+        return Err(format!(
+            "Gmail label color error (HTTP {}).",
+            response.status()
+        ));
     }
     let updated = gmail_label_from_api(
         &account_id,
-        response.json::<GmailLabelApi>().await.map_err(|error| error.to_string())?,
+        response
+            .json::<GmailLabelApi>()
+            .await
+            .map_err(|error| error.to_string())?,
     );
     upsert_gmail_label(&app, &updated)?;
     Ok(updated)
@@ -1520,7 +1553,10 @@ pub async fn delete_gmail_label(
         .await
         .map_err(|error| error.to_string())?;
     if !response.status().is_success() {
-        return Err(format!("Gmail label delete error (HTTP {}).", response.status()));
+        return Err(format!(
+            "Gmail label delete error (HTTP {}).",
+            response.status()
+        ));
     }
     delete_gmail_label_local(&app, &account_id, &label_id)
 }
@@ -1535,6 +1571,21 @@ pub async fn set_thread_gmail_label(
     applied: bool,
 ) -> Result<(), String> {
     crate::require_command_window(&window, &["main"])?;
+    if crate::db::get_account_provider(&app, &account_id)? == "imap" {
+        if label_id != "STARRED" {
+            return Err("mail_account_label_not_supported".to_string());
+        }
+        crate::mail_account::set_imap_message_flag(
+            &app,
+            &account_id,
+            &thread_id,
+            true,
+            imap_rs::client::Flag::Flagged,
+            applied,
+        )
+        .await?;
+        return set_thread_gmail_label_local(&app, &account_id, &thread_id, &label_id, applied);
+    }
     validate_gmail_identifier("thread ID", &thread_id)?;
     validate_gmail_identifier("label ID", &label_id)?;
     if label_id != "STARRED" && !gmail_label_exists(&app, &account_id, &label_id)? {
@@ -1561,7 +1612,10 @@ pub async fn set_thread_gmail_label(
         .await
         .map_err(|error| error.to_string())?;
     if !response.status().is_success() {
-        return Err(format!("Gmail label update error (HTTP {}).", response.status()));
+        return Err(format!(
+            "Gmail label update error (HTTP {}).",
+            response.status()
+        ));
     }
     set_thread_gmail_label_local(&app, &account_id, &thread_id, &label_id, applied)
 }
@@ -1574,6 +1628,10 @@ pub async fn report_spam(
     thread_id: String,
 ) -> Result<(), String> {
     crate::require_command_window(&window, &["main"])?;
+    if crate::db::get_account_provider(&app, &account_id)? == "imap" {
+        return crate::mail_account::move_imap_thread(&app, &account_id, &thread_id, "junk")
+            .await;
+    }
     let access_token = crate::db::load_account_access_token(&account_id)?;
     validate_gmail_identifier("thread ID", &thread_id)?;
     // Gmail applies spam classification to the whole conversation.
@@ -1631,6 +1689,10 @@ pub async fn trash_email(
     thread_id: String,
 ) -> Result<(), String> {
     crate::require_command_window(&window, &["main"])?;
+    if crate::db::get_account_provider(&app, &account_id)? == "imap" {
+        return crate::mail_account::move_imap_thread(&app, &account_id, &thread_id, "trash")
+            .await;
+    }
     let access_token = crate::db::load_account_access_token(&account_id)?;
     validate_gmail_identifier("thread ID", &thread_id)?;
     // Trash the whole conversation, matching Gmail's top toolbar.
@@ -1672,6 +1734,10 @@ pub async fn move_to_inbox(
     thread_id: String,
 ) -> Result<(), String> {
     crate::require_command_window(&window, &["main"])?;
+    if crate::db::get_account_provider(&app, &account_id)? == "imap" {
+        return crate::mail_account::move_imap_thread(&app, &account_id, &thread_id, "inbox")
+            .await;
+    }
     let access_token = crate::db::load_account_access_token(&account_id)?;
     validate_gmail_identifier("thread ID", &thread_id)?;
     // Restore the whole conversation, matching the reader toolbar scope.
@@ -1764,52 +1830,52 @@ struct SavedDraftMessage {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DraftSummary {
-    id: String,
-    message_id: String,
-    rfc_message_id: String,
-    thread_id: String,
-    in_reply_to: String,
-    references: String,
-    to: String,
-    cc: String,
-    bcc: String,
-    subject: String,
-    snippet: String,
-    updated_at: i64,
+    pub(crate) id: String,
+    pub(crate) message_id: String,
+    pub(crate) rfc_message_id: String,
+    pub(crate) thread_id: String,
+    pub(crate) in_reply_to: String,
+    pub(crate) references: String,
+    pub(crate) to: String,
+    pub(crate) cc: String,
+    pub(crate) bcc: String,
+    pub(crate) subject: String,
+    pub(crate) snippet: String,
+    pub(crate) updated_at: i64,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DraftPage {
-    drafts: Vec<DraftSummary>,
-    next_page_token: Option<String>,
+    pub(crate) drafts: Vec<DraftSummary>,
+    pub(crate) next_page_token: Option<String>,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DraftContent {
-    id: String,
-    message_id: String,
-    rfc_message_id: String,
-    thread_id: String,
-    in_reply_to: String,
-    references: String,
-    to: String,
-    cc: String,
-    bcc: String,
-    subject: String,
-    body: String,
-    updated_at: i64,
-    attachments: Vec<AttachmentPayload>,
+    pub(crate) id: String,
+    pub(crate) message_id: String,
+    pub(crate) rfc_message_id: String,
+    pub(crate) thread_id: String,
+    pub(crate) in_reply_to: String,
+    pub(crate) references: String,
+    pub(crate) to: String,
+    pub(crate) cc: String,
+    pub(crate) bcc: String,
+    pub(crate) subject: String,
+    pub(crate) body: String,
+    pub(crate) updated_at: i64,
+    pub(crate) attachments: Vec<AttachmentPayload>,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SavedDraft {
-    id: String,
-    message_id: String,
-    verification_message_id: String,
-    updated_at: i64,
+    pub(crate) id: String,
+    pub(crate) message_id: String,
+    pub(crate) verification_message_id: String,
+    pub(crate) updated_at: i64,
 }
 
 fn validate_recipient_header(value: &str) -> Result<(), String> {
@@ -1923,7 +1989,7 @@ fn mime_body_base64(body: &str) -> String {
 
 /// Builds a RFC 2822 raw email. Without attachments: simple text/html.
 /// With attachments: multipart/mixed with HTML part + attachment parts.
-fn build_raw_mime(
+pub(crate) fn build_raw_mime(
     headers: &[(&str, String)],
     body: &str,
     attachments: &[AttachmentPayload],
@@ -2100,37 +2166,59 @@ pub async fn send_reply(
     attachments: Option<Vec<AttachmentPayload>>,
 ) -> Result<SendOutcome, String> {
     crate::require_command_window(&window, &["main"])?;
-    let access_token = crate::db::load_account_access_token(&account_id)?;
-    let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|_| "Gmail send client could not be created.".to_string())?;
+    let is_imap = crate::db::get_account_provider(&app, &account_id)? == "imap";
     let atts = attachments.unwrap_or_default();
     validate_recipient_header(&to)?;
     validate_optional_recipient_header(&cc)?;
     validate_header_value("Subject", &subject, MAX_SUBJECT_BYTES)?;
-    validate_gmail_identifier("thread ID", &thread_id)?;
+    if !is_imap {
+        validate_gmail_identifier("thread ID", &thread_id)?;
+    }
     let outbound_message_id = generate_outbound_message_id();
 
     let clean_subject = subject
         .trim_start_matches("Re: ")
         .trim_start_matches("re: ");
     let mut headers = vec![
-        ("To", to),
-        ("Subject", format!("Re: {}", mime_encode_header(clean_subject))),
+        ("To", to.clone()),
+        (
+            "Subject",
+            format!("Re: {}", mime_encode_header(clean_subject)),
+        ),
     ];
     if !cc.trim().is_empty() {
-        headers.push(("Cc", cc));
+        headers.push(("Cc", cc.clone()));
+    }
+    if is_imap {
+        headers.insert(0, ("From", account_id.clone()));
     }
     if !in_reply_to.trim().is_empty() {
         validate_header_value("In-Reply-To", &in_reply_to, MAX_RECIPIENT_HEADER_BYTES)?;
         headers.push(("In-Reply-To", in_reply_to.clone()));
         let combined_references = build_reply_references(&references, &in_reply_to);
-        validate_header_value("References", &combined_references, MAX_RECIPIENT_HEADER_BYTES)?;
+        validate_header_value(
+            "References",
+            &combined_references,
+            MAX_RECIPIENT_HEADER_BYTES,
+        )?;
         headers.push(("References", combined_references));
     }
     headers.push(("Message-ID", outbound_message_id.clone()));
     let raw_email = build_raw_mime(&headers, &body, &atts)?;
+
+    if is_imap {
+        crate::mail_account::send_smtp_raw(&app, &account_id, &to, &cc, "", raw_email).await?;
+        return Ok(SendOutcome {
+            status: "sent",
+            message_id: outbound_message_id,
+        });
+    }
+
+    let access_token = crate::db::load_account_access_token(&account_id)?;
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|_| "Gmail send client could not be created.".to_string())?;
 
     let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw_email.as_bytes());
 
@@ -2194,11 +2282,7 @@ pub async fn send_email(
     attachments: Option<Vec<AttachmentPayload>>,
 ) -> Result<SendOutcome, String> {
     crate::require_command_window(&window, &["main"])?;
-    let access_token = crate::db::load_account_access_token(&account_id)?;
-    let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|_| "Gmail send client could not be created.".to_string())?;
+    let is_imap = crate::db::get_account_provider(&app, &account_id)? == "imap";
     let atts = attachments.unwrap_or_default();
     validate_recipient_header(&to)?;
     validate_optional_recipient_header(&cc)?;
@@ -2206,16 +2290,33 @@ pub async fn send_email(
     validate_header_value("Subject", &subject, MAX_SUBJECT_BYTES)?;
     let outbound_message_id = generate_outbound_message_id();
 
-    let mut headers = vec![("To", to)];
+    let mut headers = vec![("To", to.clone())];
     if !cc.trim().is_empty() {
-        headers.push(("Cc", cc));
+        headers.push(("Cc", cc.clone()));
     }
-    if !bcc.trim().is_empty() {
-        headers.push(("Bcc", bcc));
+    if !is_imap && !bcc.trim().is_empty() {
+        headers.push(("Bcc", bcc.clone()));
+    }
+    if is_imap {
+        headers.insert(0, ("From", account_id.clone()));
     }
     headers.push(("Subject", mime_encode_header(&subject)));
     headers.push(("Message-ID", outbound_message_id.clone()));
     let raw_email = build_raw_mime(&headers, &body, &atts)?;
+
+    if is_imap {
+        crate::mail_account::send_smtp_raw(&app, &account_id, &to, &cc, &bcc, raw_email).await?;
+        return Ok(SendOutcome {
+            status: "sent",
+            message_id: outbound_message_id,
+        });
+    }
+
+    let access_token = crate::db::load_account_access_token(&account_id)?;
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|_| "Gmail send client could not be created.".to_string())?;
 
     let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw_email.as_bytes());
 
@@ -2407,10 +2508,14 @@ async fn reconcile_created_draft(
 #[tauri::command]
 pub async fn list_drafts(
     window: tauri::WebviewWindow,
+    app: tauri::AppHandle,
     account_id: String,
     page_token: Option<String>,
 ) -> Result<DraftPage, String> {
     crate::require_command_window(&window, &["main"])?;
+    if crate::db::get_account_provider(&app, &account_id)? == "imap" {
+        return crate::mail_account::list_imap_drafts(&app, &account_id).await;
+    }
     let access_token = crate::db::load_account_access_token(&account_id)?;
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(30))
@@ -2469,10 +2574,14 @@ pub async fn list_drafts(
 #[tauri::command]
 pub async fn get_draft(
     window: tauri::WebviewWindow,
+    app: tauri::AppHandle,
     account_id: String,
     draft_id: String,
 ) -> Result<DraftContent, String> {
     crate::require_command_window(&window, &["main"])?;
+    if crate::db::get_account_provider(&app, &account_id)? == "imap" {
+        return crate::mail_account::get_imap_draft(&app, &account_id, &draft_id).await;
+    }
     validate_gmail_identifier("draft ID", &draft_id)?;
     let access_token = crate::db::load_account_access_token(&account_id)?;
     let client = Client::builder()
@@ -2516,6 +2625,7 @@ pub async fn get_draft(
 #[tauri::command]
 pub async fn save_draft(
     window: tauri::WebviewWindow,
+    app: tauri::AppHandle,
     account_id: String,
     draft_id: Option<String>,
     to: String,
@@ -2529,20 +2639,18 @@ pub async fn save_draft(
     references: Option<String>,
 ) -> Result<SavedDraft, String> {
     crate::require_command_window(&window, &["main"])?;
+    let is_imap = crate::db::get_account_provider(&app, &account_id)? == "imap";
     // Drafts deliberately accept incomplete addresses. They are validated
     // strictly only when the user sends the message.
     validate_draft_recipient_header("To", &to)?;
     validate_draft_recipient_header("Cc", &cc)?;
     validate_draft_recipient_header("Bcc", &bcc)?;
     validate_header_value("Subject", &subject, MAX_SUBJECT_BYTES)?;
-    if let Some(id) = &draft_id {
-        validate_gmail_identifier("draft ID", id)?;
+    if !is_imap {
+        if let Some(id) = &draft_id {
+            validate_gmail_identifier("draft ID", id)?;
+        }
     }
-    let access_token = crate::db::load_account_access_token(&account_id)?;
-    let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
-        .build()
-        .map_err(|_| "Gmail draft client could not be created.".to_string())?;
     let verification_message_id = generate_outbound_message_id();
     let mut headers = vec![("To", to)];
     if !cc.trim().is_empty() {
@@ -2562,6 +2670,21 @@ pub async fn save_draft(
     }
     headers.push(("Message-ID", verification_message_id.clone()));
     let raw_email = build_raw_mime(&headers, &body, &attachments.unwrap_or_default())?;
+    if is_imap {
+        return crate::mail_account::save_imap_draft(
+            &app,
+            &account_id,
+            draft_id.as_deref(),
+            raw_email,
+            verification_message_id,
+        )
+        .await;
+    }
+    let access_token = crate::db::load_account_access_token(&account_id)?;
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|_| "Gmail draft client could not be created.".to_string())?;
     let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw_email.as_bytes());
     let mut message = serde_json::json!({ "raw": encoded });
     if let Some(thread_id) = thread_id.filter(|value| !value.trim().is_empty()) {
@@ -2655,6 +2778,14 @@ pub async fn send_draft(
     verification_message_id: String,
 ) -> Result<SendOutcome, String> {
     crate::require_command_window(&window, &["main"])?;
+    if crate::db::get_account_provider(&app, &account_id)? == "imap" {
+        validate_outbound_message_id(&verification_message_id)?;
+        crate::mail_account::send_imap_draft(&app, &account_id, &draft_id).await?;
+        return Ok(SendOutcome {
+            status: "sent",
+            message_id: verification_message_id,
+        });
+    }
     validate_gmail_identifier("draft ID", &draft_id)?;
     validate_outbound_message_id(&verification_message_id)?;
     let access_token = crate::db::load_account_access_token(&account_id)?;
@@ -2709,10 +2840,14 @@ pub async fn send_draft(
 #[tauri::command]
 pub async fn delete_draft(
     window: tauri::WebviewWindow,
+    app: tauri::AppHandle,
     account_id: String,
     draft_id: String,
 ) -> Result<(), String> {
     crate::require_command_window(&window, &["main"])?;
+    if crate::db::get_account_provider(&app, &account_id)? == "imap" {
+        return crate::mail_account::delete_imap_draft(&app, &account_id, &draft_id).await;
+    }
     validate_gmail_identifier("draft ID", &draft_id)?;
     let access_token = crate::db::load_account_access_token(&account_id)?;
     let client = Client::builder()
@@ -2804,6 +2939,18 @@ pub async fn mark_as_read(
     message_id: String,
 ) -> Result<(), String> {
     crate::require_command_window(&window, &["main"])?;
+    if crate::db::get_account_provider(&app, &account_id)? == "imap" {
+        crate::mail_account::set_imap_message_flag(
+            &app,
+            &account_id,
+            &message_id,
+            false,
+            imap_rs::client::Flag::Seen,
+            true,
+        )
+        .await?;
+        return crate::db::mark_email_as_read_local(&app, &message_id, &account_id);
+    }
     let access_token = crate::db::load_account_access_token(&account_id)?;
     validate_gmail_identifier("message ID", &message_id)?;
     // Notify Gmail before changing the local cache.
@@ -2851,6 +2998,18 @@ pub async fn mark_thread_as_read(
     thread_id: String,
 ) -> Result<(), String> {
     crate::require_command_window(&window, &["main"])?;
+    if crate::db::get_account_provider(&app, &account_id)? == "imap" {
+        crate::mail_account::set_imap_message_flag(
+            &app,
+            &account_id,
+            &thread_id,
+            true,
+            imap_rs::client::Flag::Seen,
+            true,
+        )
+        .await?;
+        return crate::db::mark_thread_as_read_local(&app, &thread_id, &account_id);
+    }
     let access_token = crate::db::load_account_access_token(&account_id)?;
     validate_gmail_identifier("thread ID", &thread_id)?;
     let client = Client::builder()
@@ -2900,6 +3059,18 @@ pub async fn mark_as_unread(
     thread_id: String,
 ) -> Result<(), String> {
     crate::require_command_window(&window, &["main"])?;
+    if crate::db::get_account_provider(&app, &account_id)? == "imap" {
+        crate::mail_account::set_imap_message_flag(
+            &app,
+            &account_id,
+            &thread_id,
+            true,
+            imap_rs::client::Flag::Seen,
+            false,
+        )
+        .await?;
+        return crate::db::mark_thread_as_unread_local(&app, &thread_id, &account_id);
+    }
     let access_token = crate::db::load_account_access_token(&account_id)?;
     validate_gmail_identifier("thread ID", &thread_id)?;
     // Notify Gmail before changing the local cache.
@@ -3052,7 +3223,10 @@ async fn get_attachment_bytes(
     attachment_db_id: &str,
     access_token: &str,
 ) -> Result<(Vec<u8>, String, String), String> {
-    validate_gmail_identifier("message ID", email_id)?;
+    let is_imap = crate::db::get_account_provider(app, account_id)? == "imap";
+    if !is_imap {
+        validate_gmail_identifier("message ID", email_id)?;
+    }
     let atts = crate::db::get_email_attachments_for_account(
         app.clone(),
         email_id.to_string(),
@@ -3067,6 +3241,9 @@ async fn get_attachment_bytes(
     let b64 = if let Some(data) = att.data.filter(|d| !d.is_empty()) {
         data
     } else {
+        if is_imap {
+            return Err("mail_account_attachment_data_missing".to_string());
+        }
         let gmail_att_id = att
             .attachment_id
             .ok_or_else(|| "No attachment ID".to_string())?;
@@ -3166,7 +3343,11 @@ pub async fn save_and_reveal_attachment(
     attachment_db_id: String,
 ) -> Result<SavedAttachment, String> {
     crate::require_command_window(&window, &["main"])?;
-    let access_token = crate::db::load_account_access_token(&account_id)?;
+    let access_token = if crate::db::get_account_provider(&app, &account_id)? == "imap" {
+        String::new()
+    } else {
+        crate::db::load_account_access_token(&account_id)?
+    };
     let (bytes, filename, _mime) = get_attachment_bytes(
         &app,
         &email_id,
@@ -3300,12 +3481,17 @@ mod tests {
     fn draft_recipient_fields_accept_incomplete_addresses_but_reject_header_injection() {
         assert!(validate_draft_recipient_header("To", "unfinished-address").is_ok());
         assert!(validate_draft_recipient_header("To", "person@example.test").is_ok());
-        assert!(validate_draft_recipient_header("To", "person@example.test\r\nBcc: attacker@example.test").is_err());
+        assert!(validate_draft_recipient_header(
+            "To",
+            "person@example.test\r\nBcc: attacker@example.test"
+        )
+        .is_err());
     }
 
     #[test]
     fn message_parser_preserves_rfc_reply_headers() {
-        let detail: MessageDetail = serde_json::from_str(r#"{
+        let detail: MessageDetail = serde_json::from_str(
+            r#"{
           "id":"gmail-message", "threadId":"gmail-thread", "snippet":"hello",
           "internalDate":"123", "labelIds":["INBOX","Label_9"],
           "payload":{"headers":[
@@ -3316,7 +3502,9 @@ mod tests {
             {"name":"References","value":"<root@example.test>"},
             {"name":"Subject","value":"Hello"}
           ],"body":{}}
-        }"#).expect("message detail");
+        }"#,
+        )
+        .expect("message detail");
         let (email, _) = parse_message_detail(detail);
         assert_eq!(email.reply_to, "Help <help@example.test>");
         assert_eq!(email.message_id, "<child@example.test>");
@@ -3592,7 +3780,11 @@ pub async fn fetch_attachment_data(
     attachment_db_id: String,
 ) -> Result<String, String> {
     crate::require_command_window(&window, &["main"])?;
-    let access_token = crate::db::load_account_access_token(&account_id)?;
+    let access_token = if crate::db::get_account_provider(&app, &account_id)? == "imap" {
+        String::new()
+    } else {
+        crate::db::load_account_access_token(&account_id)?
+    };
     let (bytes, _filename, _mime) = get_attachment_bytes(
         &app,
         &email_id,

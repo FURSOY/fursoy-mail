@@ -10,9 +10,13 @@ import { extractVerificationCode, isAuthFailure, isInQuietHours, MAIL_PAGE_SIZE,
 interface SyncOptions {
   userInitiated?: boolean;
   suppressNotifications?: boolean;
+  eventDriven?: boolean;
+  accountId?: string;
+  accountIds?: string[];
 }
 
 interface UseMailSyncOptions {
+  accounts: Account[];
   accountsRef: MutableRefObject<Account[]>;
   accountTokensRef: MutableRefObject<Record<string, string>>;
   activeAccountIdRef: MutableRefObject<string | null>;
@@ -48,7 +52,7 @@ interface UseMailSyncOptions {
 
 export function useMailSync(options: UseMailSyncOptions) {
   const {
-    accountsRef, accountTokensRef, activeAccountIdRef,
+    accounts, accountsRef, accountTokensRef, activeAccountIdRef,
     expiredAccountsRef, tokenExpiredRef, appControlsRef, activeTabRef,
     syncIntervalRef, syncChainIdRef, backgroundSyncRef, recentNotificationsRef,
     knownEmailIdsRef, notificationReadyAccountIdsRef, notificationBaselineEpochRef,
@@ -67,6 +71,9 @@ export function useMailSync(options: UseMailSyncOptions) {
   const notificationDurationRef = useRef(notificationDuration);
   const notificationInfiniteRef = useRef(notificationInfinite);
   const backgroundSyncFlightRef = useRef<Promise<boolean> | null>(null);
+  const pendingSyncAccountIdsRef = useRef<Set<string>>(new Set());
+  const pendingFullSyncRef = useRef(false);
+  const pendingEventDrivenSyncRef = useRef(false);
   syncIntervalSecondsRef.current = syncIntervalSeconds;
   notificationDurationRef.current = notificationDuration;
   notificationInfiniteRef.current = notificationInfinite;
@@ -179,13 +186,17 @@ export function useMailSync(options: UseMailSyncOptions) {
 
   const startPeriodicSync = useCallback(() => {
     clearPeriodicSync();
+    const legacyAccountIds = accountsRef.current
+      .filter(account => account.provider === "google")
+      .map(account => account.id);
+    if (legacyAccountIds.length === 0) return;
     const chainId = syncChainIdRef.current;
     const scheduleNext = () => {
       if (syncChainIdRef.current !== chainId) return;
       syncIntervalRef.current = window.setTimeout(async () => {
         if (syncChainIdRef.current !== chainId) return;
         if (Object.keys(accountTokensRef.current).length > 0 && !tokenExpiredRef.current) {
-          await backgroundSyncRef.current();
+          await backgroundSyncRef.current({ accountIds: legacyAccountIds });
         }
         scheduleNext();
       }, syncIntervalDelayMs(syncIntervalSecondsRef.current));
@@ -198,13 +209,20 @@ export function useMailSync(options: UseMailSyncOptions) {
   }, [syncIntervalSeconds]);
 
   const runBackgroundSync = useCallback(async (syncOptions?: SyncOptions): Promise<boolean> => {
-    const currentAccounts = accountsRef.current;
+    const requestedAccountIds = syncOptions?.accountId
+      ? new Set([syncOptions.accountId])
+      : syncOptions?.accountIds
+        ? new Set(syncOptions.accountIds)
+        : null;
+    const currentAccounts = requestedAccountIds
+      ? accountsRef.current.filter(account => requestedAccountIds.has(account.id))
+      : accountsRef.current;
     const tokens = accountTokensRef.current;
     if (currentAccounts.length === 0) return false;
     const userInitiated = syncOptions?.userInitiated ?? false;
     const baselineEpoch = notificationBaselineEpochRef.current;
     if (appControlsRef.current.mailSyncPaused && !userInitiated) return false;
-    if (appControlsRef.current.notificationMode === "off" && !userInitiated) {
+    if (appControlsRef.current.notificationMode === "off" && !userInitiated && !syncOptions?.eventDriven) {
       const isVisible = await getCurrentWindow().isVisible().catch(() => true);
       if (!isVisible) return false;
     }
@@ -276,13 +294,33 @@ export function useMailSync(options: UseMailSyncOptions) {
 
   const backgroundSync = useCallback((syncOptions?: SyncOptions): Promise<boolean> => {
     const existing = backgroundSyncFlightRef.current;
-    if (existing) return existing;
+    if (existing) {
+      const requestedIds = syncOptions?.accountId
+        ? [syncOptions.accountId]
+        : syncOptions?.accountIds;
+      if (requestedIds) {
+        for (const accountId of requestedIds) pendingSyncAccountIdsRef.current.add(accountId);
+      } else {
+        pendingFullSyncRef.current = true;
+      }
+      pendingEventDrivenSyncRef.current ||= syncOptions?.eventDriven === true;
+      return existing;
+    }
 
     const flight = runBackgroundSync(syncOptions);
     backgroundSyncFlightRef.current = flight;
     const clearFlight = () => {
       if (backgroundSyncFlightRef.current === flight) {
         backgroundSyncFlightRef.current = null;
+        const runAll = pendingFullSyncRef.current;
+        const accountIds = [...pendingSyncAccountIdsRef.current];
+        const eventDriven = pendingEventDrivenSyncRef.current;
+        pendingFullSyncRef.current = false;
+        pendingEventDrivenSyncRef.current = false;
+        pendingSyncAccountIdsRef.current.clear();
+        if (runAll || accountIds.length > 0) {
+          void backgroundSync(runAll ? { eventDriven } : { accountIds, eventDriven });
+        }
       }
     };
     void flight.then(clearFlight, clearFlight);
@@ -290,6 +328,52 @@ export function useMailSync(options: UseMailSyncOptions) {
   }, [runBackgroundSync]);
 
   backgroundSyncRef.current = backgroundSync;
+
+  useEffect(() => {
+    let cancelled = false;
+    const timers = new Set<number>();
+    const wait = (milliseconds: number) => new Promise<void>(resolve => {
+      const timer = window.setTimeout(() => {
+        timers.delete(timer);
+        resolve();
+      }, milliseconds);
+      timers.add(timer);
+    });
+
+    const watchAccount = async (accountId: string) => {
+      while (!cancelled) {
+        try {
+          const outcome = await tauriApi.waitForImapChange(accountId);
+          if (cancelled) return;
+          if (outcome === "changed") {
+            await backgroundSyncRef.current({ accountId, eventDriven: true });
+          } else {
+            await wait(Math.max(syncIntervalDelayMs(syncIntervalSecondsRef.current), 60_000));
+            if (!cancelled) await backgroundSyncRef.current({ accountId, eventDriven: true });
+          }
+        } catch (error) {
+          if (cancelled) return;
+          if (isAuthFailure(error)) {
+            markAccountExpired(accountId, false);
+            return;
+          }
+          await wait(30_000);
+        }
+      }
+    };
+
+    for (const account of accounts) {
+      if (account.provider === "imap" && accountTokensRef.current[account.id]) {
+        void watchAccount(account.id);
+      }
+    }
+
+    return () => {
+      cancelled = true;
+      for (const timer of timers) window.clearTimeout(timer);
+      timers.clear();
+    };
+  }, [accounts, accountTokensRef, backgroundSyncRef, markAccountExpired]);
 
   return {
     isUserSyncing,

@@ -36,6 +36,7 @@ import { EmailReader } from "./components/EmailReader";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { ComposeModal } from "./components/ComposeModal";
 import { ConfirmModal } from "./components/ConfirmModal";
+import { AddMailAccountModal } from "./components/AddMailAccountModal";
 import { ToolbarTip } from "./components/ToolbarTip";
 import { WindowTitlebar } from "./components/WindowTitlebar";
 import { useUpdater } from "./hooks/useUpdater";
@@ -43,7 +44,7 @@ import { useAccounts } from "./hooks/useAccounts";
 import { useMailSync } from "./hooks/useMailSync";
 import { useMailActions } from "./hooks/useMailActions";
 import { useMailReader } from "./hooks/useMailReader";
-import { tauriApi, type MailboxDownloadStatus } from "./tauriApi";
+import { tauriApi, type DiscoveredMailProvider, type ImapAccountInput, type MailboxDownloadStatus } from "./tauriApi";
 import { enqueueMailMutation, runAuthenticatedMailAction, type MailMutationQueue } from "./mailActionState";
 
 function readTrustedImageSenders(): Record<string, string[]> {
@@ -177,11 +178,11 @@ function App() {
   const [mailThreadGroups, setMailThreadGroups] = useState<ThreadGroup[]>([]);
   const [gmailLabelsByAccount, setGmailLabelsByAccount] = useState<Record<string, GmailLabel[]>>({});
   const {
-    accounts, accountsLoaded, isConnecting, accountTokens, activeAccountId,
+    accounts, accountsLoaded, accountTokens, activeAccountId,
     tokenExpired, expiredAccountIds,
     accountsRef, accountTokensRef, activeAccountIdRef, expiredAccountsRef, tokenExpiredRef,
-    setIsConnecting, selectAccount, upsertToken, clearExpiredAccount, expireAccount, setSessionExpired,
-    initializeAccounts, connectAccount, disconnectAccount, reorderAndReloadAccounts, refreshAccessToken,
+    setIsConnecting, selectAccount, upsertToken, clearExpiredAccount, expireAccount, setSessionExpired, reloadAccounts,
+    initializeAccounts, addImapAccount, addOAuthMailAccount, disconnectAccount, reorderAndReloadAccounts, refreshAccessToken,
   } = useAccounts();
 
   const [searchQuery, setSearchQuery] = useState("");
@@ -208,6 +209,7 @@ function App() {
   const [isWindowMaximized, setIsWindowMaximized] = useState(false);
   const [toasts, setToasts] = useState<{ id: number; msg: string; type: "error" | "success" | "info" }[]>([]);
   const [verificationCopyState, setVerificationCopyState] = useState<"idle" | "copied">("idle");
+  const [mailAccountModalOpen, setMailAccountModalOpen] = useState(false);
 
   // Refs
   const searchInputRef = useRef<HTMLInputElement>(null);
@@ -689,6 +691,7 @@ function App() {
     clearPeriodicSync,
     startPeriodicSync,
   } = useMailSync({
+    accounts,
     accountsRef,
     accountTokensRef,
     activeAccountIdRef,
@@ -755,6 +758,10 @@ function App() {
               // Refresh tokens for all accounts — even those with no cached access token,
               // since refresh_access_token reads the refresh token directly from keyring.
               for (const acc of loadedAccounts) {
+                if (acc.provider !== "google") {
+                  clearExpiredAccount(acc.id);
+                  continue;
+                }
                 try {
                   const refreshed = await refreshAccessToken(acc.id);
                   if (cancelled) return;
@@ -870,6 +877,17 @@ function App() {
 
   useEffect(() => {
     if (!accountsLoaded) return;
+    const activeAccount = activeAccountId
+      ? accounts.find(account => account.id === activeAccountId)
+      : null;
+    const usesOnlyImap = activeAccount?.provider === "imap" ||
+      (activeAccountId === null && accounts.length > 0 && accounts.every(account => account.provider === "imap"));
+    if (usesOnlyImap) {
+      setIsMailboxBackfilling(false);
+      setMailboxDownloadPending(false);
+      setMailboxDownloadState("completed");
+      return;
+    }
     let cancelled = false;
     const label = activeTab;
     const accountId = activeAccountId;
@@ -900,7 +918,7 @@ function App() {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [accountsLoaded, activeAccountId, activeTab, searchQuery, advancedSearch]);
+  }, [accounts, accountsLoaded, activeAccountId, activeTab, searchQuery, advancedSearch]);
 
   useEffect(() => {
     const unlistenPromise = listen("mail-search-index-ready", () => {
@@ -1008,41 +1026,50 @@ function App() {
     startTabTransition(() => setActiveTab(tab));
   };
 
-  async function loginWithGoogle() {
+  function startInitialImapSync(accountId: string) {
+    setAuthStatus(tr.auth.loggedInSyncing);
+    const previewTimer = window.setInterval(() => {
+      tabEmailCacheRef.current = {};
+      void loadEmails("inbox");
+    }, 1500);
+    void tauriApi.syncImapEmails(accountId).then(async () => {
+      await reloadAccounts();
+      tabEmailCacheRef.current = {};
+      await loadEmails("inbox");
+      await refreshUnreadCount();
+      setAuthStatus(tr.auth.syncComplete);
+      startPeriodicSync();
+    }).catch(error => {
+      console.error("Initial IMAP sync failed:", error);
+      setAuthStatus(tr.auth.syncFailedAfterLogin);
+      const errorKey = String(error).replace(/^Error:\s*/i, "");
+      const translated = (tr.mailAccount.errors as Record<string, string>)[errorKey];
+      showToast(translated ? `${tr.auth.syncFailedAfterLogin} ${translated}` : tr.auth.syncFailedAfterLogin, "error");
+    }).finally(() => {
+      window.clearInterval(previewTimer);
+    });
+  }
+
+  async function handleAddImapAccount(input: ImapAccountInput) {
     setIsConnecting(true);
     try {
-      setAuthStatus(tr.auth.waitingForBrowser);
-      await connectAccount();
-
-      setAuthStatus(tr.auth.loggedInSyncing);
-      const stillExpired = expiredAccountsRef.current.size > 0;
-      setSessionExpired(stillExpired);
-      // The first download for a newly added account is a baseline, not new-mail activity.
-      const ok = await backgroundSyncRef.current({ userInitiated: true, suppressNotifications: true });
-      if (ok) {
-        setAuthStatus(tr.auth.syncComplete);
-        showToast(tr.auth.loginSuccess, "success");
-      } else {
-        setAuthStatus(tr.auth.syncFailedAfterLogin);
-      }
-      startPeriodicSync();
-    } catch (e) {
-      if (String(e).includes("oauth_cancelled")) {
-        setAuthStatus("");
-        return;
-      }
-      setAuthStatus(`${tr.auth.loginFailed}: ${e}`);
-      setIsUserSyncing(false);
-      showToast(`${tr.auth.loginFailed}: ${e}`, "error");
+      const { account } = await addImapAccount(input);
+      showToast(tr.mailAccount.added, "success");
+      startInitialImapSync(account.id);
     } finally {
       setIsConnecting(false);
     }
   }
 
-  async function cancelGoogleLogin() {
-    await tauriApi.cancelGoogleOAuth().catch(() => undefined);
-    setAuthStatus("");
-    setIsConnecting(false);
+  async function handleAddOAuthAccount(email: string, provider: DiscoveredMailProvider) {
+    setIsConnecting(true);
+    try {
+      const { auth } = await addOAuthMailAccount(email, provider);
+      showToast(tr.mailAccount.added, "success");
+      startInitialImapSync(auth.email);
+    } finally {
+      setIsConnecting(false);
+    }
   }
 
   async function handleLogoutAccount(accountId: string) {
@@ -1663,13 +1690,21 @@ function App() {
   if (accountsLoaded && accounts.length === 0) {
     return (
       <LocaleContext.Provider value={tr}>
-        <Onboarding
-          onConnect={loginWithGoogle}
-          onCancelConnect={cancelGoogleLogin}
-          isConnecting={isConnecting}
-          isWindowMaximized={isWindowMaximized}
-          onWindowMaximizedChange={setIsWindowMaximized}
-        />
+        <>
+          <Onboarding
+            onConnect={() => setMailAccountModalOpen(true)}
+            onCancelConnect={() => setMailAccountModalOpen(false)}
+            isConnecting={false}
+            isWindowMaximized={isWindowMaximized}
+            onWindowMaximizedChange={setIsWindowMaximized}
+          />
+          <AddMailAccountModal
+            open={mailAccountModalOpen}
+            onClose={() => setMailAccountModalOpen(false)}
+            onAdd={handleAddImapAccount}
+            onOAuth={handleAddOAuthAccount}
+          />
+        </>
       </LocaleContext.Provider>
     );
   }
@@ -1696,12 +1731,12 @@ function App() {
           authStatus={authStatus}
           isUserSyncing={isUserSyncing}
           unreadCount={unreadCount}
-          onLogin={loginWithGoogle}
+          onLogin={() => setMailAccountModalOpen(true)}
           usesOverlaySidebar={usesOverlaySidebar}
           accounts={accounts}
           activeAccountId={activeAccountId}
           onSwitchAccount={handleSwitchAccount}
-          onAddAccount={loginWithGoogle}
+          onAddAccount={() => setMailAccountModalOpen(true)}
           onLogoutAccount={handleLogoutAccount}
           expiredAccountIds={expiredAccountIds}
           gmailLabels={sidebarGmailLabels}
@@ -1793,7 +1828,7 @@ function App() {
           onCheckForUpdates={checkForUpdates}
           onInstallUpdate={installUpdate}
           accounts={accounts}
-          onAddAccount={loginWithGoogle}
+          onAddAccount={() => setMailAccountModalOpen(true)}
           onLogoutAccount={handleLogoutAccount}
           onReorderAccounts={handleReorderAccounts}
         />
@@ -1933,7 +1968,7 @@ function App() {
               : tr.messages.reloginRequired}
           </div>
           <button
-            onClick={loginWithGoogle}
+            onClick={() => setMailAccountModalOpen(true)}
             className="px-3 py-1 bg-white text-red-600 text-xs font-semibold rounded hover:bg-red-50 transition-colors"
           >
             {tr.messages.signIn}
@@ -1942,6 +1977,12 @@ function App() {
       )}
 
       <ConfirmModal modal={confirmModal} onClose={() => setConfirmModal(null)} />
+      <AddMailAccountModal
+        open={mailAccountModalOpen}
+        onClose={() => setMailAccountModalOpen(false)}
+        onAdd={handleAddImapAccount}
+        onOAuth={handleAddOAuthAccount}
+      />
 
       {/* Toast notifications */}
       <div className="fixed bottom-4 right-4 z-[100] flex flex-col gap-2 pointer-events-none max-w-sm">

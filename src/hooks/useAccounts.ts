@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { Account } from "../types";
-import { tauriApi } from "../tauriApi";
+import { tauriApi, type DiscoveredMailProvider, type ImapAccountInput } from "../tauriApi";
 
 export function useAccounts() {
   const [accounts, setAccounts] = useState<Account[]>([]);
@@ -91,7 +91,7 @@ export function useAccounts() {
         const auth = await tauriApi.getAccountAuth(account.id);
         const stillValid = auth?.expires_at == null
           || auth.expires_at > Math.floor(Date.now() / 1000) + 30;
-        if (auth?.authenticated && stillValid) tokens[account.id] = "active";
+        if (auth?.authenticated && (account.provider === "imap" || stillValid)) tokens[account.id] = "active";
       } catch {
         console.error("Failed to load account authentication state.");
       }
@@ -120,6 +120,24 @@ export function useAccounts() {
     return updated;
   }, [clearExpiredAccount, loadAccounts, removeToken, selectAccount]);
 
+  const addImapAccount = useCallback(async (input: ImapAccountInput) => {
+    const account = await tauriApi.addMailAccount(input);
+    const updated = await loadAccounts();
+    upsertToken(account.id, "active");
+    clearExpiredAccount(account.id);
+    if (updated.length === 1) selectAccount(account.id);
+    return { account, accounts: updated };
+  }, [clearExpiredAccount, loadAccounts, selectAccount, upsertToken]);
+
+  const addOAuthMailAccount = useCallback(async (email: string, provider: DiscoveredMailProvider) => {
+    const auth = await tauriApi.startMailOAuth(email, provider);
+    const updated = await loadAccounts();
+    upsertToken(auth.email, "active");
+    clearExpiredAccount(auth.email);
+    if (updated.length === 1) selectAccount(auth.email);
+    return { auth, accounts: updated };
+  }, [clearExpiredAccount, loadAccounts, selectAccount, upsertToken]);
+
   const reorderAndReloadAccounts = useCallback(async (orderedIds: string[]) => {
     await tauriApi.reorderAccounts(orderedIds);
     return loadAccounts();
@@ -139,6 +157,7 @@ export function useAccounts() {
     expiredAccountsRef,
     tokenExpiredRef,
     setAccountsLoaded,
+    reloadAccounts: loadAccounts,
     setIsConnecting,
     replaceAccounts,
     selectAccount,
@@ -151,6 +170,8 @@ export function useAccounts() {
     loadAccounts,
     initializeAccounts,
     connectAccount,
+    addImapAccount,
+    addOAuthMailAccount,
     disconnectAccount,
     reorderAndReloadAccounts,
     refreshAccessToken: tauriApi.refreshAccessToken,

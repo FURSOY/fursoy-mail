@@ -6,6 +6,8 @@ import { themePresets, typography, ui, type ThemePresetName } from "../theme";
 import { tauriApi } from "../tauriApi";
 import type { Account, AppControls, DensityMode, NotificationMode, OtpMode, RemoteImageMode, RenderMode } from "../types";
 import { MIN_SYNC_INTERVAL_SECONDS, normalizeSyncIntervalSeconds } from "../syncInterval";
+import { ToolbarTip } from "./ToolbarTip";
+import { ProfileAvatar } from "./ProfileAvatar";
 
 const PRIVACY_POLICY_URL = "https://fursoy.com/privacy/";
 
@@ -152,15 +154,15 @@ export function SettingsPanel({
       <div className="max-w-2xl mx-auto">
         <h2 className={`${typography.pageTitle} mb-6 flex items-center gap-2`}>
           {usesOverlaySidebar && (
-            <button
-              type="button"
-              onClick={onMenuOpen}
-              className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-zinc-500 hover:bg-white/10 hover:text-zinc-200"
-              aria-label={tr.settings.openMenu}
-              title={tr.settings.openMenu}
-            >
-              <Menu className="h-4 w-4" />
-            </button>
+            <ToolbarTip label={tr.settings.openMenu}>
+              <button
+                type="button"
+                onClick={onMenuOpen}
+                className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-zinc-500 hover:bg-white/10 hover:text-zinc-200"
+              >
+                <Menu className="h-4 w-4" />
+              </button>
+            </ToolbarTip>
           )}
           {tr.nav.settings}
         </h2>
@@ -191,13 +193,7 @@ export function SettingsPanel({
                   >
                     <GripVertical className="w-4 h-4" />
                   </button>
-                  {acc.picture ? (
-                    <img src={acc.picture} alt={acc.email} className="w-8 h-8 rounded-full object-cover shrink-0" />
-                  ) : (
-                    <div className="w-8 h-8 rounded-full bg-zinc-700 flex items-center justify-center text-sm font-bold text-zinc-300 shrink-0">
-                      {acc.email[0]?.toUpperCase() ?? "?"}
-                    </div>
-                  )}
+                  <ProfileAvatar picture={acc.picture} email={acc.email} alt={acc.email} className="w-8 h-8 rounded-full object-cover shrink-0 text-sm" />
                   <div className="flex-1 min-w-0">
                     <div className="text-sm font-medium text-zinc-200 truncate">{acc.email.split("@")[0]}</div>
                     <div className="text-xs text-zinc-500 truncate">{acc.email}</div>

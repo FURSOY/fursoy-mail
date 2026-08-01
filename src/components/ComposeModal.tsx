@@ -5,6 +5,8 @@ import { ui } from "../theme";
 import type { Account, AttachmentPayload, DraftSummary } from "../types";
 import { tauriApi, type ContactSuggestion } from "../tauriApi";
 import { normalizeComposerLinkUrl, sanitizeComposerHtml } from "../utils";
+import { ToolbarTip } from "./ToolbarTip";
+import { ProfileAvatar } from "./ProfileAvatar";
 
 // Gmail blocks these extensions (and so do we)
 const BLOCKED_EXTENSIONS = new Set([
@@ -124,6 +126,7 @@ export function ComposeModal({
   const draftCreateOutcomeUnknownRef = useRef<string | null>(null);
 
   const activeAccount = accounts.find(a => a.id === composeAccountId) ?? accounts[0];
+  const supportsRemoteDrafts = activeAccount?.provider === "google" || activeAccount?.provider === "imap";
 
   const beginDraftAction = () => {
     if (draftActionPendingRef.current) return false;
@@ -166,6 +169,7 @@ export function ComposeModal({
   }, [bodyText, composeBcc, composeCc, composeSubject, composeTo]);
 
   const persistDraft = useCallback((body: string, items: AttachmentItem[]) => {
+    if (!supportsRemoteDrafts) return draftSaveQueueRef.current;
     const existingDraftId = draftIdRef.current;
     if (!activeAccount?.id || pendingAttachmentReads > 0 || (!hasDraftContent(body, items) && !existingDraftId)) {
       return draftSaveQueueRef.current;
@@ -210,11 +214,11 @@ export function ComposeModal({
         throw error;
       });
     return draftSaveQueueRef.current;
-  }, [activeAccount?.id, composeBcc, composeCc, composeSubject, composeTo, hasDraftContent, pendingAttachmentReads, updateDraftSummary]);
+  }, [activeAccount?.id, composeBcc, composeCc, composeSubject, composeTo, hasDraftContent, pendingAttachmentReads, supportsRemoteDrafts, updateDraftSummary]);
 
   const loadDrafts = useCallback(async (reset: boolean) => {
     const accountId = activeAccount?.id;
-    if (!accountId || draftListLoadingRef.current) return;
+    if (!supportsRemoteDrafts || !accountId || draftListLoadingRef.current) return;
     const pageToken = reset ? null : nextDraftPageTokenRef.current;
     if (!reset && !pageToken) return;
     draftListLoadingRef.current = true;
@@ -239,7 +243,7 @@ export function ComposeModal({
         setDraftsLoading(false);
       }
     }
-  }, [activeAccount?.id]);
+  }, [activeAccount?.id, supportsRemoteDrafts]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -298,7 +302,7 @@ export function ComposeModal({
   }, [activeAccount?.id, loadDrafts]);
 
   useEffect(() => {
-    if ((!hasDraftContent() && !draftIdRef.current) || pendingAttachmentReads > 0 || draftActionPending || isSending) return;
+    if (!supportsRemoteDrafts || (!hasDraftContent() && !draftIdRef.current) || pendingAttachmentReads > 0 || draftActionPending || isSending) return;
     if (draftSaveTimerRef.current) clearTimeout(draftSaveTimerRef.current);
     draftSaveTimerRef.current = setTimeout(() => {
       const html = bodyEditableRef.current?.innerHTML ?? composeBody;
@@ -307,7 +311,7 @@ export function ComposeModal({
     return () => {
       if (draftSaveTimerRef.current) clearTimeout(draftSaveTimerRef.current);
     };
-  }, [attachments, composeBcc, composeBody, composeCc, composeSubject, composeTo, draftActionPending, hasDraftContent, isSending, pendingAttachmentReads, persistDraft]);
+  }, [attachments, composeBcc, composeBody, composeCc, composeSubject, composeTo, draftActionPending, hasDraftContent, isSending, pendingAttachmentReads, persistDraft, supportsRemoteDrafts]);
 
   const searchContacts = useCallback((q: string) => {
     if (debounceRef.current) clearTimeout(debounceRef.current);
@@ -542,6 +546,11 @@ export function ComposeModal({
   };
 
   const handleClose = async () => {
+    if (!supportsRemoteDrafts) {
+      if (hasDraftContent()) setConfirmDiscard(true);
+      else onClose(false);
+      return;
+    }
     if (pendingAttachmentReads > 0 || !beginDraftAction()) return;
     if (draftSaveTimerRef.current) clearTimeout(draftSaveTimerRef.current);
     try {
@@ -600,7 +609,7 @@ export function ComposeModal({
     if (draftSaveTimerRef.current) clearTimeout(draftSaveTimerRef.current);
     try {
       const body = bodyEditableRef.current?.innerHTML ?? composeBody;
-      await persistDraft(body, attachments);
+      if (supportsRemoteDrafts) await persistDraft(body, attachments);
       await onSend(
         composeCc,
         composeBcc,
@@ -766,9 +775,11 @@ export function ComposeModal({
               </span>
             )}
           </div>
-          <button type="button" onClick={() => void handleClose()} disabled={draftActionPending || pendingAttachmentReads > 0} title={tr.compose.saveAndClose} aria-label={tr.compose.saveAndClose} className={ui.iconButton}>
-            {draftActionPending ? <RefreshCw className="w-4 h-4 animate-spin" /> : <X className="w-4 h-4" />}
-          </button>
+          <ToolbarTip label={supportsRemoteDrafts ? tr.compose.saveAndClose : tr.common.close}>
+            <button type="button" aria-label={supportsRemoteDrafts ? tr.compose.saveAndClose : tr.common.close} onClick={() => void handleClose()} disabled={draftActionPending || pendingAttachmentReads > 0} className={ui.iconButton}>
+              {draftActionPending ? <RefreshCw className="w-4 h-4 animate-spin" /> : <X className="w-4 h-4" />}
+            </button>
+          </ToolbarTip>
         </div>
 
         <div className="p-4 flex flex-col gap-3 flex-1 overflow-hidden min-h-0">
@@ -781,14 +792,13 @@ export function ComposeModal({
                 className="w-full flex items-center gap-2 px-3 py-2 rounded-lg bg-white/[0.03] border border-white/5 hover:border-white/10 transition-colors text-left"
               >
                 <span className="text-[10px] text-zinc-600 shrink-0 w-10">{tr.compose.from}</span>
-                {activeAccount?.picture ? (
-                  <img src={activeAccount.picture} className="w-5 h-5 rounded-full shrink-0" alt="" />
-                ) : (
-                  <div className="w-5 h-5 rounded-full flex items-center justify-center text-[9px] font-bold text-white shrink-0"
-                    style={{ background: emailColor(activeAccount?.email ?? "") }}>
-                    {activeAccount?.email[0]?.toUpperCase()}
-                  </div>
-                )}
+                <ProfileAvatar
+                  picture={activeAccount?.picture}
+                  email={activeAccount?.email ?? ""}
+                  className="w-5 h-5 rounded-full object-cover shrink-0 text-[9px]"
+                  fallbackClassName="text-white"
+                  fallbackStyle={{ background: emailColor(activeAccount?.email ?? "") }}
+                />
                 <span className="flex-1 min-w-0 text-xs text-zinc-300 truncate">{activeAccount?.email}</span>
                 <ChevronDown className={`w-3.5 h-3.5 text-zinc-500 shrink-0 transition-transform ${fromOpen ? "rotate-180" : ""}`} />
               </button>
@@ -799,14 +809,13 @@ export function ComposeModal({
                       onClick={() => void changeComposeAccount(acc.id)}
                       className={`w-full flex items-center gap-2.5 px-3 py-2.5 hover:bg-white/5 transition-colors text-left ${acc.id === composeAccountId ? "bg-white/[0.04]" : ""}`}
                     >
-                      {acc.picture ? (
-                        <img src={acc.picture} className="w-7 h-7 rounded-full shrink-0" alt="" />
-                      ) : (
-                        <div className="w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold text-white shrink-0"
-                          style={{ background: emailColor(acc.email) }}>
-                          {acc.email[0]?.toUpperCase()}
-                        </div>
-                      )}
+                      <ProfileAvatar
+                        picture={acc.picture}
+                        email={acc.email}
+                        className="w-7 h-7 rounded-full object-cover shrink-0 text-xs"
+                        fallbackClassName="text-white"
+                        fallbackStyle={{ background: emailColor(acc.email) }}
+                      />
                       <div className="min-w-0 flex-1">
                         <div className="text-xs text-zinc-200 truncate">{acc.email.split("@")[0]}</div>
                         <div className="text-[10px] text-zinc-500 truncate">{acc.email}</div>
@@ -997,14 +1006,18 @@ export function ComposeModal({
                     </div>
                   </div>
                 )}
-                <button type="button" title={tr.compose.undo} aria-label={tr.compose.undo} disabled={!canUndo} onMouseDown={e => { e.preventDefault(); applyFormat("undo"); }}
-                  className={`w-7 h-7 flex items-center justify-center rounded transition-colors ${canUndo ? "text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.06] cursor-pointer" : "text-zinc-700 cursor-default"}`}>
-                  <Undo2 className="w-3.5 h-3.5" />
-                </button>
-                <button type="button" title={tr.compose.redo} aria-label={tr.compose.redo} disabled={!canRedo} onMouseDown={e => { e.preventDefault(); applyFormat("redo"); }}
-                  className={`w-7 h-7 flex items-center justify-center rounded transition-colors ${canRedo ? "text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.06] cursor-pointer" : "text-zinc-700 cursor-default"}`}>
-                  <Redo2 className="w-3.5 h-3.5" />
-                </button>
+                <ToolbarTip label={tr.compose.undo}>
+                  <button type="button" disabled={!canUndo} onMouseDown={e => { e.preventDefault(); applyFormat("undo"); }}
+                    className={`w-7 h-7 flex items-center justify-center rounded transition-colors ${canUndo ? "text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.06] cursor-pointer" : "text-zinc-700 cursor-default"}`}>
+                    <Undo2 className="w-3.5 h-3.5" />
+                  </button>
+                </ToolbarTip>
+                <ToolbarTip label={tr.compose.redo}>
+                  <button type="button" disabled={!canRedo} onMouseDown={e => { e.preventDefault(); applyFormat("redo"); }}
+                    className={`w-7 h-7 flex items-center justify-center rounded transition-colors ${canRedo ? "text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.06] cursor-pointer" : "text-zinc-700 cursor-default"}`}>
+                    <Redo2 className="w-3.5 h-3.5" />
+                  </button>
+                </ToolbarTip>
                 <div className="w-px h-4 bg-white/10 mx-1 shrink-0" />
                 {([
                   { cmd: "bold",          label: "B", cls: "font-bold",    title: tr.compose.bold },
@@ -1012,45 +1025,52 @@ export function ComposeModal({
                   { cmd: "underline",     label: "U", cls: "underline",    title: tr.compose.underline },
                   { cmd: "strikeThrough", label: "S", cls: "line-through", title: tr.compose.strikethrough },
                 ] as { cmd: string; label: string; cls: string; title: string }[]).map(({ cmd, label, cls, title }) => (
-                  <button key={cmd} type="button" title={title} aria-label={title}
-                    onMouseDown={e => { e.preventDefault(); applyFormat(cmd); }}
-                    className="w-7 h-7 flex items-center justify-center rounded text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.06] text-xs transition-colors">
-                    <span className={cls}>{label}</span>
-                  </button>
+                  <ToolbarTip key={cmd} label={title}>
+                    <button type="button" onMouseDown={e => { e.preventDefault(); applyFormat(cmd); }}
+                      className="w-7 h-7 flex items-center justify-center rounded text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.06] text-xs transition-colors">
+                      <span className={cls}>{label}</span>
+                    </button>
+                  </ToolbarTip>
                 ))}
                 <div className="w-px h-4 bg-white/10 mx-1 shrink-0" />
-                <button type="button" title={tr.compose.insertLink} aria-label={tr.compose.insertLink}
-                  onMouseDown={e => { e.preventDefault(); saveSelection(); setLinkUrl(""); setLinkPopover(v => !v); }}
-                  className={`w-7 h-7 flex items-center justify-center rounded transition-colors ${linkPopover ? "text-blue-400 bg-blue-500/10" : "text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.06]"}`}>
-                  <Link2 className="w-3.5 h-3.5" />
-                </button>
+                <ToolbarTip label={tr.compose.insertLink}>
+                  <button type="button" onMouseDown={e => { e.preventDefault(); saveSelection(); setLinkUrl(""); setLinkPopover(v => !v); }}
+                    className={`w-7 h-7 flex items-center justify-center rounded transition-colors ${linkPopover ? "text-blue-400 bg-blue-500/10" : "text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.06]"}`}>
+                    <Link2 className="w-3.5 h-3.5" />
+                  </button>
+                </ToolbarTip>
                 <div className="w-px h-4 bg-white/10 mx-1 shrink-0" />
-                <button type="button" title={tr.compose.numberedList} aria-label={tr.compose.numberedList}
-                  onMouseDown={e => { e.preventDefault(); applyFormat("insertOrderedList"); }}
-                  className="w-7 h-7 flex items-center justify-center rounded text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.06] transition-colors">
-                  <ListOrdered className="w-3.5 h-3.5" />
-                </button>
-                <button type="button" title={tr.compose.bulletList} aria-label={tr.compose.bulletList}
-                  onMouseDown={e => { e.preventDefault(); applyFormat("insertUnorderedList"); }}
-                  className="w-7 h-7 flex items-center justify-center rounded text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.06] transition-colors">
-                  <List className="w-3.5 h-3.5" />
-                </button>
+                <ToolbarTip label={tr.compose.numberedList}>
+                  <button type="button" onMouseDown={e => { e.preventDefault(); applyFormat("insertOrderedList"); }}
+                    className="w-7 h-7 flex items-center justify-center rounded text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.06] transition-colors">
+                    <ListOrdered className="w-3.5 h-3.5" />
+                  </button>
+                </ToolbarTip>
+                <ToolbarTip label={tr.compose.bulletList}>
+                  <button type="button" onMouseDown={e => { e.preventDefault(); applyFormat("insertUnorderedList"); }}
+                    className="w-7 h-7 flex items-center justify-center rounded text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.06] transition-colors">
+                    <List className="w-3.5 h-3.5" />
+                  </button>
+                </ToolbarTip>
               </div>
             )}
 
             {/* Bottom bar — paperclip + format toggle */}
             <div className="px-2 py-1.5 border-t border-white/[0.06] flex items-center gap-1 shrink-0">
-              <button type="button" title={tr.compose.attachFile} aria-label={tr.compose.attachFile} onClick={() => fileInputRef.current?.click()}
-                className="w-7 h-7 flex items-center justify-center rounded-lg text-zinc-500 hover:text-zinc-300 hover:bg-white/[0.04] transition-colors">
-                <Paperclip className="w-3.5 h-3.5" />
-              </button>
+              <ToolbarTip label={tr.compose.attachFile}>
+                <button type="button" onClick={() => fileInputRef.current?.click()}
+                  className="w-7 h-7 flex items-center justify-center rounded-lg text-zinc-500 hover:text-zinc-300 hover:bg-white/[0.04] transition-colors">
+                  <Paperclip className="w-3.5 h-3.5" />
+                </button>
+              </ToolbarTip>
               <input ref={fileInputRef} type="file" multiple className="hidden" onChange={handleFileSelect} />
-              <button type="button" title={tr.compose.formatting} aria-label={tr.compose.formatting}
-                onClick={() => { setShowFormatBar(v => !v); setLinkPopover(false); }}
-                className={`flex items-center gap-1 px-2 py-1.5 rounded-lg text-xs transition-colors ${showFormatBar ? "text-blue-400 bg-blue-500/10" : "text-zinc-500 hover:text-zinc-300 hover:bg-white/[0.04]"}`}>
-                <Type className="w-3.5 h-3.5" />
-                <ChevronDown className={`w-3 h-3 transition-transform duration-150 ${showFormatBar ? "rotate-180" : ""}`} />
-              </button>
+              <ToolbarTip label={tr.compose.formatting}>
+                <button type="button" onClick={() => { setShowFormatBar(v => !v); setLinkPopover(false); }}
+                  className={`flex items-center gap-1 px-2 py-1.5 rounded-lg text-xs transition-colors ${showFormatBar ? "text-blue-400 bg-blue-500/10" : "text-zinc-500 hover:text-zinc-300 hover:bg-white/[0.04]"}`}>
+                  <Type className="w-3.5 h-3.5" />
+                  <ChevronDown className={`w-3 h-3 transition-transform duration-150 ${showFormatBar ? "rotate-180" : ""}`} />
+                </button>
+              </ToolbarTip>
             </div>
           </div>
         </div>
@@ -1065,7 +1085,7 @@ export function ComposeModal({
           )}
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
-              <button type="button" onClick={() => setConfirmDiscard(true)} disabled={draftActionPending || isSending} title={tr.compose.deleteDraft} className="flex items-center gap-1.5 text-[length:var(--font-size-compact)] text-[var(--color-text-subtle)] hover:text-[var(--color-status-danger)] transition-colors disabled:opacity-50">
+              <button type="button" onClick={() => setConfirmDiscard(true)} disabled={draftActionPending || isSending} className="flex items-center gap-1.5 text-[length:var(--font-size-compact)] text-[var(--color-text-subtle)] hover:text-[var(--color-status-danger)] transition-colors disabled:opacity-50">
                 <Trash2 className="w-3.5 h-3.5" />
                 {tr.compose.deleteDraft}
               </button>
@@ -1088,7 +1108,7 @@ export function ComposeModal({
         </div>
         </div>
 
-          <aside className="hidden md:flex w-72 shrink-0 flex-col border-l border-[var(--color-border-default)] bg-[var(--color-surface-app)]">
+          {supportsRemoteDrafts && <aside className="hidden md:flex w-72 shrink-0 flex-col border-l border-[var(--color-border-default)] bg-[var(--color-surface-app)]">
             <div className="px-4 py-3 border-b border-[var(--color-border-subtle)] flex items-center justify-between gap-2">
               <div>
                 <div className="text-[length:var(--font-size-compact)] font-semibold text-[var(--color-text-secondary)]">{tr.compose.recentDrafts}</div>
@@ -1147,7 +1167,7 @@ export function ComposeModal({
                 </div>
               )}
             </div>
-          </aside>
+          </aside>}
       </div>
 
       {confirmDiscard && (

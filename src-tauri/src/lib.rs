@@ -2,6 +2,8 @@ mod auth;
 mod db;
 mod gmail;
 mod img_proxy;
+mod mail_account;
+mod mail_oauth;
 mod notify;
 mod safe_fs;
 mod settings;
@@ -41,11 +43,13 @@ impl SyncWorkers {
     pub fn claim_or_request_resync(&mut self, account_id: &str, account_generation: i64) -> bool {
         match self.active.get(account_id) {
             Some(active_generation) if *active_generation == account_generation => {
-                self.resync_requested.insert(account_id.to_string(), account_generation);
+                self.resync_requested
+                    .insert(account_id.to_string(), account_generation);
                 false
             }
             _ => {
-                self.active.insert(account_id.to_string(), account_generation);
+                self.active
+                    .insert(account_id.to_string(), account_generation);
                 true
             }
         }
@@ -76,7 +80,8 @@ impl SyncWorkers {
         if self.active.get(account_id) != Some(&account_generation) {
             return false;
         }
-        self.backfilling.insert(account_id.to_string(), account_generation);
+        self.backfilling
+            .insert(account_id.to_string(), account_generation);
         true
     }
 
@@ -236,6 +241,7 @@ pub fn run() {
         .manage(TokenRefreshFlights::default())
         .manage(img_proxy::ImageProxyState::default())
         .manage(auth::OAuthFlowState::default())
+        .manage(mail_oauth::MailOAuthFlowState::default())
         .manage(notify::PendingNotification::default())
         .manage(settings::AppControlsState::default())
         .manage(db::SearchCoordinator::default())
@@ -253,7 +259,9 @@ pub fn run() {
                     }
                     match window.hide() {
                         Ok(()) => api.prevent_close(),
-                        Err(error) => eprintln!("[WINDOW] main window could not be hidden: {error}"),
+                        Err(error) => {
+                            eprintln!("[WINDOW] main window could not be hidden: {error}")
+                        }
                     }
                 }
             }
@@ -346,8 +354,7 @@ pub fn run() {
                             eprintln!("[TRAY] notification setting could not be saved: {error}");
                             return;
                         }
-                        if let Err(error) =
-                            mute_item.set_checked(controls.notifications_disabled())
+                        if let Err(error) = mute_item.set_checked(controls.notifications_disabled())
                         {
                             if settings::write_app_controls(app, &previous).is_err() {
                                 eprintln!("[TRAY] notification menu update and rollback failed");
@@ -391,8 +398,7 @@ pub fn run() {
                         }
                         if let Err(error) = app.emit("app-controls-changed", controls) {
                             let rollback = settings::write_app_controls(app, &previous);
-                            let menu_rollback =
-                                pause_item.set_checked(previous.mail_sync_paused);
+                            let menu_rollback = pause_item.set_checked(previous.mail_sync_paused);
                             if rollback.is_err() || menu_rollback.is_err() {
                                 eprintln!("[TRAY] sync setting event and rollback failed");
                             } else {
@@ -431,6 +437,13 @@ pub fn run() {
             auth::start_google_oauth,
             auth::cancel_google_oauth,
             auth::refresh_access_token,
+            mail_oauth::discover_mail_provider,
+            mail_oauth::start_mail_oauth,
+            mail_oauth::cancel_mail_oauth,
+            mail_account::test_mail_account,
+            mail_account::add_mail_account,
+            mail_account::sync_imap_emails,
+            mail_account::wait_for_imap_change,
             db::get_accounts,
             db::get_account_auth,
             auth::remove_account,
@@ -529,7 +542,9 @@ mod tests {
         let flights = TokenRefreshFlights::default();
 
         assert!(flights.join_or_start("account-a").is_none());
-        let waiting_a = flights.join_or_start("account-a").expect("join account-a refresh");
+        let waiting_a = flights
+            .join_or_start("account-a")
+            .expect("join account-a refresh");
         assert!(flights.join_or_start("account-b").is_none());
 
         flights.finish("account-a", Err("refresh failed".to_string()));
@@ -542,7 +557,9 @@ mod tests {
         );
 
         // Completing account-a does not affect account-b's independent flight.
-        let waiting_b = flights.join_or_start("account-b").expect("join account-b refresh");
+        let waiting_b = flights
+            .join_or_start("account-b")
+            .expect("join account-b refresh");
         flights.finish("account-b", Err("other account failed".to_string()));
         assert_eq!(
             waiting_b

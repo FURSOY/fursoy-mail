@@ -52,10 +52,15 @@ function emailKey(email: EmailSummary) {
   return `${email.account_id}\u0000${email.id}`;
 }
 
-function actionFailureMessage(summary: string, error: unknown) {
+function localizedBackendError(locale: AppLocale, error: unknown) {
   const detail = (error instanceof Error ? error.message : String(error))
     .replace(/^Error:\s*/i, "")
     .trim();
+  return locale.mailAccount.errors[detail as keyof typeof locale.mailAccount.errors] ?? detail;
+}
+
+function actionFailureMessage(locale: AppLocale, summary: string, error: unknown) {
+  const detail = localizedBackendError(locale, error);
   return detail ? `${summary}: ${detail.slice(0, 180)}` : summary;
 }
 
@@ -153,7 +158,7 @@ export function useMailActions(options: UseMailActionsOptions) {
     } catch (error) {
       if (unreadDelta) adjustUnreadBadge(mail.account_id, -unreadDelta);
       console.error("Archive email failed:", error);
-      showToast(actionFailureMessage(locale.messages.archiveFailed, error), "error");
+      showToast(actionFailureMessage(locale, locale.messages.archiveFailed, error), "error");
       void loadEmails(activeTabRef.current);
     }
   }, [activeTabRef, adjustUnreadBadge, getTokenForEmail, loadEmails, locale, refreshUnreadCount, runAuthenticatedAction, setEmails, setSelectedMail, showToast]);
@@ -171,7 +176,7 @@ export function useMailActions(options: UseMailActionsOptions) {
     } catch (error) {
       if (unreadDelta) adjustUnreadBadge(mail.account_id, -unreadDelta);
       console.error("Trash email failed:", error);
-      showToast(actionFailureMessage(locale.messages.deleteFailed, error), "error");
+      showToast(actionFailureMessage(locale, locale.messages.deleteFailed, error), "error");
       void loadEmails(activeTabRef.current);
     }
   }, [activeTabRef, adjustUnreadBadge, getTokenForEmail, loadEmails, locale, refreshUnreadCount, runAuthenticatedAction, setEmails, setSelectedMail, showToast]);
@@ -189,7 +194,7 @@ export function useMailActions(options: UseMailActionsOptions) {
     } catch (error) {
       if (unreadDelta) adjustUnreadBadge(mail.account_id, -unreadDelta);
       console.error("Report spam failed:", error);
-      showToast(actionFailureMessage(locale.messages.spamReportFailed, error), "error");
+      showToast(actionFailureMessage(locale, locale.messages.spamReportFailed, error), "error");
       void loadEmails(activeTabRef.current);
     }
   }, [activeTabRef, adjustUnreadBadge, getTokenForEmail, loadEmails, locale, refreshUnreadCount, runAuthenticatedAction, setEmails, setSelectedMail, showToast]);
@@ -208,7 +213,7 @@ export function useMailActions(options: UseMailActionsOptions) {
     } catch (error) {
       if (unreadDelta) adjustUnreadBadge(mail.account_id, -unreadDelta);
       console.error("Move email to inbox failed:", error);
-      showToast(actionFailureMessage(locale.messages.moveFailed, error), "error");
+      showToast(actionFailureMessage(locale, locale.messages.moveFailed, error), "error");
       void loadEmails(activeTabRef.current);
     }
   }, [activeTabRef, adjustUnreadBadge, getTokenForEmail, loadEmails, locale, refreshUnreadCount, runAuthenticatedAction, setEmails, setSelectedMail, showToast]);
@@ -329,7 +334,7 @@ export function useMailActions(options: UseMailActionsOptions) {
         markAccountExpired(sendFromId);
         setComposeSendError(locale.messages.reloginRequired);
       } else {
-        const message = raw.replace(/^Error:\s*/i, "").replace(/Gmail send error:\s*/i, "");
+        const message = localizedBackendError(locale, raw).replace(/Gmail send error:\s*/i, "");
         setComposeSendError(message || locale.messages.sendFailed);
       }
       return false;
@@ -362,7 +367,7 @@ export function useMailActions(options: UseMailActionsOptions) {
     } catch (error) {
       console.error("Mark email as unread failed:", error);
       if (unreadDelta) adjustUnreadBadge(mail.account_id, -unreadDelta);
-      showToast(actionFailureMessage(locale.messages.operationFailed, error), "error");
+      showToast(actionFailureMessage(locale, locale.messages.operationFailed, error), "error");
       void loadEmails(activeTabRef.current);
     }
   }, [activeTabRef, adjustUnreadBadge, getTokenForEmail, loadEmails, locale, recentlyReadRef, refreshUnreadCount, runAuthenticatedAction, setEmails, setSelectedMail, showToast]);

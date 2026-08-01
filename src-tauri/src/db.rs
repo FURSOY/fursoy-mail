@@ -1,5 +1,7 @@
 use keyring::Entry;
-use rusqlite::{params, Connection, InterruptHandle, OptionalExtension, Result, TransactionBehavior};
+use rusqlite::{
+    params, Connection, InterruptHandle, OptionalExtension, Result, TransactionBehavior,
+};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::sync::{
@@ -30,7 +32,8 @@ fn account_key(email: &str) -> String {
 }
 
 pub fn save_tokens(email: &str, tokens: &StoredTokens) -> Result<(), String> {
-    let data = serde_json::to_string(tokens).map_err(|e| format!("Token serileştirilemedi: {e}"))?;
+    let data =
+        serde_json::to_string(tokens).map_err(|e| format!("Token serileştirilemedi: {e}"))?;
     Entry::new(KEYRING_SERVICE, &account_key(email))
         .and_then(|e| e.set_password(&data))
         .map_err(|e| format!("Token kaydedilemedi: {e}"))
@@ -66,7 +69,7 @@ pub fn load_account_access_token(account_id: &str) -> Result<String, String> {
             .map_err(|_| "Sistem saati geçersiz.".to_string())?
             .as_secs() as i64;
         if expires_at <= now.saturating_add(30) {
-            return Err("401: Google oturumunun süresi doldu.".to_string());
+            return Err("401: Mail account session expired.".to_string());
         }
     }
     Ok(tokens.access_token)
@@ -101,6 +104,19 @@ pub struct Account {
     pub email: String,
     pub picture: String,
     pub display_order: i32,
+    pub provider: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ImapAccountSettings {
+    pub account_id: String,
+    pub username: String,
+    pub imap_host: String,
+    pub imap_port: u16,
+    pub imap_security: String,
+    pub smtp_host: String,
+    pub smtp_port: u16,
+    pub smtp_security: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -304,7 +320,11 @@ impl SearchCoordinator {
 
     fn finish(&self, generation: u64) {
         if let Ok(mut active) = self.inner.active.lock() {
-            if active.as_ref().map(|(active_generation, _)| *active_generation) == Some(generation) {
+            if active
+                .as_ref()
+                .map(|(active_generation, _)| *active_generation)
+                == Some(generation)
+            {
                 active.take();
             }
         }
@@ -403,7 +423,8 @@ pub fn init_db(app: &AppHandle) -> Result<()> {
             email TEXT NOT NULL UNIQUE,
             picture TEXT NOT NULL DEFAULT '',
             display_order INTEGER NOT NULL DEFAULT 0,
-            cache_generation INTEGER NOT NULL DEFAULT 1
+            cache_generation INTEGER NOT NULL DEFAULT 1,
+            provider TEXT NOT NULL DEFAULT 'google'
         )",
         [],
     )?;
@@ -418,6 +439,35 @@ pub fn init_db(app: &AppHandle) -> Result<()> {
             [],
         )?;
     }
+    let account_provider_column_exists: bool = conn
+        .prepare("SELECT COUNT(*) FROM pragma_table_info('accounts') WHERE name='provider'")
+        .and_then(|mut statement| statement.query_row([], |row| row.get::<_, i64>(0)))
+        .map(|count| count > 0)
+        .unwrap_or(false);
+    if !account_provider_column_exists {
+        conn.execute(
+            "ALTER TABLE accounts ADD COLUMN provider TEXT NOT NULL DEFAULT 'google'",
+            [],
+        )?;
+    }
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS imap_account_settings (
+             account_id TEXT PRIMARY KEY,
+             username TEXT NOT NULL,
+             imap_host TEXT NOT NULL,
+             imap_port INTEGER NOT NULL,
+             imap_security TEXT NOT NULL,
+             smtp_host TEXT NOT NULL,
+             smtp_port INTEGER NOT NULL,
+             smtp_security TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS imap_mailboxes (
+             account_id TEXT NOT NULL,
+             role TEXT NOT NULL,
+             mailbox TEXT NOT NULL,
+             PRIMARY KEY (account_id, role)
+         );",
+    )?;
     conn.execute(
         "CREATE TABLE IF NOT EXISTS account_generations (
             account_id TEXT PRIMARY KEY,
@@ -494,24 +544,54 @@ pub fn init_db(app: &AppHandle) -> Result<()> {
          AFTER DELETE ON emails BEGIN
              DELETE FROM email_labels
              WHERE account_id = old.account_id AND email_id = old.id;
-         END;"
+         END;",
     )?;
 
     // Migration: add missing columns to emails
     let mut thread_id_was_missing = false;
     let mut reply_metadata_was_missing = false;
     for (col, ddl) in [
-        ("label", "ALTER TABLE emails ADD COLUMN label TEXT NOT NULL DEFAULT 'inbox'"),
-        ("recipient", "ALTER TABLE emails ADD COLUMN recipient TEXT NOT NULL DEFAULT ''"),
-        ("thread_id", "ALTER TABLE emails ADD COLUMN thread_id TEXT NOT NULL DEFAULT ''"),
-        ("thread_key", "ALTER TABLE emails ADD COLUMN thread_key TEXT NOT NULL DEFAULT ''"),
-        ("cc", "ALTER TABLE emails ADD COLUMN cc TEXT NOT NULL DEFAULT ''"),
-        ("reply_to", "ALTER TABLE emails ADD COLUMN reply_to TEXT NOT NULL DEFAULT ''"),
-        ("message_id", "ALTER TABLE emails ADD COLUMN message_id TEXT NOT NULL DEFAULT ''"),
-        ("references_header", "ALTER TABLE emails ADD COLUMN references_header TEXT NOT NULL DEFAULT ''"),
+        (
+            "label",
+            "ALTER TABLE emails ADD COLUMN label TEXT NOT NULL DEFAULT 'inbox'",
+        ),
+        (
+            "recipient",
+            "ALTER TABLE emails ADD COLUMN recipient TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            "thread_id",
+            "ALTER TABLE emails ADD COLUMN thread_id TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            "thread_key",
+            "ALTER TABLE emails ADD COLUMN thread_key TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            "cc",
+            "ALTER TABLE emails ADD COLUMN cc TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            "reply_to",
+            "ALTER TABLE emails ADD COLUMN reply_to TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            "message_id",
+            "ALTER TABLE emails ADD COLUMN message_id TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            "references_header",
+            "ALTER TABLE emails ADD COLUMN references_header TEXT NOT NULL DEFAULT ''",
+        ),
         ("body_text", "ALTER TABLE emails ADD COLUMN body_text TEXT"),
-        ("account_id", "ALTER TABLE emails ADD COLUMN account_id TEXT NOT NULL DEFAULT ''"),
-        ("sync_generation", "ALTER TABLE emails ADD COLUMN sync_generation INTEGER NOT NULL DEFAULT 0"),
+        (
+            "account_id",
+            "ALTER TABLE emails ADD COLUMN account_id TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            "sync_generation",
+            "ALTER TABLE emails ADD COLUMN sync_generation INTEGER NOT NULL DEFAULT 0",
+        ),
     ] {
         let exists: bool = conn
             .prepare(&format!(
@@ -712,7 +792,10 @@ pub fn init_db(app: &AppHandle) -> Result<()> {
          END;",
     )?;
     if !search_index_exists {
-        conn.execute("INSERT INTO email_search(email_search) VALUES('rebuild')", [])?;
+        conn.execute(
+            "INSERT INTO email_search(email_search) VALUES('rebuild')",
+            [],
+        )?;
     }
 
     let thread_summaries_exist: bool = conn
@@ -835,10 +918,7 @@ pub fn init_db(app: &AppHandle) -> Result<()> {
     // Never destroy the only recoverable copy when the credential store is
     // temporarily unavailable. A later startup will retry the migration.
     if credentials_preserved {
-        conn.execute(
-            "UPDATE auth SET access_token = '', refresh_token = ''",
-            [],
-        )?;
+        conn.execute("UPDATE auth SET access_token = '', refresh_token = ''", [])?;
     }
 
     // Any remaining rows without an owner cannot safely be assigned to an
@@ -861,7 +941,7 @@ pub fn get_accounts(
     let conn = Connection::open(db_path).map_err(database_error)?;
     let mut stmt = conn
         .prepare(
-            "SELECT id, email, picture, display_order \
+            "SELECT id, email, picture, display_order, provider \
              FROM accounts ORDER BY display_order ASC, id ASC",
         )
         .map_err(database_error)?;
@@ -872,6 +952,7 @@ pub fn get_accounts(
                 email: row.get(1)?,
                 picture: row.get(2)?,
                 display_order: row.get(3)?,
+                provider: row.get(4)?,
             })
         })
         .map_err(database_error)?;
@@ -906,11 +987,12 @@ pub fn upsert_account(app: &AppHandle, email: &str, picture: &str) -> Result<Acc
         .map_err(database_error)?;
 
     tx.execute(
-        "INSERT INTO accounts (id, email, picture, display_order, cache_generation)
-         VALUES (?1, ?2, ?3, ?4, ?5)
+        "INSERT INTO accounts (id, email, picture, display_order, cache_generation, provider)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'google')
          ON CONFLICT(id) DO UPDATE SET
              picture = excluded.picture,
-             cache_generation = excluded.cache_generation",
+             cache_generation = excluded.cache_generation,
+             provider = 'google'",
         params![email, email, picture, max_order + 1, cache_generation],
     )
     .map_err(database_error)?;
@@ -929,7 +1011,229 @@ pub fn upsert_account(app: &AppHandle, email: &str, picture: &str) -> Result<Acc
         email: email.to_string(),
         picture: picture.to_string(),
         display_order,
+        provider: "google".to_string(),
     })
+}
+
+pub fn upsert_imap_account(
+    app: &AppHandle,
+    settings: &ImapAccountSettings,
+) -> Result<Account, String> {
+    let db_path = get_db_path(app);
+    let mut conn = Connection::open(db_path).map_err(database_error)?;
+    let tx = conn.transaction().map_err(database_error)?;
+    let existing: Option<(i32, String)> = tx
+        .query_row(
+            "SELECT display_order, provider FROM accounts WHERE id = ?1",
+            params![settings.account_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(database_error)?;
+    let display_order = existing.as_ref().map(|value| value.0).unwrap_or_else(|| {
+        tx.query_row(
+            "SELECT COALESCE(MAX(display_order), -1) + 1 FROM accounts",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0)
+    });
+    let replacing_provider = existing
+        .as_ref()
+        .is_some_and(|value| value.1.as_str() != "imap");
+
+    if replacing_provider {
+        tx.execute(
+            "INSERT INTO account_generations (account_id, generation) VALUES (?1, 2)
+             ON CONFLICT(account_id) DO UPDATE SET generation = generation + 1",
+            params![settings.account_id],
+        )
+        .map_err(database_error)?;
+        for table in [
+            "attachments",
+            "email_labels",
+            "gmail_labels",
+            "imap_mailboxes",
+            "emails",
+            "thread_summaries",
+            "sync_state",
+            "mailbox_cursors",
+        ] {
+            if tx
+                .prepare(&format!("SELECT 1 FROM {table} LIMIT 1"))
+                .is_ok()
+            {
+                tx.execute(
+                    &format!("DELETE FROM {table} WHERE account_id = ?1"),
+                    params![settings.account_id],
+                )
+                .map_err(database_error)?;
+            }
+        }
+    } else {
+        tx.execute(
+            "INSERT INTO account_generations (account_id, generation) VALUES (?1, 1)
+             ON CONFLICT(account_id) DO NOTHING",
+            params![settings.account_id],
+        )
+        .map_err(database_error)?;
+    }
+    let generation: i64 = tx
+        .query_row(
+            "SELECT generation FROM account_generations WHERE account_id = ?1",
+            params![settings.account_id],
+            |row| row.get(0),
+        )
+        .map_err(database_error)?;
+
+    tx.execute(
+        "INSERT INTO accounts (id, email, picture, display_order, cache_generation, provider)
+         VALUES (?1, ?1, '', ?2, ?3, 'imap')
+         ON CONFLICT(id) DO UPDATE SET
+             email = excluded.email,
+             picture = '',
+             cache_generation = excluded.cache_generation,
+             provider = 'imap'",
+        params![settings.account_id, display_order, generation],
+    )
+    .map_err(database_error)?;
+    tx.execute(
+        "INSERT INTO imap_account_settings (
+             account_id, username, imap_host, imap_port, imap_security,
+             smtp_host, smtp_port, smtp_security
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         ON CONFLICT(account_id) DO UPDATE SET
+             username = excluded.username,
+             imap_host = excluded.imap_host,
+             imap_port = excluded.imap_port,
+             imap_security = excluded.imap_security,
+             smtp_host = excluded.smtp_host,
+             smtp_port = excluded.smtp_port,
+             smtp_security = excluded.smtp_security",
+        params![
+            settings.account_id,
+            settings.username,
+            settings.imap_host,
+            settings.imap_port,
+            settings.imap_security,
+            settings.smtp_host,
+            settings.smtp_port,
+            settings.smtp_security,
+        ],
+    )
+    .map_err(database_error)?;
+    tx.commit().map_err(database_error)?;
+
+    Ok(Account {
+        id: settings.account_id.clone(),
+        email: settings.account_id.clone(),
+        picture: String::new(),
+        display_order,
+        provider: "imap".to_string(),
+    })
+}
+
+pub fn get_imap_account_settings(
+    app: &AppHandle,
+    account_id: &str,
+) -> Result<ImapAccountSettings, String> {
+    let db_path = get_db_path(app);
+    let conn = Connection::open(db_path).map_err(database_error)?;
+    conn.query_row(
+        "SELECT account_id, username, imap_host, imap_port, imap_security,
+                smtp_host, smtp_port, smtp_security
+         FROM imap_account_settings WHERE account_id = ?1",
+        params![account_id],
+        |row| {
+            Ok(ImapAccountSettings {
+                account_id: row.get(0)?,
+                username: row.get(1)?,
+                imap_host: row.get(2)?,
+                imap_port: row.get(3)?,
+                imap_security: row.get(4)?,
+                smtp_host: row.get(5)?,
+                smtp_port: row.get(6)?,
+                smtp_security: row.get(7)?,
+            })
+        },
+    )
+    .map_err(database_error)
+}
+
+pub fn replace_imap_mailboxes(
+    app: &AppHandle,
+    account_id: &str,
+    mailboxes: &[(String, String)],
+) -> Result<(), String> {
+    let db_path = get_db_path(app);
+    let mut conn = Connection::open(db_path).map_err(database_error)?;
+    let tx = conn.transaction().map_err(database_error)?;
+    tx.execute(
+        "DELETE FROM imap_mailboxes WHERE account_id = ?1",
+        params![account_id],
+    )
+    .map_err(database_error)?;
+    for (role, mailbox) in mailboxes {
+        tx.execute(
+            "INSERT INTO imap_mailboxes (account_id, role, mailbox) VALUES (?1, ?2, ?3)",
+            params![account_id, role, mailbox],
+        )
+        .map_err(database_error)?;
+    }
+    tx.commit().map_err(database_error)
+}
+
+pub fn get_imap_mailboxes(
+    app: &AppHandle,
+    account_id: &str,
+) -> Result<Vec<(String, String)>, String> {
+    let db_path = get_db_path(app);
+    let conn = Connection::open(db_path).map_err(database_error)?;
+    let mut statement = conn
+        .prepare(
+            "SELECT role, mailbox FROM imap_mailboxes
+             WHERE account_id = ?1 ORDER BY role",
+        )
+        .map_err(database_error)?;
+    let rows = statement
+        .query_map(params![account_id], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(database_error)?;
+    Ok(rows.filter_map(Result::ok).collect())
+}
+
+pub fn get_thread_email_ids(
+    app: &AppHandle,
+    account_id: &str,
+    thread_id: &str,
+) -> Result<Vec<String>, String> {
+    let db_path = get_db_path(app);
+    let conn = Connection::open(db_path).map_err(database_error)?;
+    let mut statement = conn
+        .prepare(
+            "SELECT id FROM emails
+             WHERE account_id = ?1 AND thread_key = ?2 AND label != 'draft'",
+        )
+        .map_err(database_error)?;
+    let rows = statement
+        .query_map(params![account_id, thread_id], |row| row.get(0))
+        .map_err(database_error)?;
+    Ok(rows.filter_map(Result::ok).collect())
+}
+
+pub fn get_email_ids_for_label(
+    app: &AppHandle,
+    account_id: &str,
+    label: &str,
+) -> Result<Vec<String>, String> {
+    let db_path = get_db_path(app);
+    let conn = Connection::open(db_path).map_err(database_error)?;
+    let mut statement = conn
+        .prepare("SELECT id FROM emails WHERE account_id = ?1 AND label = ?2")
+        .map_err(database_error)?;
+    let rows = statement
+        .query_map(params![account_id, label], |row| row.get(0))
+        .map_err(database_error)?;
+    Ok(rows.filter_map(Result::ok).collect())
 }
 
 pub fn get_account_picture(app: &AppHandle, email: &str) -> String {
@@ -944,6 +1248,28 @@ pub fn get_account_picture(app: &AppHandle, email: &str) -> String {
         |r| r.get(0),
     )
     .unwrap_or_default()
+}
+
+pub fn set_account_picture(app: &AppHandle, account_id: &str, picture: &str) -> Result<(), String> {
+    let db_path = get_db_path(app);
+    let conn = Connection::open(db_path).map_err(database_error)?;
+    conn.execute(
+        "UPDATE accounts SET picture = ?2 WHERE id = ?1",
+        params![account_id, picture],
+    )
+    .map(|_| ())
+    .map_err(database_error)
+}
+
+pub fn get_account_provider(app: &AppHandle, account_id: &str) -> Result<String, String> {
+    let db_path = get_db_path(app);
+    let conn = Connection::open(db_path).map_err(database_error)?;
+    conn.query_row(
+        "SELECT provider FROM accounts WHERE id = ?1",
+        params![account_id],
+        |row| row.get(0),
+    )
+    .map_err(database_error)
 }
 
 pub fn get_account_cache_generation(app: &AppHandle, account_id: &str) -> Result<i64, String> {
@@ -1009,10 +1335,16 @@ fn remove_account_cache_from_conn(conn: &mut Connection, account_id: &str) -> Re
         params![account_id],
     )?;
     if tx.prepare("SELECT 1 FROM email_labels LIMIT 1").is_ok() {
-        tx.execute("DELETE FROM email_labels WHERE account_id = ?1", params![account_id])?;
+        tx.execute(
+            "DELETE FROM email_labels WHERE account_id = ?1",
+            params![account_id],
+        )?;
     }
     if tx.prepare("SELECT 1 FROM gmail_labels LIMIT 1").is_ok() {
-        tx.execute("DELETE FROM gmail_labels WHERE account_id = ?1", params![account_id])?;
+        tx.execute(
+            "DELETE FROM gmail_labels WHERE account_id = ?1",
+            params![account_id],
+        )?;
     }
     tx.execute(
         "DELETE FROM emails WHERE account_id = ?1",
@@ -1032,8 +1364,22 @@ fn remove_account_cache_from_conn(conn: &mut Connection, account_id: &str) -> Re
         "DELETE FROM mailbox_cursors WHERE account_id = ?1",
         params![account_id],
     )?;
-    tx.execute("DELETE FROM accounts WHERE id = ?1", params![account_id])
-        ?;
+    if tx
+        .prepare("SELECT 1 FROM imap_account_settings LIMIT 1")
+        .is_ok()
+    {
+        tx.execute(
+            "DELETE FROM imap_account_settings WHERE account_id = ?1",
+            params![account_id],
+        )?;
+    }
+    if tx.prepare("SELECT 1 FROM imap_mailboxes LIMIT 1").is_ok() {
+        tx.execute(
+            "DELETE FROM imap_mailboxes WHERE account_id = ?1",
+            params![account_id],
+        )?;
+    }
+    tx.execute("DELETE FROM accounts WHERE id = ?1", params![account_id])?;
     tx.commit()
 }
 
@@ -1047,7 +1393,8 @@ fn reset_local_mail_cache_from_conn(
         Some(id) => vec![id.to_string()],
         None => {
             let mut stmt = conn.prepare("SELECT id FROM accounts")?;
-            let ids = stmt.query_map([], |row| row.get::<_, String>(0))?
+            let ids = stmt
+                .query_map([], |row| row.get::<_, String>(0))?
                 .filter_map(Result::ok)
                 .collect();
             ids
@@ -1068,16 +1415,28 @@ fn reset_local_mail_cache_from_conn(
             tx.execute("DELETE FROM attachments WHERE account_id = ?1", params![id])?;
             tx.execute("DELETE FROM emails WHERE account_id = ?1", params![id])?;
             if tx.prepare("SELECT 1 FROM thread_summaries LIMIT 1").is_ok() {
-                tx.execute("DELETE FROM thread_summaries WHERE account_id = ?1", params![id])?;
+                tx.execute(
+                    "DELETE FROM thread_summaries WHERE account_id = ?1",
+                    params![id],
+                )?;
             }
             tx.execute("DELETE FROM sync_state WHERE account_id = ?1", params![id])?;
-            tx.execute("DELETE FROM mailbox_cursors WHERE account_id = ?1", params![id])?;
+            tx.execute(
+                "DELETE FROM mailbox_cursors WHERE account_id = ?1",
+                params![id],
+            )?;
         }
         None => {
             // Bump every generation before deleting the cache so a worker that
             // was already in flight cannot write stale rows back after reset.
-            tx.execute("UPDATE account_generations SET generation = generation + 1", [])?;
-            tx.execute("UPDATE accounts SET cache_generation = cache_generation + 1", [])?;
+            tx.execute(
+                "UPDATE account_generations SET generation = generation + 1",
+                [],
+            )?;
+            tx.execute(
+                "UPDATE accounts SET cache_generation = cache_generation + 1",
+                [],
+            )?;
             tx.execute("DELETE FROM attachments", [])?;
             tx.execute("DELETE FROM emails", [])?;
             if tx.prepare("SELECT 1 FROM thread_summaries LIMIT 1").is_ok() {
@@ -1203,14 +1562,14 @@ fn search_contacts_from_conn(
     let mut raw_pairs: Vec<(String, i64)> = Vec::new();
 
     // Senders from received emails
-    let mut stmt = conn
-        .prepare(
-            "SELECT sender, COUNT(*) FROM emails \
+    let mut stmt = conn.prepare(
+        "SELECT sender, COUNT(*) FROM emails \
              WHERE account_id = ?2 AND label != 'sent' AND sender != '' AND LOWER(sender) LIKE ?1 \
              GROUP BY sender ORDER BY COUNT(*) DESC LIMIT 20",
-        )?;
-    let rows = stmt
-        .query_map(params![like, account_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+    )?;
+    let rows = stmt.query_map(params![like, account_id], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+    })?;
     for r in rows.flatten() {
         raw_pairs.push(r);
     }
@@ -1222,8 +1581,9 @@ fn search_contacts_from_conn(
              WHERE account_id = ?2 AND label = 'sent' AND recipient != '' AND LOWER(recipient) LIKE ?1 \
              GROUP BY recipient ORDER BY COUNT(*) DESC LIMIT 20",
         )?;
-    let rows2 = stmt2
-        .query_map(params![like, account_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+    let rows2 = stmt2.query_map(params![like, account_id], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+    })?;
     for r in rows2.flatten() {
         raw_pairs.push(r);
     }
@@ -1281,17 +1641,31 @@ pub fn get_account_auth(
     let db_path = get_db_path(&app);
     let conn = Connection::open(db_path).map_err(database_error)?;
 
-    let row: Option<(String, String)> = conn
+    let row: Option<(String, String, String)> = conn
         .query_row(
-            "SELECT email, picture FROM accounts WHERE id = ?1",
+            "SELECT email, picture, provider FROM accounts WHERE id = ?1",
             params![account_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .ok();
 
-    let Some((email, picture)) = row else {
+    let Some((email, picture, provider)) = row else {
         return Ok(None);
     };
+
+    if provider == "imap" {
+        if !crate::mail_account::has_stored_password(&account_id)
+            && load_tokens(&account_id).is_none()
+        {
+            return Ok(None);
+        }
+        return Ok(Some(AuthInfo {
+            authenticated: true,
+            expires_at: None,
+            email,
+            picture,
+        }));
+    }
 
     let Some(tokens) = load_tokens(&email) else {
         return Ok(None);
@@ -1318,7 +1692,9 @@ fn decode_search_entity(entity: &str) -> Option<char> {
         "apos" | "#39" => Some('\''),
         "nbsp" => Some(' '),
         _ if entity.starts_with("#x") || entity.starts_with("#X") => {
-            u32::from_str_radix(&entity[2..], 16).ok().and_then(char::from_u32)
+            u32::from_str_radix(&entity[2..], 16)
+                .ok()
+                .and_then(char::from_u32)
         }
         _ if entity.starts_with('#') => entity[1..].parse::<u32>().ok().and_then(char::from_u32),
         _ => None,
@@ -1328,12 +1704,56 @@ fn decode_search_entity(entity: &str) -> Option<char> {
 fn is_search_html_tag(tag: &str) -> bool {
     matches!(
         tag,
-        "html" | "head" | "body" | "title" | "meta" | "link" | "style" | "script" |
-        "noscript" | "div" | "span" | "p" | "br" | "a" | "img" | "picture" | "source" |
-        "table" | "tbody" | "thead" | "tfoot" | "tr" | "td" | "th" | "ul" | "ol" | "li" |
-        "blockquote" | "pre" | "code" | "strong" | "b" | "em" | "i" | "u" | "s" | "font" |
-        "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "hr" | "section" | "article" | "header" |
-        "footer" | "main" | "center"
+        "html"
+            | "head"
+            | "body"
+            | "title"
+            | "meta"
+            | "link"
+            | "style"
+            | "script"
+            | "noscript"
+            | "div"
+            | "span"
+            | "p"
+            | "br"
+            | "a"
+            | "img"
+            | "picture"
+            | "source"
+            | "table"
+            | "tbody"
+            | "thead"
+            | "tfoot"
+            | "tr"
+            | "td"
+            | "th"
+            | "ul"
+            | "ol"
+            | "li"
+            | "blockquote"
+            | "pre"
+            | "code"
+            | "strong"
+            | "b"
+            | "em"
+            | "i"
+            | "u"
+            | "s"
+            | "font"
+            | "h1"
+            | "h2"
+            | "h3"
+            | "h4"
+            | "h5"
+            | "h6"
+            | "hr"
+            | "section"
+            | "article"
+            | "header"
+            | "footer"
+            | "main"
+            | "center"
     )
 }
 
@@ -1344,7 +1764,9 @@ pub(crate) fn email_body_to_search_text(source: &str) -> String {
     while cursor < source.len() && output.len() < MAX_SEARCH_BODY_CHARS {
         let remaining = &source[cursor..];
         if remaining.starts_with('<') {
-            let Some(end_offset) = remaining.find('>') else { break };
+            let Some(end_offset) = remaining.find('>') else {
+                break;
+            };
             let tag_source = remaining[1..end_offset].trim();
             let closing = tag_source.starts_with('/');
             let tag_name = tag_source
@@ -1367,7 +1789,23 @@ pub(crate) fn email_body_to_search_text(source: &str) -> String {
                     skipped_element = Some(tag_name);
                 }
             } else if skipped_element.is_none()
-                && matches!(tag_name.as_str(), "br" | "p" | "div" | "li" | "tr" | "td" | "th" | "blockquote" | "pre" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6")
+                && matches!(
+                    tag_name.as_str(),
+                    "br" | "p"
+                        | "div"
+                        | "li"
+                        | "tr"
+                        | "td"
+                        | "th"
+                        | "blockquote"
+                        | "pre"
+                        | "h1"
+                        | "h2"
+                        | "h3"
+                        | "h4"
+                        | "h5"
+                        | "h6"
+                )
             {
                 output.push(' ');
             }
@@ -1426,11 +1864,7 @@ pub fn backfill_email_search_text(app: &AppHandle) -> Result<(), String> {
     }
 }
 
-fn refresh_thread_summary(
-    conn: &Connection,
-    account_id: &str,
-    thread_key: &str,
-) -> Result<()> {
+fn refresh_thread_summary(conn: &Connection, account_id: &str, thread_key: &str) -> Result<()> {
     let summary_available: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'thread_summaries')",
         [],
@@ -1548,12 +1982,13 @@ pub fn upsert_sync_mail_batch(
     ensure_account_generation(&tx, account_id, account_generation)?;
 
     {
-        let mut previous_thread = tx.prepare(
-            "SELECT thread_key FROM emails WHERE account_id = ?1 AND id = ?2",
-        )?;
+        let mut previous_thread =
+            tx.prepare("SELECT thread_key FROM emails WHERE account_id = ?1 AND id = ?2")?;
         for (email, _, _) in &indexed_emails {
             if let Some(thread_key) = previous_thread
-                .query_row(params![account_id, &email.id], |row| row.get::<_, String>(0))
+                .query_row(params![account_id, &email.id], |row| {
+                    row.get::<_, String>(0)
+                })
                 .optional()?
             {
                 affected_thread_keys.insert(thread_key);
@@ -1839,7 +2274,10 @@ fn search_thread_groups_from_conn(
             "EXISTS (SELECT 1 FROM email_labels located WHERE located.account_id = e.account_id AND located.email_id = e.id AND located.label_id = ?)"
                 .to_string(),
         );
-    } else if matches!(filters.location.as_str(), "inbox" | "sent" | "archive" | "spam" | "trash") {
+    } else if matches!(
+        filters.location.as_str(),
+        "inbox" | "sent" | "archive" | "spam" | "trash"
+    ) {
         values.push(Value::Text(filters.location.clone()));
         conditions.push("e.label = ?".to_string());
     } else if filters.location == "all" {
@@ -1870,12 +2308,14 @@ fn search_thread_groups_from_conn(
         if !seen_threads.insert((row_account_id.clone(), thread_key.clone())) {
             continue;
         }
-        let is_after_cursor = cursor.map_or(true, |(cursor_date, cursor_account, cursor_thread)| {
-            date < cursor_date
-                || (date == cursor_date
-                    && (row_account_id.as_str() > cursor_account
-                        || (row_account_id == cursor_account && thread_key.as_str() > cursor_thread)))
-        });
+        let is_after_cursor =
+            cursor.map_or(true, |(cursor_date, cursor_account, cursor_thread)| {
+                date < cursor_date
+                    || (date == cursor_date
+                        && (row_account_id.as_str() > cursor_account
+                            || (row_account_id == cursor_account
+                                && thread_key.as_str() > cursor_thread)))
+            });
         if is_after_cursor {
             selected_rowids.push(rowid);
             if selected_rowids.len() >= limit as usize {
@@ -1986,7 +2426,7 @@ fn get_thread_groups_from_conn(
                        END
                        AND starred.label_id = 'STARRED'
                  )"
-                    .to_string(),
+                .to_string(),
             );
         } else if let Some(gmail_label_id) = label.strip_prefix("gmail:") {
             if !email_labels_exist {
@@ -2004,7 +2444,7 @@ fn get_thread_groups_from_conn(
                        END
                        AND el.label_id = ?
                  )"
-                    .to_string(),
+                .to_string(),
             );
             values.push(Value::Text(gmail_label_id.to_string()));
         } else {
@@ -2089,7 +2529,10 @@ fn get_thread_groups_from_conn(
         conditions.join(" AND ")
     );
     let mut statement = conn.prepare(&sql)?;
-    let rows = statement.query_map(rusqlite::params_from_iter(values.iter()), map_thread_group_row)?;
+    let rows = statement.query_map(
+        rusqlite::params_from_iter(values.iter()),
+        map_thread_group_row,
+    )?;
     Ok(rows.filter_map(Result::ok).collect())
 }
 
@@ -2235,12 +2678,23 @@ pub fn get_thread_groups_by_label(
     let db_path = get_db_path(&app);
     let conn = Connection::open(db_path).map_err(database_error)?;
     let limit = i64::from(limit.unwrap_or(100).clamp(1, 500));
-    let cursor = match (before_date, before_account_id.as_deref(), before_thread_id.as_deref()) {
+    let cursor = match (
+        before_date,
+        before_account_id.as_deref(),
+        before_thread_id.as_deref(),
+    ) {
         (Some(date), Some(account_id), Some(thread_id)) => Some((date, account_id, thread_id)),
         _ => None,
     };
-    get_thread_groups_from_conn(&conn, Some(&label), None, account_id.as_deref(), limit, cursor)
-        .map_err(database_error)
+    get_thread_groups_from_conn(
+        &conn,
+        Some(&label),
+        None,
+        account_id.as_deref(),
+        limit,
+        cursor,
+    )
+    .map_err(database_error)
 }
 
 #[tauri::command]
@@ -2394,7 +2848,11 @@ pub async fn search_local_thread_groups(
     before_thread_id: Option<String>,
 ) -> Result<Vec<ThreadGroup>, String> {
     crate::require_command_window(&window, &["main"])?;
-    if query.trim().is_empty() && !filters.as_ref().is_some_and(AdvancedSearchCriteria::is_active) {
+    if query.trim().is_empty()
+        && !filters
+            .as_ref()
+            .is_some_and(AdvancedSearchCriteria::is_active)
+    {
         return Ok(Vec::new());
     }
     let db_path = get_db_path(&app);
@@ -2488,8 +2946,11 @@ pub fn replace_gmail_labels(
             existing_colors.insert(row.0, (row.1, row.2));
         }
     }
-    tx.execute("DELETE FROM gmail_labels WHERE account_id = ?1", params![account_id])
-        .map_err(database_error)?;
+    tx.execute(
+        "DELETE FROM gmail_labels WHERE account_id = ?1",
+        params![account_id],
+    )
+    .map_err(database_error)?;
     for label in labels {
         let previous = existing_colors.get(&label.id);
         let background_color = label
@@ -2503,7 +2964,13 @@ pub fn replace_gmail_labels(
         tx.execute(
             "INSERT INTO gmail_labels (account_id, id, name, background_color, text_color)
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![account_id, label.id, label.name, background_color, text_color],
+            params![
+                account_id,
+                label.id,
+                label.name,
+                background_color,
+                text_color
+            ],
         )
         .map_err(database_error)?;
     }
@@ -2528,7 +2995,13 @@ pub fn upsert_gmail_label(app: &AppHandle, label: &GmailLabel) -> Result<(), Str
              name = excluded.name,
              background_color = excluded.background_color,
              text_color = excluded.text_color",
-        params![label.account_id, label.id, label.name, label.background_color, label.text_color],
+        params![
+            label.account_id,
+            label.id,
+            label.name,
+            label.background_color,
+            label.text_color
+        ],
     )
     .map_err(database_error)?;
     Ok(())
@@ -2616,7 +3089,11 @@ pub fn set_thread_gmail_label_local(
     Ok(())
 }
 
-pub fn gmail_label_exists(app: &AppHandle, account_id: &str, label_id: &str) -> Result<bool, String> {
+pub fn gmail_label_exists(
+    app: &AppHandle,
+    account_id: &str,
+    label_id: &str,
+) -> Result<bool, String> {
     let db_path = get_db_path(app);
     let conn = Connection::open(db_path).map_err(database_error)?;
     conn.query_row(
@@ -2657,8 +3134,11 @@ pub fn mark_email_as_read_local(app: &AppHandle, id: &str, account_id: &str) -> 
         )
         .optional()
         .map_err(database_error)?;
-    tx.execute("UPDATE emails SET unread = 0 WHERE id = ?1 AND account_id = ?2", params![id, account_id])
-        .map_err(database_error)?;
+    tx.execute(
+        "UPDATE emails SET unread = 0 WHERE id = ?1 AND account_id = ?2",
+        params![id, account_id],
+    )
+    .map_err(database_error)?;
     if let Some(thread_key) = thread_key {
         refresh_thread_summary(&tx, account_id, &thread_key).map_err(database_error)?;
     }
@@ -2666,7 +3146,11 @@ pub fn mark_email_as_read_local(app: &AppHandle, id: &str, account_id: &str) -> 
     Ok(())
 }
 
-pub fn archive_thread_local(app: &AppHandle, thread_id: &str, account_id: &str) -> Result<(), String> {
+pub fn archive_thread_local(
+    app: &AppHandle,
+    thread_id: &str,
+    account_id: &str,
+) -> Result<(), String> {
     let db_path = get_db_path(app);
     let mut conn = Connection::open(db_path).map_err(database_error)?;
     let tx = conn.transaction().map_err(database_error)?;
@@ -2680,7 +3164,11 @@ pub fn archive_thread_local(app: &AppHandle, thread_id: &str, account_id: &str) 
     Ok(())
 }
 
-pub fn trash_thread_local(app: &AppHandle, thread_id: &str, account_id: &str) -> Result<(), String> {
+pub fn trash_thread_local(
+    app: &AppHandle,
+    thread_id: &str,
+    account_id: &str,
+) -> Result<(), String> {
     let db_path = get_db_path(app);
     let mut conn = Connection::open(db_path).map_err(database_error)?;
     let tx = conn.transaction().map_err(database_error)?;
@@ -2694,11 +3182,7 @@ pub fn trash_thread_local(app: &AppHandle, thread_id: &str, account_id: &str) ->
     Ok(())
 }
 
-pub fn spam_thread_local(
-    app: &AppHandle,
-    thread_id: &str,
-    account_id: &str,
-) -> Result<(), String> {
+pub fn spam_thread_local(app: &AppHandle, thread_id: &str, account_id: &str) -> Result<(), String> {
     let db_path = get_db_path(app);
     let mut conn = Connection::open(db_path).map_err(database_error)?;
     let tx = conn.transaction().map_err(database_error)?;
@@ -2712,7 +3196,11 @@ pub fn spam_thread_local(
     Ok(())
 }
 
-pub fn move_thread_to_inbox_local(app: &AppHandle, thread_id: &str, account_id: &str) -> Result<(), String> {
+pub fn move_thread_to_inbox_local(
+    app: &AppHandle,
+    thread_id: &str,
+    account_id: &str,
+) -> Result<(), String> {
     let db_path = get_db_path(app);
     let mut conn = Connection::open(db_path).map_err(database_error)?;
     let tx = conn.transaction().map_err(database_error)?;
@@ -2726,7 +3214,11 @@ pub fn move_thread_to_inbox_local(app: &AppHandle, thread_id: &str, account_id: 
     Ok(())
 }
 
-pub fn mark_thread_as_unread_local(app: &AppHandle, thread_id: &str, account_id: &str) -> Result<(), String> {
+pub fn mark_thread_as_unread_local(
+    app: &AppHandle,
+    thread_id: &str,
+    account_id: &str,
+) -> Result<(), String> {
     let db_path = get_db_path(app);
     let mut conn = Connection::open(db_path).map_err(database_error)?;
     let tx = conn.transaction().map_err(database_error)?;
@@ -2740,7 +3232,11 @@ pub fn mark_thread_as_unread_local(app: &AppHandle, thread_id: &str, account_id:
     Ok(())
 }
 
-pub fn mark_thread_as_read_local(app: &AppHandle, thread_id: &str, account_id: &str) -> Result<(), String> {
+pub fn mark_thread_as_read_local(
+    app: &AppHandle,
+    thread_id: &str,
+    account_id: &str,
+) -> Result<(), String> {
     let db_path = get_db_path(app);
     let mut conn = Connection::open(db_path).map_err(database_error)?;
     let tx = conn.transaction().map_err(database_error)?;
@@ -2803,7 +3299,8 @@ pub fn set_gmail_inbox_unread_stats(
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(database_error)?;
-    ensure_account_generation(&tx, account_id, account_generation).map_err(|_| "Account is no longer available")?;
+    ensure_account_generation(&tx, account_id, account_generation)
+        .map_err(|_| "Account is no longer available")?;
     tx.execute(
         "INSERT INTO sync_state (
              account_id, gmail_inbox_messages_unread, gmail_inbox_threads_unread
@@ -2859,7 +3356,10 @@ pub struct ActiveFullSync {
     pub pending_history_id: String,
 }
 
-pub fn get_active_full_sync(app: &AppHandle, account_id: &str) -> Result<Option<ActiveFullSync>, String> {
+pub fn get_active_full_sync(
+    app: &AppHandle,
+    account_id: &str,
+) -> Result<Option<ActiveFullSync>, String> {
     let db_path = get_db_path(app);
     let conn = Connection::open(db_path).map_err(database_error)?;
     conn.query_row(
@@ -2945,7 +3445,7 @@ pub fn complete_full_sync(
         history_id,
         sync_generation,
     )
-        .map_err(database_error)
+    .map_err(database_error)
 }
 
 fn finalize_full_sync_from_conn(
@@ -2956,13 +3456,14 @@ fn finalize_full_sync_from_conn(
 ) -> Result<usize> {
     let tx = conn.transaction()?;
     ensure_account_generation(&tx, account_id, account_generation)?;
-    let pending_history_id: String = tx.query_row(
-        "SELECT pending_full_history_id FROM sync_state
+    let pending_history_id: String = tx
+        .query_row(
+            "SELECT pending_full_history_id FROM sync_state
          WHERE account_id = ?1 AND active_full_sync_generation = ?2",
-        params![account_id, sync_generation],
-        |row| row.get::<_, Option<String>>(0),
-    )?
-    .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+            params![account_id, sync_generation],
+            |row| row.get::<_, Option<String>>(0),
+        )?
+        .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
 
     tx.execute(
         "DELETE FROM attachments
@@ -3242,28 +3743,26 @@ fn delete_emails_by_ids_from_conn(
     }
 
     let placeholders = vec!["?"; ids.len()].join(",");
-    let attachment_sql = format!(
-        "DELETE FROM attachments WHERE account_id = ? AND email_id IN ({placeholders})"
-    );
-    let email_sql = format!(
-        "DELETE FROM emails WHERE account_id = ? AND id IN ({placeholders})"
-    );
+    let attachment_sql =
+        format!("DELETE FROM attachments WHERE account_id = ? AND email_id IN ({placeholders})");
+    let email_sql = format!("DELETE FROM emails WHERE account_id = ? AND id IN ({placeholders})");
     let mut params: Vec<&dyn rusqlite::types::ToSql> = vec![&account_id];
     params.extend(ids.iter().map(|s| s as &dyn rusqlite::types::ToSql));
     let tx = conn.transaction()?;
-    let affected_thread_keys: Vec<String> = if tx.prepare("SELECT thread_key FROM emails LIMIT 0").is_ok() {
-        let thread_key_sql = format!(
+    let affected_thread_keys: Vec<String> =
+        if tx.prepare("SELECT thread_key FROM emails LIMIT 0").is_ok() {
+            let thread_key_sql = format!(
             "SELECT DISTINCT thread_key FROM emails WHERE account_id = ? AND id IN ({placeholders})"
         );
-        let mut statement = tx.prepare(&thread_key_sql)?;
-        let keys = statement
-            .query_map(params.as_slice(), |row| row.get(0))?
-            .filter_map(Result::ok)
-            .collect();
-        keys
-    } else {
-        Vec::new()
-    };
+            let mut statement = tx.prepare(&thread_key_sql)?;
+            let keys = statement
+                .query_map(params.as_slice(), |row| row.get(0))?
+                .filter_map(Result::ok)
+                .collect();
+            keys
+        } else {
+            Vec::new()
+        };
     tx.execute(&attachment_sql, params.as_slice())?;
     let deleted = tx.execute(&email_sql, params.as_slice())?;
     for thread_key in affected_thread_keys {
@@ -3281,7 +3780,8 @@ pub fn delete_emails_by_ids(
 ) -> Result<(), String> {
     let db_path = get_db_path(app);
     let mut conn = Connection::open(db_path).map_err(database_error)?;
-    ensure_account_generation(&conn, account_id, account_generation).map_err(|_| "Account is no longer available")?;
+    ensure_account_generation(&conn, account_id, account_generation)
+        .map_err(|_| "Account is no longer available")?;
     delete_emails_by_ids_from_conn(&mut conn, account_id, ids).map_err(database_error)?;
     Ok(())
 }
@@ -3292,10 +3792,9 @@ mod tests {
 
     #[test]
     fn stored_tokens_accept_legacy_keyring_json_without_expiry() {
-        let tokens: StoredTokens = serde_json::from_str(
-            r#"{"access_token":"access","refresh_token":"refresh"}"#,
-        )
-        .expect("legacy keyring JSON");
+        let tokens: StoredTokens =
+            serde_json::from_str(r#"{"access_token":"access","refresh_token":"refresh"}"#)
+                .expect("legacy keyring JSON");
         assert_eq!(tokens.access_token, "access");
         assert_eq!(tokens.refresh_token, "refresh");
         assert_eq!(tokens.expires_at, None);
@@ -3370,7 +3869,10 @@ mod tests {
             attachment_account_id(Some("authorized-account"), &attachment),
             "authorized-account"
         );
-        assert_eq!(attachment_account_id(None, &attachment), "untrusted-account");
+        assert_eq!(
+            attachment_account_id(None, &attachment),
+            "untrusted-account"
+        );
     }
 
     #[test]
@@ -3450,8 +3952,8 @@ mod tests {
         )
         .expect("seed orphaned attachments");
 
-        let deleted = purge_orphaned_attachments_from_conn(&conn)
-            .expect("purge orphaned attachments");
+        let deleted =
+            purge_orphaned_attachments_from_conn(&conn).expect("purge orphaned attachments");
 
         assert_eq!(deleted, 2);
         let remaining: Vec<String> = conn
@@ -3478,7 +3980,10 @@ mod tests {
         .expect("create mailbox cursors");
 
         let cursors = vec![("inbox".to_string(), Some("next-page".to_string()))];
-        assert!(complete_full_sync_from_conn(&mut conn, "account-a", 1, &cursors, "history-1", 1).is_err());
+        assert!(
+            complete_full_sync_from_conn(&mut conn, "account-a", 1, &cursors, "history-1", 1)
+                .is_err()
+        );
 
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM mailbox_cursors", [], |row| row.get(0))
@@ -3529,8 +4034,8 @@ mod tests {
         )
         .expect("seed full-sync state");
 
-        let deleted = finalize_full_sync_from_conn(&mut conn, "account-a", 1, 7)
-            .expect("finalize full sync");
+        let deleted =
+            finalize_full_sync_from_conn(&mut conn, "account-a", 1, 7).expect("finalize full sync");
         assert_eq!(deleted, 1);
 
         let remaining_messages: Vec<(String, String)> = conn
@@ -3618,7 +4123,13 @@ mod tests {
 
         remove_account_cache_from_conn(&mut conn, "account-a").expect("remove account cache");
 
-        for table in ["accounts", "emails", "attachments", "sync_state", "mailbox_cursors"] {
+        for table in [
+            "accounts",
+            "emails",
+            "attachments",
+            "sync_state",
+            "mailbox_cursors",
+        ] {
             let count: i64 = conn
                 .query_row(
                     &format!("SELECT COUNT(*) FROM {table} WHERE account_id = 'account-a'"),
@@ -3644,7 +4155,11 @@ mod tests {
             .expect("read invalidated generation");
         assert_eq!(generation, 4);
         let remaining_attachments: i64 = conn
-            .query_row("SELECT COUNT(*) FROM attachments WHERE account_id = 'account-b'", [], |row| row.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM attachments WHERE account_id = 'account-b'",
+                [],
+                |row| row.get(0),
+            )
             .expect("keep other account attachment");
         assert_eq!(remaining_attachments, 1);
     }
@@ -3730,17 +4245,27 @@ mod tests {
 
         let account_a = search_local_emails_from_conn(&conn, "atlas", Some("account-a"), 50)
             .expect("search selected account");
-        assert_eq!(account_a.iter().map(|email| email.id.as_str()).collect::<Vec<_>>(), ["a-subject"]);
-
-        let all_accounts = search_local_emails_from_conn(&conn, "atlas", None, 50)
-            .expect("search all accounts");
         assert_eq!(
-            all_accounts.iter().map(|email| email.id.as_str()).collect::<Vec<_>>(),
+            account_a
+                .iter()
+                .map(|email| email.id.as_str())
+                .collect::<Vec<_>>(),
+            ["a-subject"]
+        );
+
+        let all_accounts =
+            search_local_emails_from_conn(&conn, "atlas", None, 50).expect("search all accounts");
+        assert_eq!(
+            all_accounts
+                .iter()
+                .map(|email| email.id.as_str())
+                .collect::<Vec<_>>(),
             ["a-subject", "b-subject"]
         );
 
-        let recipient = search_local_emails_from_conn(&conn, "team@example.test", Some("account-a"), 50)
-            .expect("search recipient");
+        let recipient =
+            search_local_emails_from_conn(&conn, "team@example.test", Some("account-a"), 50)
+                .expect("search recipient");
         assert_eq!(recipient.len(), 1);
         assert_eq!(recipient[0].id, "a-recipient");
     }
@@ -3748,7 +4273,9 @@ mod tests {
     #[test]
     fn full_text_search_finds_visible_body_content_without_indexing_html_noise() {
         assert_eq!(
-            email_body_to_search_text("<style>.fin{color:red}</style><p>Weekly Fin update &amp; notes</p>"),
+            email_body_to_search_text(
+                "<style>.fin{color:red}</style><p>Weekly Fin update &amp; notes</p>"
+            ),
             "Weekly Fin update & notes"
         );
         assert_eq!(
@@ -3787,12 +4314,17 @@ mod tests {
         )
         .expect("seed full-text search");
 
-        let groups = get_thread_groups_from_conn(&conn, None, Some("fin"), Some("account-a"), 1, None)
-            .expect("search body content");
+        let groups =
+            get_thread_groups_from_conn(&conn, None, Some("fin"), Some("account-a"), 1, None)
+                .expect("search body content");
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].latest_email.id, "body-match");
         assert_eq!(groups[0].count, 2);
-        assert!(groups[0].latest_email.snippet.to_lowercase().contains("fin"));
+        assert!(groups[0]
+            .latest_email
+            .snippet
+            .to_lowercase()
+            .contains("fin"));
 
         let cursor = &groups[0].latest_email;
         let next = get_thread_groups_from_conn(
@@ -3866,15 +4398,9 @@ mod tests {
             starred: true,
             ..AdvancedSearchCriteria::default()
         };
-        let results = search_thread_groups_from_conn(
-            &conn,
-            "",
-            Some(&filters),
-            Some("account-a"),
-            20,
-            None,
-        )
-        .expect("run advanced search");
+        let results =
+            search_thread_groups_from_conn(&conn, "", Some(&filters), Some("account-a"), 20, None)
+                .expect("run advanced search");
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].latest_email.id, "match");
@@ -3938,19 +4464,32 @@ mod tests {
                 "SELECT latest_email_id, latest_date, unread_count, message_count, participants
                  FROM thread_summaries WHERE account_id = 'account-a' AND thread_key = 'thread-a'",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .expect("read summary");
         assert_eq!(summary.0, "newer");
         assert_eq!((summary.1, summary.2, summary.3), (20, 1, 2));
         let participants: std::collections::HashSet<&str> = summary.4.split('\u{1f}').collect();
-        assert_eq!(participants, std::collections::HashSet::from(["Alice", "Bob"]));
+        assert_eq!(
+            participants,
+            std::collections::HashSet::from(["Alice", "Bob"])
+        );
 
         conn.execute("DELETE FROM emails WHERE label != 'draft'", [])
             .expect("delete visible messages");
         refresh_thread_summary(&conn, "account-a", "thread-a").expect("remove empty summary");
         let remaining: i64 = conn
-            .query_row("SELECT COUNT(*) FROM thread_summaries", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM thread_summaries", [], |row| {
+                row.get(0)
+            })
             .expect("count summaries");
         assert_eq!(remaining, 0);
     }
@@ -4003,15 +4542,9 @@ mod tests {
         )
         .expect("seed conversation summaries");
 
-        let first = get_thread_groups_from_conn(
-            &conn,
-            Some("inbox"),
-            None,
-            Some("account-a"),
-            2,
-            None,
-        )
-        .expect("load first conversation page");
+        let first =
+            get_thread_groups_from_conn(&conn, Some("inbox"), None, Some("account-a"), 2, None)
+                .expect("load first conversation page");
         assert_eq!(first.len(), 2);
         assert_eq!(first[0].latest_email.id, "t1-new");
         assert_eq!(first[0].count, 2);
@@ -4034,19 +4567,22 @@ mod tests {
             )),
         )
         .expect("load second conversation page");
-        assert_eq!(second.iter().map(|group| group.latest_email.id.as_str()).collect::<Vec<_>>(), ["t3"]);
-
-        let all_mail = get_thread_groups_from_conn(
-            &conn,
-            Some("all"),
-            None,
-            Some("account-a"),
-            20,
-            None,
-        )
-        .expect("load all mail without spam, trash, or drafts");
         assert_eq!(
-            all_mail.iter().map(|group| group.latest_email.id.as_str()).collect::<Vec<_>>(),
+            second
+                .iter()
+                .map(|group| group.latest_email.id.as_str())
+                .collect::<Vec<_>>(),
+            ["t3"]
+        );
+
+        let all_mail =
+            get_thread_groups_from_conn(&conn, Some("all"), None, Some("account-a"), 20, None)
+                .expect("load all mail without spam, trash, or drafts");
+        assert_eq!(
+            all_mail
+                .iter()
+                .map(|group| group.latest_email.id.as_str())
+                .collect::<Vec<_>>(),
             ["sent", "t1-new", "t2", "t3"],
         );
 
@@ -4084,15 +4620,9 @@ mod tests {
         assert_eq!(labeled[0].latest_email.id, "t1-new");
         assert_eq!(labeled[0].label_ids, ["Label_9"]);
 
-        let starred = get_thread_groups_from_conn(
-            &conn,
-            Some("starred"),
-            None,
-            Some("account-a"),
-            10,
-            None,
-        )
-        .expect("filter starred conversations");
+        let starred =
+            get_thread_groups_from_conn(&conn, Some("starred"), None, Some("account-a"), 10, None)
+                .expect("filter starred conversations");
         assert_eq!(starred.len(), 1);
         assert_eq!(starred[0].latest_email.id, "t2");
         assert_eq!(starred[0].label_ids, ["STARRED"]);
@@ -4113,13 +4643,22 @@ mod tests {
 
         let account_a = search_contacts_from_conn(&conn, "example.test", "account-a")
             .expect("search account a contacts");
-        let mut account_a_emails: Vec<&str> = account_a.iter().map(|contact| contact.email.as_str()).collect();
+        let mut account_a_emails: Vec<&str> = account_a
+            .iter()
+            .map(|contact| contact.email.as_str())
+            .collect();
         account_a_emails.sort_unstable();
-        assert_eq!(account_a_emails, ["alice@example.test", "carol@example.test"]);
+        assert_eq!(
+            account_a_emails,
+            ["alice@example.test", "carol@example.test"]
+        );
 
         let account_b = search_contacts_from_conn(&conn, "example.test", "account-b")
             .expect("search account b contacts");
-        let mut account_b_emails: Vec<&str> = account_b.iter().map(|contact| contact.email.as_str()).collect();
+        let mut account_b_emails: Vec<&str> = account_b
+            .iter()
+            .map(|contact| contact.email.as_str())
+            .collect();
         account_b_emails.sort_unstable();
         assert_eq!(account_b_emails, ["bob@example.test", "dave@example.test"]);
     }
@@ -4143,11 +4682,17 @@ mod tests {
         )
         .expect("seed local cache");
 
-        let invalidated = reset_local_mail_cache_from_conn(&mut conn, None)
-            .expect("reset all local cache");
-        assert_eq!(invalidated, vec!["account-a".to_string(), "account-b".to_string()]);
+        let invalidated =
+            reset_local_mail_cache_from_conn(&mut conn, None).expect("reset all local cache");
+        assert_eq!(
+            invalidated,
+            vec!["account-a".to_string(), "account-b".to_string()]
+        );
         for table in ["emails", "attachments", "sync_state", "mailbox_cursors"] {
-            let count: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))
+            let count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
                 .expect("count cleared cache rows");
             assert_eq!(count, 0, "{table} was not cleared");
         }
@@ -4158,7 +4703,10 @@ mod tests {
             .expect("query generations")
             .filter_map(Result::ok)
             .collect();
-        assert_eq!(generations, vec![("account-a".to_string(), 5), ("account-b".to_string(), 10)]);
+        assert_eq!(
+            generations,
+            vec![("account-a".to_string(), 5), ("account-b".to_string(), 10)]
+        );
     }
 
     #[test]
@@ -4181,8 +4729,14 @@ mod tests {
         )
         .expect("seed unread counts");
 
-        assert_eq!(inbox_unread_count_from_conn(&conn, Some("account-a")).unwrap(), 5);
-        assert_eq!(inbox_unread_count_from_conn(&conn, Some("account-b")).unwrap(), 3);
+        assert_eq!(
+            inbox_unread_count_from_conn(&conn, Some("account-a")).unwrap(),
+            5
+        );
+        assert_eq!(
+            inbox_unread_count_from_conn(&conn, Some("account-b")).unwrap(),
+            3
+        );
         assert_eq!(inbox_unread_count_from_conn(&conn, None).unwrap(), 8);
     }
 }

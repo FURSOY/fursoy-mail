@@ -53,10 +53,7 @@ fn get_client_id() -> Result<String, String> {
 }
 
 fn get_client_secret() -> Result<String, String> {
-    read_credential(
-        "GOOGLE_CLIENT_SECRET",
-        option_env!("GOOGLE_CLIENT_SECRET"),
-    )
+    read_credential("GOOGLE_CLIENT_SECRET", option_env!("GOOGLE_CLIENT_SECRET"))
 }
 
 // ── OAuth URL ─────────────────────────────────────────────────────────────────
@@ -222,8 +219,11 @@ pub async fn start_google_oauth(
             let mut request_line = String::new();
             let mut limited_reader =
                 reader.take((MAX_CALLBACK_REQUEST_LINE.saturating_add(1)) as u64);
-            let read_result =
-                timeout(CALLBACK_READ_TIMEOUT, limited_reader.read_line(&mut request_line)).await;
+            let read_result = timeout(
+                CALLBACK_READ_TIMEOUT,
+                limited_reader.read_line(&mut request_line),
+            )
+            .await;
             drop(limited_reader);
 
             if !matches!(read_result, Ok(Ok(bytes)) if bytes > 0)
@@ -231,9 +231,7 @@ pub async fn start_google_oauth(
                 || !request_line.ends_with('\n')
             {
                 let _ = stream
-                    .write_all(
-                        b"HTTP/1.1 414 URI Too Long\r\nConnection: close\r\n\r\n",
-                    )
+                    .write_all(b"HTTP/1.1 414 URI Too Long\r\nConnection: close\r\n\r\n")
                     .await;
                 continue;
             }
@@ -356,7 +354,10 @@ pub async fn start_google_oauth(
         .map_err(|_| "Google kullanici bilgisi istegi basarisiz oldu.".to_string())?;
 
     if !user_res.status().is_success() {
-        return Err(format!("Google kullanıcı bilgisi alınamadı: {}", user_res.status()));
+        return Err(format!(
+            "Google kullanıcı bilgisi alınamadı: {}",
+            user_res.status()
+        ));
     }
     let user_info: UserInfo = user_res
         .json()
@@ -375,7 +376,9 @@ pub async fn start_google_oauth(
         .unwrap_or_default();
     let refresh_token = auth_resp.refresh_token.unwrap_or(existing_refresh);
     if refresh_token.is_empty() {
-        return Err("Google refresh token döndürmedi. Lütfen erişimi yeniden onaylayın.".to_string());
+        return Err(
+            "Google refresh token döndürmedi. Lütfen erişimi yeniden onaylayın.".to_string(),
+        );
     }
     let expires_at = token_expiry(auth_resp.expires_in)?;
 
@@ -448,6 +451,11 @@ async fn refresh_access_token_once(
     app: tauri::AppHandle,
     account_id: &str,
 ) -> Result<crate::db::AuthInfo, String> {
+    if crate::db::get_account_provider(&app, account_id)? == "imap"
+        && crate::db::load_tokens(account_id).is_some()
+    {
+        return crate::mail_oauth::refresh_mail_oauth_token(app, account_id).await;
+    }
     let stored_tokens = crate::db::load_tokens(account_id)
         .ok_or_else(|| "Oturum bilgisi bulunamadı. Lütfen tekrar giriş yapın.".to_string())?;
     let refresh_token = stored_tokens.refresh_token;
@@ -543,6 +551,11 @@ pub async fn remove_account(
     account_id: String,
 ) -> Result<(), String> {
     crate::require_command_window(&window, &["main"])?;
+    if crate::db::get_account_provider(&app, &account_id)? == "imap" {
+        crate::db::remove_account_data(&app, &account_id)?;
+        crate::mail_account::delete_stored_password(&account_id)?;
+        return crate::db::delete_tokens(&account_id);
+    }
     if let Some(tokens) = crate::db::load_tokens(&account_id) {
         let token_to_revoke = if tokens.refresh_token.is_empty() {
             tokens.access_token.as_str()
@@ -669,5 +682,4 @@ mod tests {
         };
         assert!(validate_token_response(&missing_scope, true).is_err());
     }
-
 }

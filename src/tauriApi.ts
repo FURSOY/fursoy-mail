@@ -52,6 +52,36 @@ export interface CustomNotificationInput {
   copyFailedLabel?: string;
 }
 
+export type ImapIdleOutcome = "changed" | "unsupported";
+
+export type MailSecurity = "tls" | "starttls";
+
+export interface ImapAccountInput {
+  email: string;
+  username: string;
+  password: string;
+  imapHost: string;
+  imapPort: number;
+  imapSecurity: MailSecurity;
+  smtpHost: string;
+  smtpPort: number;
+  smtpSecurity: MailSecurity;
+}
+
+export interface MailConnectionReport {
+  imapOk: boolean;
+  smtpOk: boolean;
+  mailboxCount: number;
+}
+
+export type DiscoveredMailProvider = "google" | "microsoft" | "yahoo" | "icloud" | "manual";
+
+export interface ProviderDiscovery {
+  email: string;
+  provider: DiscoveredMailProvider;
+  authType: "oauth" | "app_password" | "manual";
+}
+
 export interface ThreadPageInput {
   label: string;
   accountId: string | null;
@@ -72,6 +102,19 @@ export interface ThreadSearchInput {
 }
 
 export const tauriApi = {
+  discoverMailProvider: (email: string) =>
+    invoke<ProviderDiscovery>("discover_mail_provider", { email }),
+  startMailOAuth: (email: string, provider: DiscoveredMailProvider) =>
+    invoke<AuthInfo>("start_mail_oauth", { email, provider }),
+  cancelMailOAuth: () => invoke<void>("cancel_mail_oauth"),
+  testMailAccount: (input: ImapAccountInput) =>
+    invoke<MailConnectionReport>("test_mail_account", { input }),
+  addMailAccount: (input: ImapAccountInput) =>
+    invoke<Account>("add_mail_account", { input }),
+  syncImapEmails: (accountId: string) =>
+    invoke<void>("sync_imap_emails", { accountId }),
+  waitForImapChange: (accountId: string) =>
+    invoke<ImapIdleOutcome>("wait_for_imap_change", { accountId }),
   getAccounts: () => invoke<Account[]>("get_accounts"),
   getAccountAuth: (accountId: string) =>
     invoke<AuthInfo | null>("get_account_auth", { accountId }),

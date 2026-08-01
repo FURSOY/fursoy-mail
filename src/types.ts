@@ -12,6 +12,7 @@ export interface Account {
   email: string;
   picture: string;
   display_order: number;
+  provider: "imap" | "google";
 }
 
 export interface EmailSummary {
