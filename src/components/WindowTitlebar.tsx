@@ -2,6 +2,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Copy, Minus, Square, X } from "lucide-react";
 import { useLocale } from "../i18n";
 import { surfaces } from "../theme";
+import { ToolbarTip } from "./ToolbarTip";
 
 interface WindowTitlebarProps {
   isMaximized: boolean;
@@ -28,37 +29,37 @@ export function WindowTitlebar({
         <span className="text-[var(--color-text-secondary)]">{tr.app.name}</span>
       </div>
       <div className="flex items-center" style={{ WebkitAppRegion: "no-drag" } as React.CSSProperties}>
-        <button
-          type="button"
-          aria-label={tr.common.minimize}
-          title={tr.common.minimize}
-          onClick={() => getCurrentWindow().minimize()}
-          className="flex h-9 w-11 items-center justify-center text-[var(--color-text-muted)] transition-colors hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-text-secondary)]"
-        >
-          <Minus className="h-4 w-4" />
-        </button>
-        <button
-          type="button"
-          aria-label={isMaximized ? tr.common.restore : tr.common.maximize}
-          title={isMaximized ? tr.common.restore : tr.common.maximize}
-          onClick={async () => {
-            const win = getCurrentWindow();
-            await win.toggleMaximize();
-            onMaximizedChange(await win.isMaximized());
-          }}
-          className="flex h-9 w-11 items-center justify-center text-[var(--color-text-muted)] transition-colors hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-text-secondary)]"
-        >
-          {isMaximized ? <Copy className="h-3.5 w-3.5" /> : <Square className="h-3 w-3" />}
-        </button>
-        <button
-          type="button"
-          aria-label={tr.common.close}
-          title={tr.common.close}
-          onClick={async () => { await getCurrentWindow().hide(); }}
-          className="flex h-9 w-11 items-center justify-center text-[var(--color-text-muted)] transition-colors hover:bg-[var(--color-status-danger)] hover:text-white"
-        >
-          <X className="h-4 w-4" />
-        </button>
+        <ToolbarTip label={tr.common.minimize}>
+          <button
+            type="button"
+            onClick={() => getCurrentWindow().minimize()}
+            className="flex h-9 w-11 items-center justify-center text-[var(--color-text-muted)] transition-colors hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-text-secondary)]"
+          >
+            <Minus className="h-4 w-4" />
+          </button>
+        </ToolbarTip>
+        <ToolbarTip label={isMaximized ? tr.common.restore : tr.common.maximize}>
+          <button
+            type="button"
+            onClick={async () => {
+              const win = getCurrentWindow();
+              await win.toggleMaximize();
+              onMaximizedChange(await win.isMaximized());
+            }}
+            className="flex h-9 w-11 items-center justify-center text-[var(--color-text-muted)] transition-colors hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-text-secondary)]"
+          >
+            {isMaximized ? <Copy className="h-3.5 w-3.5" /> : <Square className="h-3 w-3" />}
+          </button>
+        </ToolbarTip>
+        <ToolbarTip label={tr.common.close}>
+          <button
+            type="button"
+            onClick={async () => { await getCurrentWindow().hide(); }}
+            className="flex h-9 w-11 items-center justify-center text-[var(--color-text-muted)] transition-colors hover:bg-[var(--color-status-danger)] hover:text-white"
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </ToolbarTip>
       </div>
     </div>
   );
