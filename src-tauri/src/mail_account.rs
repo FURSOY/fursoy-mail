@@ -1228,6 +1228,100 @@ fn adopt_mailbox_layout(
     Ok(discovered.roles)
 }
 
+/// How often Gmail's labels are read back from the server. They cannot ride
+/// along with the flags — see `reconcile_gmail_labels` — so they cost their own
+/// round trips, and a few minutes of lag on a label set in another client is a
+/// fair price for not paying them on every pass.
+const GMAIL_LABEL_TTL: Duration = Duration::from_secs(600);
+/// A ceiling on how much one reconcile may cost. Past this many labels the
+/// searches stop being worth their round trips, and the local list keeps
+/// whatever this app itself applied.
+const GMAIL_LABEL_SEARCH_LIMIT: usize = 60;
+
+fn gmail_label_checks() -> &'static Mutex<HashMap<String, Instant>> {
+    static CHECKS: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+    CHECKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn gmail_labels_are_due(account_id: &str) -> bool {
+    gmail_label_checks()
+        .lock()
+        .map(|checks| {
+            checks
+                .get(account_id)
+                .is_none_or(|checked| checked.elapsed() >= GMAIL_LABEL_TTL)
+        })
+        .unwrap_or(true)
+}
+
+fn mark_gmail_labels_checked(account_id: &str) {
+    if let Ok(mut checks) = gmail_label_checks().lock() {
+        checks.insert(account_id.to_string(), Instant::now());
+    }
+}
+
+/// Reads Gmail's label membership back from the server and makes the cache
+/// match it.
+///
+/// It has to be a search. Gmail carries labels in `X-GM-LABELS`, which cannot
+/// be fetched through this crate at all: every reply line is parsed by
+/// `imap-proto`, which has no such attribute and fails the whole command when
+/// one appears — and leaves the rest of the reply in the socket, which breaks
+/// every command after it. `SEARCH X-GM-LABELS "name"` is ordinary IMAP the
+/// parser understands, and Gmail answers it in any mailbox, so membership is
+/// read one label at a time and reconciled for exactly the mailbox it was
+/// searched in.
+fn reconcile_gmail_labels(
+    app: &AppHandle,
+    account_id: &str,
+    session: &mut OAuthImapSession,
+    mailboxes: &[(String, String)],
+) -> Result<(), String> {
+    let labels = crate::db::get_gmail_labels_for_account(app, account_id)?;
+    if labels.is_empty() {
+        return Ok(());
+    }
+    if labels.len() > GMAIL_LABEL_SEARCH_LIMIT {
+        imap_log(|| format!("labels: {} is too many to reconcile", labels.len()));
+        return Ok(());
+    }
+    for (role, mailbox) in mailboxes {
+        let Some(cache_label) = mailbox_label(role, true).map(str::to_string) else {
+            continue;
+        };
+        // Nothing cached here means nothing a search could be reconciled
+        // against, and one count is cheaper than a search per label.
+        if crate::db::count_emails_for_label(app, account_id, &cache_label)? == 0 {
+            continue;
+        }
+        if session.select(mailbox).is_err() {
+            continue;
+        }
+        for label in &labels {
+            let Ok(uids) = session.uid_search(tag_search_query(true, &label.name)) else {
+                // One label that could not be searched leaves its own
+                // membership alone; the rest of the pass is still worth doing.
+                continue;
+            };
+            let member_ids: Vec<String> = uids
+                .into_iter()
+                .map(|uid| format!("imap:{cache_label}:{uid}"))
+                .collect();
+            let changed = crate::db::set_label_membership(
+                app,
+                account_id,
+                &label.id,
+                &cache_label,
+                &member_ids,
+            )?;
+            if changed > 0 {
+                imap_log(|| format!("labels: {changed} message(s) changed in {role}"));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn sync_imap_account_blocking(
     app: &AppHandle,
     account_id: &str,
@@ -1306,6 +1400,15 @@ fn sync_imap_account_blocking(
         if adopt_mailbox_layout(app, account_id, &mut session, gmail_account).is_ok() {
             mark_mailbox_layout_fresh(account_id);
         }
+    }
+    if gmail_account && gmail_labels_are_due(account_id) {
+        // A failed reconcile is not worth failing a sync that already worked,
+        // and the timer holds so the next sync tries again rather than
+        // hammering the server.
+        if let Err(error) = reconcile_gmail_labels(app, account_id, &mut session, &mailboxes) {
+            imap_log(|| format!("labels: reconcile failed ({error})"));
+        }
+        mark_gmail_labels_checked(account_id);
     }
     session.logout().ok();
     Ok(())
@@ -1531,10 +1634,20 @@ fn plan_mailbox_pass(
     // of the answer, never agreement.
     let condstore_usable =
         synced_before && stored.highest_mod_seq != 0 && selected.highest_mod_seq != 0;
-    // An unchanged sequence rules out flag edits too, which the UID checkpoint
-    // alone never could. That is what lets a woken pass end without asking.
+    // An unchanged sequence rules out flag and tag edits too, which the UID
+    // checkpoint alone never could. That is what lets a woken pass end without
+    // asking — and, the other way round, what makes a moved sequence worth a
+    // pass even when nothing woke this one: a message read, starred or
+    // relabelled in another client moves no UID, so a mailbox whose sequence
+    // has advanced is the only sign there is until the reconcile timer, which
+    // on a CONDSTORE server is an hour away.
     let modseq_unchanged = condstore_usable && stored.highest_mod_seq == selected.highest_mod_seq;
-    let nothing_moved = unchanged && (!forced || modseq_unchanged);
+    let nothing_moved = unchanged
+        && if condstore_usable {
+            modseq_unchanged
+        } else {
+            !forced
+        };
     if nothing_moved && !reconcile_due {
         return MailboxPlan::Skip;
     }
@@ -2124,30 +2237,12 @@ fn changed_since_fetch_query(highest_mod_seq: u64) -> String {
     format!("(UID FLAGS) (CHANGEDSINCE {highest_mod_seq})")
 }
 
-/// The same fetch with Gmail's labels asked for alongside the flags. It has to
-/// go out untyped: `imap-proto` has no `X-GM-LABELS` attribute and fails to
-/// parse any FETCH reply carrying one, so the typed API cannot ask for it.
-fn gmail_labels_fetch_query(query: &str) -> String {
-    query.replacen("(UID FLAGS)", "(UID FLAGS X-GM-LABELS)", 1)
-}
-
 fn fetch_uid_flags_with_query(
     session: &mut OAuthImapSession,
     uid_set: &str,
     query: &str,
     gmail_account: bool,
 ) -> Result<Vec<MessageFlagState>, String> {
-    if gmail_account {
-        let command = format!("UID FETCH {uid_set} {}", gmail_labels_fetch_query(query));
-        // A reply this app cannot read must not cost the pass: fall back to the
-        // typed fetch, which returns the same flags without the labels.
-        if let Ok(response) = session.run_command_and_read_response(&command) {
-            if let Some(states) = parse_gmail_flag_reply(&response) {
-                return Ok(states);
-            }
-            imap_log(|| format!("gmail label reply unparsed ({} bytes)", response.len()));
-        }
-    }
     let fetched = session
         .uid_fetch(uid_set, query)
         .map_err(|_| "mail_account_imap_failed".to_string())?;
@@ -2170,140 +2265,14 @@ fn fetch_uid_flags_with_query(
             uid,
             unread,
             starred,
-            // Gmail only reaches this line when its own reply could not be
-            // read, and its keywords are not its labels, so it reports nothing
-            // rather than wiping the tags it does carry.
+            // Gmail's labels are not keywords and never appear in FLAGS, so
+            // this pass reports nothing about them rather than reading an empty
+            // keyword list as "the user cleared every label". They are read
+            // separately, by search (see `reconcile_gmail_labels`).
             tags: (!gmail_account).then(|| tag_names_from_flags(keywords)),
         });
     }
     Ok(entries)
-}
-
-/// Reads `UID`, `FLAGS` and `X-GM-LABELS` out of an untyped FETCH reply.
-/// Returns `None` for anything it does not fully understand, so a reply shape
-/// this parser was not written for falls back to the typed fetch instead of
-/// silently reporting messages as having lost their labels.
-fn parse_gmail_flag_reply(response: &[u8]) -> Option<Vec<MessageFlagState>> {
-    let text = std::str::from_utf8(response).ok()?;
-    let mut states = Vec::new();
-    for line in text.split("\r\n") {
-        let line = line.trim();
-        let Some(rest) = line.strip_prefix('*') else {
-            continue;
-        };
-        // "* 12 FETCH (...)": the sequence number is not what addresses a
-        // message here, the UID inside the reply is.
-        let rest = rest.trim_start();
-        let Some((_, rest)) = rest.split_once(' ') else {
-            continue;
-        };
-        let Some(body) = rest.trim_start().strip_prefix("FETCH ") else {
-            continue;
-        };
-        let body = body
-            .trim()
-            .strip_prefix('(')
-            .and_then(|body| body.strip_suffix(')'))?;
-        states.push(parse_gmail_fetch_body(body)?);
-    }
-    Some(states)
-}
-
-fn parse_gmail_fetch_body(body: &str) -> Option<MessageFlagState> {
-    let mut rest = body;
-    let mut uid = None;
-    let mut flags: Vec<String> = Vec::new();
-    let mut labels: Option<Vec<String>> = None;
-    loop {
-        rest = rest.trim_start_matches(' ');
-        if rest.is_empty() {
-            break;
-        }
-        let (name, next) = read_imap_atom(rest)?;
-        rest = next.trim_start_matches(' ');
-        match name.to_ascii_uppercase().as_str() {
-            "UID" => {
-                let (value, next) = read_imap_atom(rest)?;
-                uid = value.parse::<u32>().ok();
-                rest = next;
-            }
-            "FLAGS" => {
-                let (items, next) = read_imap_list(rest)?;
-                flags = items;
-                rest = next;
-            }
-            "X-GM-LABELS" => {
-                let (items, next) = read_imap_list(rest)?;
-                labels = Some(items);
-                rest = next;
-            }
-            // An attribute this parser has no use for still has to be stepped
-            // over, whatever shape its value has.
-            _ => {
-                let (_, next) = if rest.starts_with('(') {
-                    read_imap_list(rest)?
-                } else {
-                    read_imap_value(rest).map(|(value, next)| (vec![value], next))?
-                };
-                rest = next;
-            }
-        }
-    }
-    Some(MessageFlagState {
-        uid: uid?,
-        unread: !flags.iter().any(|flag| flag.eq_ignore_ascii_case("\\Seen")),
-        starred: flags.iter().any(|flag| flag.eq_ignore_ascii_case("\\Flagged")),
-        tags: labels.map(|items| tag_names_from_flags(items.iter().map(String::as_str))),
-    })
-}
-
-fn read_imap_atom(input: &str) -> Option<(String, &str)> {
-    let end = input.find([' ', '(', ')']).unwrap_or(input.len());
-    (end > 0).then(|| (input[..end].to_string(), &input[end..]))
-}
-
-fn read_imap_quoted(input: &str) -> Option<(String, &str)> {
-    let mut characters = input.char_indices();
-    if characters.next()?.1 != '"' {
-        return None;
-    }
-    let mut value = String::new();
-    let mut escaped = false;
-    for (index, character) in characters {
-        if escaped {
-            value.push(character);
-            escaped = false;
-            continue;
-        }
-        match character {
-            '\\' => escaped = true,
-            '"' => return Some((value, &input[index + character.len_utf8()..])),
-            _ => value.push(character),
-        }
-    }
-    None
-}
-
-fn read_imap_value(input: &str) -> Option<(String, &str)> {
-    if input.starts_with('"') {
-        read_imap_quoted(input)
-    } else {
-        read_imap_atom(input)
-    }
-}
-
-fn read_imap_list(input: &str) -> Option<(Vec<String>, &str)> {
-    let mut rest = input.strip_prefix('(')?;
-    let mut items = Vec::new();
-    loop {
-        rest = rest.trim_start_matches(' ');
-        if let Some(after) = rest.strip_prefix(')') {
-            return Some((items, after));
-        }
-        let (item, next) = read_imap_value(rest)?;
-        items.push(item);
-        rest = next;
-    }
 }
 
 fn imap_remote_ref(message_id: &str) -> Option<(&str, u32)> {
@@ -2352,11 +2321,11 @@ fn uids_by_source_role(
 /// Gmail reads an expunge from All Mail as "delete this conversation" —
 /// restoring a message must never be able to end in the trash.
 fn gmail_unarchive_store_query() -> &'static str {
-    "+X-GM-LABELS (\\Inbox)"
+    "+X-GM-LABELS.SILENT (\\Inbox)"
 }
 
 fn gmail_archive_store_query() -> &'static str {
-    "-X-GM-LABELS (\\Inbox)"
+    "-X-GM-LABELS.SILENT (\\Inbox)"
 }
 
 /// Quotes a label value for use inside an `X-GM-LABELS` STORE/SEARCH term.
@@ -2390,12 +2359,40 @@ fn tag_store_query(gmail_account: bool, tag_name: &str, applied: bool) -> String
     let sign = if applied { "+" } else { "-" };
     if gmail_account {
         format!(
-            "{sign}X-GM-LABELS ({})",
+            "{sign}X-GM-LABELS.SILENT ({})",
             quote_tag_value(&gmail_label_wire_name(tag_name))
         )
     } else {
         format!("{sign}FLAGS.SILENT ({})", sanitize_tag_keyword(tag_name))
     }
+}
+
+/// Runs a STORE and forgives the one failure that is not one: a reply this
+/// crate cannot read. Every line comes back through `imap-proto`, which has no
+/// `X-GM-LABELS` attribute, so the echo Gmail sends after a label change fails
+/// the command even though the change was made — and leaves the rest of the
+/// reply in the socket, which is why the caller must stop using the session.
+/// The stores are asked for silently precisely so this stays unreachable.
+fn store_on_selected(
+    session: &mut OAuthImapSession,
+    uid_set: &str,
+    query: &str,
+) -> Result<StoreOutcome, String> {
+    match session.uid_store(uid_set, query) {
+        Ok(_) => Ok(StoreOutcome::Continue),
+        Err(imap::error::Error::Parse(_)) => {
+            imap_log(|| "store: reply could not be read, ending the session".to_string());
+            Ok(StoreOutcome::SessionSpent)
+        }
+        Err(_) => Err("mail_account_imap_failed".to_string()),
+    }
+}
+
+/// Whether the session may still be used after a store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StoreOutcome {
+    Continue,
+    SessionSpent,
 }
 
 /// The SEARCH term that finds every message currently carrying a tag.
@@ -2830,17 +2827,21 @@ pub async fn move_imap_thread(
                 .collect::<Vec<_>>()
                 .join(",");
             if gmail_account && target_is_archive {
-                session
-                    .uid_store(&uid_set, gmail_archive_store_query())
-                    .map_err(|_| "mail_account_imap_failed".to_string())?;
+                if store_on_selected(&mut session, &uid_set, gmail_archive_store_query())?
+                    == StoreOutcome::SessionSpent
+                {
+                    return Ok(());
+                }
                 continue;
             }
             // Restoring an archived Gmail message is a label change, never a
             // move out of All Mail.
             if gmail_account && target_is_inbox && source_role == "all" {
-                session
-                    .uid_store(&uid_set, gmail_unarchive_store_query())
-                    .map_err(|_| "mail_account_imap_failed".to_string())?;
+                if store_on_selected(&mut session, &uid_set, gmail_unarchive_store_query())?
+                    == StoreOutcome::SessionSpent
+                {
+                    return Ok(());
+                }
                 continue;
             }
             if supports_move {
@@ -2973,9 +2974,9 @@ pub async fn set_imap_message_tag(
                 .map(u32::to_string)
                 .collect::<Vec<_>>()
                 .join(",");
-            session
-                .uid_store(&uid_set, &query)
-                .map_err(|_| "mail_account_imap_failed".to_string())?;
+            if store_on_selected(&mut session, &uid_set, &query)? == StoreOutcome::SessionSpent {
+                return Ok(());
+            }
         }
         session.logout().ok();
         Ok(())
@@ -3212,6 +3213,7 @@ pub async fn rename_tag(
         let server_renames = renames.clone();
         tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
             let mut session = connect_sync_imap(&input, access_token.as_deref())?;
+            let mut server_deletes: Vec<String> = Vec::new();
             for (old_name, new_name) in server_renames {
                 let apply_query = tag_store_query(gmail_account, &new_name, true);
                 let remove_query = tag_store_query(gmail_account, &old_name, false);
@@ -3233,13 +3235,25 @@ pub async fn rename_tag(
                         .map(u32::to_string)
                         .collect::<Vec<_>>()
                         .join(",");
-                    session
-                        .uid_store(&uid_set, &apply_query)
-                        .map_err(|_| "mail_account_imap_failed".to_string())?;
-                    session
-                        .uid_store(&uid_set, &remove_query)
-                        .map_err(|_| "mail_account_imap_failed".to_string())?;
+                    if store_on_selected(&mut session, &uid_set, &apply_query)?
+                        == StoreOutcome::SessionSpent
+                        || store_on_selected(&mut session, &uid_set, &remove_query)?
+                            == StoreOutcome::SessionSpent
+                    {
+                        return Ok(());
+                    }
                 }
+                // Gmail keeps a label alive as an empty mailbox after the last
+                // message loses it, and the layout refresh would read it back
+                // and put the old name in the sidebar again. Children first,
+                // since deleting a parent takes its sub-labels with it.
+                if gmail_account {
+                    server_deletes.push(gmail_label_wire_name(&old_name));
+                }
+            }
+            for mailbox in server_deletes.iter().rev() {
+                // A label that was only ever local has no mailbox to delete.
+                session.delete(mailbox).ok();
             }
             session.logout().ok();
             Ok(())
@@ -3271,7 +3285,7 @@ pub async fn delete_tag(app: &AppHandle, account_id: &str, label_id: &str) -> Re
         let access_token = account_oauth_token(app, account_id).await?;
         let gmail_account = input.imap_host.eq_ignore_ascii_case("imap.gmail.com");
         let mailboxes = crate::db::get_imap_mailboxes(app, account_id)?;
-        let name = existing.name;
+        let name = existing.name.clone();
         tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
             let mut session = connect_sync_imap(&input, access_token.as_deref())?;
             let found = find_tagged_messages(&mut session, &mailboxes, gmail_account, &name)?;
@@ -3285,15 +3299,31 @@ pub async fn delete_tag(app: &AppHandle, account_id: &str, label_id: &str) -> Re
                     .map(u32::to_string)
                     .collect::<Vec<_>>()
                     .join(",");
-                session
-                    .uid_store(&uid_set, &remove_query)
-                    .map_err(|_| "mail_account_imap_failed".to_string())?;
+                if store_on_selected(&mut session, &uid_set, &remove_query)?
+                    == StoreOutcome::SessionSpent
+                {
+                    return Ok(());
+                }
+            }
+            // On Gmail a label outlives the messages that carried it, as an
+            // empty mailbox the next layout refresh would list and put straight
+            // back in the sidebar. Deleting a label there deletes no mail.
+            if gmail_account {
+                session.delete(&gmail_label_wire_name(&name)).ok();
             }
             session.logout().ok();
             Ok(())
         })
         .await
         .map_err(|_| "mail_account_test_interrupted".to_string())??;
+    }
+    // Gmail deletes a label's sub-labels with it, and a tag whose parent is
+    // gone reads as a stray either way, so the local list follows.
+    let child_prefix = format!("{}/", existing.name);
+    for child in crate::db::get_gmail_labels_for_account(app, account_id)? {
+        if child.name.starts_with(&child_prefix) {
+            crate::db::delete_gmail_label_local(app, account_id, &child.id)?;
+        }
     }
     crate::db::delete_gmail_label_local(app, account_id, label_id)
 }
@@ -3871,8 +3901,7 @@ mod tests {
         changed_since_fetch_query, decode_text_part, fallback_mailbox_role,
         gmail_archive_store_query, gmail_unarchive_store_query, imap_auth_failed_code,
         imap_remote_ref, imap_watchers, is_gmail_system_view, mailbox_idle_active, mailbox_label,
-        mailbox_role_for_label, normalize_tag_name, parse_gmail_flag_reply, tag_names_from_flags,
-        uids_by_source_role,
+        mailbox_role_for_label, normalize_tag_name, tag_names_from_flags, uids_by_source_role,
         message_layout, message_to_email, parse_selected_mailbox, plan_mailbox_pass,
         quote_mailbox, quote_tag_value, resolve_mailbox_role, sanitize_tag_keyword,
         should_skip_sync, stop_imap_watcher, strip_bcc_header, tag_search_query, tag_store_query,
@@ -3906,18 +3935,18 @@ mod tests {
 
     #[test]
     fn gmail_archive_removes_the_inbox_label() {
-        assert_eq!(gmail_archive_store_query(), "-X-GM-LABELS (\\Inbox)");
+        assert_eq!(gmail_archive_store_query(), "-X-GM-LABELS.SILENT (\\Inbox)");
     }
 
     #[test]
     fn a_gmail_tag_stores_and_searches_through_x_gm_labels() {
         assert_eq!(
             tag_store_query(true, "Projects/Q1", true),
-            "+X-GM-LABELS (\"Projects/Q1\")"
+            "+X-GM-LABELS.SILENT (\"Projects/Q1\")"
         );
         assert_eq!(
             tag_store_query(true, "Projects/Q1", false),
-            "-X-GM-LABELS (\"Projects/Q1\")"
+            "-X-GM-LABELS.SILENT (\"Projects/Q1\")"
         );
         assert_eq!(
             tag_search_query(true, "Projects/Q1"),
@@ -4078,6 +4107,20 @@ mod tests {
             &condstore_reported(100, 50, 405),
             false,
             true,
+            false,
+        );
+        assert_eq!(decision, MailboxPlan::ChangedSince);
+    }
+
+    #[test]
+    fn a_sequence_that_moved_is_read_even_without_a_wake() {
+        // A label or a flag changed in another client: no UID moved, nothing
+        // woke this pass, and only the modification sequence says so.
+        let decision = plan_mailbox_pass(
+            &condstore_state(),
+            &condstore_reported(100, 50, 405),
+            false,
+            false,
             false,
         );
         assert_eq!(decision, MailboxPlan::ChangedSince);
@@ -4392,59 +4435,6 @@ mod tests {
     }
 
     #[test]
-    fn reads_uid_flags_and_labels_out_of_a_gmail_reply() {
-        let reply = concat!(
-            "* 1 FETCH (UID 11 FLAGS (\\Seen) X-GM-LABELS (\\Important \"Work\" \"Projects/Q1\"))\r\n",
-            "* 2 FETCH (UID 12 FLAGS (\\Flagged) X-GM-LABELS ())\r\n",
-            "A004 OK Success\r\n"
-        );
-        let states = parse_gmail_flag_reply(reply.as_bytes()).expect("parse gmail reply");
-        assert_eq!(states.len(), 2);
-        assert_eq!(states[0].uid, 11);
-        assert!(!states[0].unread);
-        // Gmail's own label-flags are mailboxes and states, not user tags.
-        assert_eq!(
-            states[0].tags,
-            Some(vec!["Projects/Q1".to_string(), "Work".to_string()])
-        );
-        assert_eq!(states[1].uid, 12);
-        assert!(states[1].unread);
-        assert!(states[1].starred);
-        assert_eq!(states[1].tags, Some(Vec::new()));
-    }
-
-    #[test]
-    fn a_condstore_reply_keeps_its_labels_readable() {
-        // A CHANGEDSINCE fetch comes back with MODSEQ alongside what was
-        // asked for, and the order of the attributes is the server's choice.
-        let reply = concat!(
-            "* 4 FETCH (X-GM-LABELS (\"Fatura\") UID 88 MODSEQ (90210) FLAGS (\\Seen))\r\n",
-            "A7 OK Success\r\n"
-        );
-        let states = parse_gmail_flag_reply(reply.as_bytes()).expect("parse condstore reply");
-        assert_eq!(states.len(), 1);
-        assert_eq!(states[0].uid, 88);
-        assert!(!states[0].unread);
-        assert_eq!(states[0].tags, Some(vec!["Fatura".to_string()]));
-    }
-
-    #[test]
-    fn a_gmail_label_arrives_decoded_from_modified_utf7() {
-        let reply = "* 1 FETCH (UID 7 FLAGS () X-GM-LABELS (\"&AZ4-nemli\"))\r\nA1 OK\r\n";
-        let states = parse_gmail_flag_reply(reply.as_bytes()).expect("parse gmail reply");
-        assert_eq!(states[0].tags, Some(vec![crate::mutf7::decode("&AZ4-nemli")]));
-    }
-
-    #[test]
-    fn a_reply_shape_the_parser_does_not_know_falls_back_instead_of_losing_tags() {
-        // A literal is a shape this parser deliberately does not handle: the
-        // caller has to see None and ask again with the typed fetch, rather
-        // than being told these messages carry no labels at all.
-        let reply = "* 1 FETCH (UID 5 X-GM-LABELS ({7}\r\nZahmet))\r\nA1 OK\r\n";
-        assert!(parse_gmail_flag_reply(reply.as_bytes()).is_none());
-    }
-
-    #[test]
     fn only_user_keywords_become_tags() {
         let flags = ["\\Seen", "\\Important", "$Forwarded", "Work", "Fatura"];
         assert_eq!(
@@ -4533,7 +4523,7 @@ mod tests {
     fn restoring_a_gmail_archive_puts_the_inbox_label_back() {
         assert_eq!(
             gmail_unarchive_store_query(),
-            "+X-GM-LABELS (\\Inbox)"
+            "+X-GM-LABELS.SILENT (\\Inbox)"
         );
     }
 

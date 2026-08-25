@@ -69,22 +69,24 @@ export function LabelChips({
   );
 }
 
-export function LabelPicker({
+/**
+ * The list itself: search, the labels with their applied state, and the row
+ * that creates one under a chosen parent. It is rendered in place by
+ * `LabelPicker` and through a portal by the mail list, so the two cannot drift
+ * apart in behaviour or in looks.
+ */
+export function LabelMenu({
   labels,
   labelIds,
-  disabled,
   onToggle,
   onCreate,
 }: {
   labels: GmailLabel[];
   labelIds: string[];
-  disabled?: boolean;
   onToggle: (labelId: string, applied: boolean) => Promise<void>;
   onCreate: (name: string) => Promise<GmailLabel | null>;
 }) {
   const tr = useLocale();
-  const rootRef = useRef<HTMLDivElement>(null);
-  const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
   const [creating, setCreating] = useState(false);
   const [choosingCreateLocation, setChoosingCreateLocation] = useState(false);
@@ -94,25 +96,14 @@ export function LabelPicker({
     return normalized ? labels.filter(label => label.name.toLocaleLowerCase().includes(normalized)) : labels;
   }, [labels, query]);
 
-  useEffect(() => {
-    if (!open) return;
-    const close = (event: MouseEvent) => {
-      if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
-    };
-    const escape = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setOpen(false);
-    };
-    document.addEventListener("mousedown", close);
-    document.addEventListener("keydown", escape);
-    return () => {
-      document.removeEventListener("mousedown", close);
-      document.removeEventListener("keydown", escape);
-    };
-  }, [open]);
-
-  useEffect(() => {
-    if (!open) setChoosingCreateLocation(false);
-  }, [open]);
+  const toggleLabel = async (labelId: string, applied: boolean) => {
+    setPendingId(labelId);
+    try {
+      await onToggle(labelId, applied);
+    } finally {
+      setPendingId(null);
+    }
+  };
 
   const createLabel = async (parentName: string | null = null) => {
     const leafName = query.trim();
@@ -132,6 +123,150 @@ export function LabelPicker({
   };
 
   return (
+    <>
+      <div className="flex items-center gap-2 border-b border-white/5 px-3 py-2">
+        <Search className="h-3.5 w-3.5 text-zinc-600" />
+        <input
+          autoFocus
+          value={query}
+          onChange={event => {
+            setQuery(event.target.value);
+            setChoosingCreateLocation(false);
+          }}
+          onKeyDown={event => {
+            if (event.key !== "Enter") return;
+            // Enter on a name that already exists means "use that one", not
+            // "make a second one and fail on the duplicate".
+            const existing = labels.find(label =>
+              label.name.toLocaleLowerCase() === query.trim().toLocaleLowerCase());
+            if (existing) {
+              void toggleLabel(existing.id, !labelIds.includes(existing.id));
+              return;
+            }
+            void createLabel(null);
+          }}
+          placeholder={tr.labels.search}
+          aria-label={tr.labels.search}
+          className="min-w-0 flex-1 bg-transparent text-xs text-zinc-200 outline-none placeholder:text-zinc-600"
+        />
+      </div>
+      <div className="label-scrollbar max-h-64 overflow-y-auto p-1.5">
+        {choosingCreateLocation ? (
+          <>
+            <div className="mb-1 flex items-center gap-1 border-b border-white/5 pb-1">
+              <button
+                type="button"
+                aria-label={tr.common.back}
+                onClick={() => setChoosingCreateLocation(false)}
+                className="flex h-7 w-7 items-center justify-center rounded-md text-zinc-500 hover:bg-white/5 hover:text-zinc-200"
+              >
+                <ChevronLeft className="h-3.5 w-3.5" />
+              </button>
+              <span className="min-w-0 flex-1 truncate text-xs font-medium text-zinc-300">{tr.labels.chooseLocation}</span>
+            </div>
+            <button
+              type="button"
+              disabled={creating}
+              onClick={() => void createLabel(null)}
+              className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs text-zinc-300 hover:bg-white/5 disabled:opacity-50"
+            >
+              <span className="h-2.5 w-2.5 shrink-0 rounded-full bg-zinc-600" />
+              <span className="truncate">{tr.labels.topLevel}</span>
+            </button>
+            {labels.map(parent => {
+              const targetName = nestedLabelName(parent.name, query.trim());
+              const duplicate = labels.some(label => label.name.toLocaleLowerCase() === targetName.toLocaleLowerCase());
+              return (
+                <button
+                  key={parent.id}
+                  type="button"
+                  disabled={creating || duplicate}
+                  title={parent.name}
+                  onClick={() => void createLabel(parent.name)}
+                  className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs text-zinc-300 hover:bg-white/5 disabled:opacity-35"
+                >
+                  <span
+                    className="h-2.5 w-2.5 shrink-0 rounded-full"
+                    style={{ backgroundColor: safeColor(parent.background_color, "#71717a") }}
+                  />
+                  <span className="min-w-0 flex-1 truncate">{parent.name}</span>
+                </button>
+              );
+            })}
+          </>
+        ) : filtered.map(label => {
+          const applied = labelIds.includes(label.id);
+          return (
+            <button
+              key={label.id}
+              type="button"
+              disabled={pendingId === label.id}
+              onClick={() => void toggleLabel(label.id, !applied)}
+              className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs text-zinc-300 hover:bg-white/5 disabled:opacity-50"
+            >
+              <span
+                className="h-2.5 w-2.5 shrink-0 rounded-full"
+                style={{ backgroundColor: safeColor(label.background_color, "#71717a") }}
+              />
+              <span className="min-w-0 flex-1 truncate">{label.name}</span>
+              {applied && <Check className="h-3.5 w-3.5 text-[var(--app-accent)]" />}
+            </button>
+          );
+        })}
+        {!choosingCreateLocation && filtered.length === 0 && !query.trim() && (
+          <div className="px-2 py-3 text-center text-xs text-zinc-600">{tr.labels.none}</div>
+        )}
+      </div>
+      {!choosingCreateLocation && query.trim() && !labels.some(label => label.name.toLocaleLowerCase() === query.trim().toLocaleLowerCase()) && (
+        <button
+          type="button"
+          disabled={creating}
+          onClick={() => setChoosingCreateLocation(true)}
+          className="flex w-full items-center gap-2 border-t border-white/5 px-3 py-2 text-left text-xs text-[var(--app-accent)] hover:bg-white/5 disabled:opacity-50"
+        >
+          <Plus className="h-3.5 w-3.5" />
+          <span className="truncate">{tr.labels.createNamed.replace("{name}", query.trim())}</span>
+        </button>
+      )}
+    </>
+  );
+}
+
+/** The popover shell around `LabelMenu` for a toolbar button. */
+export function LabelPicker({
+  labels,
+  labelIds,
+  disabled,
+  onToggle,
+  onCreate,
+}: {
+  labels: GmailLabel[];
+  labelIds: string[];
+  disabled?: boolean;
+  onToggle: (labelId: string, applied: boolean) => Promise<void>;
+  onCreate: (name: string) => Promise<GmailLabel | null>;
+}) {
+  const tr = useLocale();
+  const rootRef = useRef<HTMLDivElement>(null);
+  const [open, setOpen] = useState(false);
+
+  useEffect(() => {
+    if (!open) return;
+    const close = (event: MouseEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
+    };
+    const escape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    document.addEventListener("mousedown", close);
+    document.addEventListener("keydown", escape);
+    return () => {
+      document.removeEventListener("mousedown", close);
+      document.removeEventListener("keydown", escape);
+    };
+  }, [open]);
+
+  return (
     <div ref={rootRef} className="relative inline-flex items-center">
       <ToolbarTip label={tr.labels.manage}>
         <button
@@ -146,115 +281,7 @@ export function LabelPicker({
       </ToolbarTip>
       {open && (
         <div className="absolute right-0 top-full z-[120] mt-1 w-64 overflow-hidden rounded-lg border border-white/10 bg-[var(--color-surface-popover)] shadow-2xl">
-          <div className="flex items-center gap-2 border-b border-white/5 px-3 py-2">
-            <Search className="h-3.5 w-3.5 text-zinc-600" />
-            <input
-              autoFocus
-              value={query}
-              onChange={event => {
-                setQuery(event.target.value);
-                setChoosingCreateLocation(false);
-              }}
-              onKeyDown={event => {
-                if (event.key !== "Enter") return;
-                // Enter on a name that already exists means "use that one",
-                // not "make a second one and fail on the duplicate".
-                const existing = labels.find(label =>
-                  label.name.toLocaleLowerCase() === query.trim().toLocaleLowerCase());
-                if (existing) {
-                  setPendingId(existing.id);
-                  void onToggle(existing.id, !labelIds.includes(existing.id))
-                    .finally(() => setPendingId(null));
-                  return;
-                }
-                void createLabel(null);
-              }}
-              placeholder={tr.labels.search}
-              aria-label={tr.labels.search}
-              className="min-w-0 flex-1 bg-transparent text-xs text-zinc-200 outline-none placeholder:text-zinc-600"
-            />
-          </div>
-          <div className="max-h-64 overflow-y-auto p-1.5">
-            {choosingCreateLocation ? (
-              <>
-                <div className="mb-1 flex items-center gap-1 border-b border-white/5 pb-1">
-                  <button
-                    type="button"
-                    aria-label={tr.common.back}
-                    onClick={() => setChoosingCreateLocation(false)}
-                    className="flex h-7 w-7 items-center justify-center rounded-md text-zinc-500 hover:bg-white/5 hover:text-zinc-200"
-                  >
-                    <ChevronLeft className="h-3.5 w-3.5" />
-                  </button>
-                  <span className="min-w-0 flex-1 truncate text-xs font-medium text-zinc-300">{tr.labels.chooseLocation}</span>
-                </div>
-                <button
-                  type="button"
-                  disabled={creating}
-                  onClick={() => void createLabel(null)}
-                  className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs text-zinc-300 hover:bg-white/5 disabled:opacity-50"
-                >
-                  <span className="h-2.5 w-2.5 shrink-0 rounded-full bg-zinc-600" />
-                  <span className="truncate">{tr.labels.topLevel}</span>
-                </button>
-                {labels.map(parent => {
-                  const targetName = nestedLabelName(parent.name, query.trim());
-                  const duplicate = labels.some(label => label.name.toLocaleLowerCase() === targetName.toLocaleLowerCase());
-                  return (
-                    <button
-                      key={parent.id}
-                      type="button"
-                      disabled={creating || duplicate}
-                      title={parent.name}
-                      onClick={() => void createLabel(parent.name)}
-                      className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs text-zinc-300 hover:bg-white/5 disabled:opacity-35"
-                    >
-                      <span
-                        className="h-2.5 w-2.5 shrink-0 rounded-full"
-                        style={{ backgroundColor: safeColor(parent.background_color, "#71717a") }}
-                      />
-                      <span className="min-w-0 flex-1 truncate">{parent.name}</span>
-                    </button>
-                  );
-                })}
-              </>
-            ) : filtered.map(label => {
-              const applied = labelIds.includes(label.id);
-              return (
-                <button
-                  key={label.id}
-                  type="button"
-                  disabled={pendingId === label.id}
-                  onClick={async () => {
-                    setPendingId(label.id);
-                    try { await onToggle(label.id, !applied); } finally { setPendingId(null); }
-                  }}
-                  className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs text-zinc-300 hover:bg-white/5 disabled:opacity-50"
-                >
-                  <span
-                    className="h-2.5 w-2.5 shrink-0 rounded-full"
-                    style={{ backgroundColor: safeColor(label.background_color, "#71717a") }}
-                  />
-                  <span className="min-w-0 flex-1 truncate">{label.name}</span>
-                  {applied && <Check className="h-3.5 w-3.5 text-[var(--app-accent)]" />}
-                </button>
-              );
-            })}
-            {!choosingCreateLocation && filtered.length === 0 && !query.trim() && (
-              <div className="px-2 py-3 text-center text-xs text-zinc-600">{tr.labels.none}</div>
-            )}
-          </div>
-          {!choosingCreateLocation && query.trim() && !labels.some(label => label.name.toLocaleLowerCase() === query.trim().toLocaleLowerCase()) && (
-            <button
-              type="button"
-              disabled={creating}
-              onClick={() => setChoosingCreateLocation(true)}
-              className="flex w-full items-center gap-2 border-t border-white/5 px-3 py-2 text-left text-xs text-[var(--app-accent)] hover:bg-white/5 disabled:opacity-50"
-            >
-              <Plus className="h-3.5 w-3.5" />
-              <span className="truncate">{tr.labels.createNamed.replace("{name}", query.trim())}</span>
-            </button>
-          )}
+          <LabelMenu labels={labels} labelIds={labelIds} onToggle={onToggle} onCreate={onCreate} />
         </div>
       )}
     </div>

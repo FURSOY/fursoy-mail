@@ -8,6 +8,10 @@ import type { Account, AppControls, EmailSummary, OtpMode } from "../types";
 import { tauriApi, type ImapChangeEvent } from "../tauriApi";
 import { extractVerificationCode, isAuthFailure, isInQuietHours, isMailListTab, isSessionRevoked, MAIL_PAGE_SIZE } from "../utils";
 
+/// How long a refresh the user pressed stays visibly running, even when the
+/// work itself was instant.
+const MIN_SYNC_FEEDBACK_MS = 600;
+
 interface SyncOptions {
   userInitiated?: boolean;
   suppressNotifications?: boolean;
@@ -99,6 +103,7 @@ export function useMailSync(options: UseMailSyncOptions) {
   const backgroundSyncFlightRef = useRef<Promise<boolean> | null>(null);
   const pendingSyncAccountIdsRef = useRef<Set<string>>(new Set());
   const pendingFullSyncRef = useRef(false);
+  const pendingUserSyncRef = useRef(false);
   // Accounts become watchable only once their credential is loaded, which
   // happens after the account list is published. Keying the watcher effect on
   // the account list alone would start it while no account had a token yet and
@@ -328,6 +333,7 @@ export function useMailSync(options: UseMailSyncOptions) {
       return false;
     }
 
+    const startedAt = Date.now();
     try {
       if (userInitiated) setIsUserSyncing(true);
       else setIsBackgroundSyncing(true);
@@ -362,8 +368,18 @@ export function useMailSync(options: UseMailSyncOptions) {
       showToast(`${locale.messages.syncFailedDetail}: ${error instanceof Error ? error.message : String(error)}`, "error");
       return false;
     } finally {
-      if (userInitiated) setIsUserSyncing(false);
-      else setIsBackgroundSyncing(false);
+      if (userInitiated) {
+        // A sync that answers from its checkpoint can finish in a few
+        // milliseconds, which reads as a button that did nothing. Hold the
+        // spinner long enough to be seen.
+        const elapsed = Date.now() - startedAt;
+        if (elapsed < MIN_SYNC_FEEDBACK_MS) {
+          await new Promise(resolve => setTimeout(resolve, MIN_SYNC_FEEDBACK_MS - elapsed));
+        }
+        setIsUserSyncing(false);
+      } else {
+        setIsBackgroundSyncing(false);
+      }
     }
   }, [
     accountsRef, accountTokensRef, appControlsRef, expiredAccountsRef, locale,
@@ -382,7 +398,16 @@ export function useMailSync(options: UseMailSyncOptions) {
       } else {
         pendingFullSyncRef.current = true;
       }
-      return existing;
+      if (!syncOptions?.userInitiated) return existing;
+      // A refresh the user asked for cannot start while another pass owns the
+      // connection, so it waits — but the button has to say so immediately, and
+      // the queued pass has to be the forced one they actually asked for.
+      // Without this, pressing refresh during a background sync looked like
+      // nothing happened at all.
+      pendingFullSyncRef.current = true;
+      pendingUserSyncRef.current = true;
+      setIsUserSyncing(true);
+      return existing.catch(() => false).finally(() => setIsUserSyncing(false));
     }
 
     const flight = runBackgroundSync(syncOptions);
@@ -395,7 +420,9 @@ export function useMailSync(options: UseMailSyncOptions) {
         pendingFullSyncRef.current = false;
         pendingSyncAccountIdsRef.current.clear();
         if (runAll || accountIds.length > 0) {
-          void backgroundSync(runAll ? undefined : { accountIds });
+          const userInitiated = pendingUserSyncRef.current;
+          pendingUserSyncRef.current = false;
+          void backgroundSync(runAll ? { userInitiated } : { accountIds, userInitiated });
         }
       }
     };

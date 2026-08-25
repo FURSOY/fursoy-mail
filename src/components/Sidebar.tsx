@@ -356,8 +356,11 @@ export function Sidebar({
             <span className="min-w-0 flex-1 truncate text-left">{tr.labels.title}</span>
             <ChevronDown className={`h-3.5 w-3.5 shrink-0 text-zinc-600 transition-transform ${labelsOpen ? "rotate-0" : "-rotate-90"}`} />
           </button>
+          {/* The nav is inset by its own padding: a scroll box that stops at the
+              content edge leaves the bar floating short of the sidebar, so the
+              box is pulled out and the padding put back inside it. */}
           {labelsOpen && (
-            <div className="label-scrollbar max-h-[188px] space-y-0.5 overflow-y-auto pr-0.5">
+            <div className="label-scrollbar -mr-2 max-h-[188px] space-y-0.5 overflow-y-auto pr-2">
               {activeAccountId === null ? (
                 <div className="px-3 pb-2 text-[10px] leading-4 text-zinc-600">{tr.labels.chooseAccount}</div>
               ) : labelRows.length > 0 ? (

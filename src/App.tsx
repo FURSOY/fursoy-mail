@@ -1474,7 +1474,7 @@ function App() {
       const currentToken = getTokenForEmail(mail);
       if (!currentToken) return false;
 
-      if (action === "unread") recentlyReadRef.current.delete(emailKey(mail));
+      if (action.kind === "unread") recentlyReadRef.current.delete(emailKey(mail));
 
       try {
         await enqueueMailMutation(
@@ -1490,20 +1490,24 @@ function App() {
             markAccountExpired,
             action: () => {
               const targetId = mail.thread_id || mail.id;
-              switch (action) {
+              switch (action.kind) {
                 case "archive": return tauriApi.archiveEmail(mail.account_id, targetId);
                 case "inbox": return tauriApi.moveToInbox(mail.account_id, targetId);
                 case "read": return tauriApi.markThreadAsRead(mail.account_id, targetId);
                 case "unread": return tauriApi.markAsUnread(mail.account_id, targetId);
                 case "spam": return tauriApi.reportSpam(mail.account_id, targetId);
                 case "trash": return tauriApi.trashEmail(mail.account_id, targetId);
+                case "label":
+                  return tauriApi.setThreadGmailLabel(mail.account_id, targetId, action.labelId, action.applied);
+                case "folder":
+                  return tauriApi.moveToMailbox(mail.account_id, targetId, action.role);
               }
             },
           }),
         );
         return true;
       } catch (error) {
-        console.error(`Bulk mail action failed (${action}):`, error);
+        console.error(`Bulk mail action failed (${action.kind}):`, error);
         return false;
       }
     };
@@ -1877,6 +1881,8 @@ function App() {
               activeAccountId={activeAccountId}
               gmailLabelsByAccount={gmailLabelsByAccount}
               customMailboxesByAccount={customMailboxesByAccount}
+              onToggleThreadLabel={handleSetThreadGmailLabel}
+              onCreateGmailLabel={handleCreateGmailLabel}
             />
             {activeMail ? (
               <EmailReader

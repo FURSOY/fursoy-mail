@@ -1,14 +1,16 @@
 import {
   Archive, Check, Inbox, Mail, MailOpen, Menu, PanelLeft, RefreshCw,
-  Rows3, Search, Settings, ShieldAlert, SlidersHorizontal, Star, Trash2, X, Columns2,
+  Rows3, Search, Settings, ShieldAlert, SlidersHorizontal, Star, Tag, Trash2, X, Columns2,
 } from "lucide-react";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { useLocale } from "../i18n";
 import type { Account, EmailSummary, GmailLabel, ThreadGroup, MailViewPreference, CustomMailbox } from "../types";
 import { formatDate, splitSearchHighlight } from "../utils";
 import { ToolbarTip } from "./ToolbarTip";
-import { LabelChips } from "./MailLabels";
+import { LabelChips, LabelMenu, LabelPicker } from "./MailLabels";
+import { FolderPicker } from "./FolderPicker";
 import { ProfileAvatar } from "./ProfileAvatar";
 import { AdvancedSearchPanel } from "./AdvancedSearchPanel";
 import type { AdvancedSearchCriteria } from "../advancedSearch";
@@ -53,9 +55,14 @@ interface EmailListProps {
   activeAccountId?: string | null;
   gmailLabelsByAccount: Record<string, GmailLabel[]>;
   customMailboxesByAccount: Record<string, CustomMailbox[]>;
+  onToggleThreadLabel: (mail: EmailSummary, labelId: string, applied: boolean) => Promise<void>;
+  onCreateGmailLabel: (accountId: string, name: string) => Promise<GmailLabel | null>;
 }
 
-export type BulkMailAction = "archive" | "inbox" | "read" | "unread" | "spam" | "trash";
+export type BulkMailAction =
+  | { kind: "archive" | "inbox" | "read" | "unread" | "spam" | "trash" }
+  | { kind: "label"; labelId: string; applied: boolean }
+  | { kind: "folder"; role: string };
 
 function HighlightedText({ text, query }: { text: string; query: string }) {
   return <>{splitSearchHighlight(text, query).map((segment, index) => segment.match
@@ -109,6 +116,7 @@ export function EmailList({
   mailViewPreference, onViewPreferenceChange,
   onRefresh, onLoadMore, hasMoreEmails, isLoadingMoreEmails, isMailListLoading, mailAppendVersion, notificationFocusVersion, isMailboxBackfilling, mailboxDownloadPending, mailboxDownloadState, accessToken,
   accounts, activeAccountId, gmailLabelsByAccount, customMailboxesByAccount,
+  onToggleThreadLabel, onCreateGmailLabel,
 }: EmailListProps) {
   const tr = useLocale();
   const activeGmailLabelId = activeTab.startsWith("gmail:") ? activeTab.slice(6) : null;
@@ -141,6 +149,12 @@ export function EmailList({
   const [bulkActionPending, setBulkActionPending] = useState(false);
   const [selectionMenuOpen, setSelectionMenuOpen] = useState(false);
   const [advancedSearchOpen, setAdvancedSearchOpen] = useState(false);
+  // The row menu is portalled: the list scrolls, so a popover positioned inside
+  // it would be clipped at the edges and would drift while the list moves.
+  const [rowLabelMenu, setRowLabelMenu] = useState<
+    { mail: EmailSummary; labelIds: string[]; left: number; top: number } | null
+  >(null);
+  const rowLabelMenuRef = useRef<HTMLDivElement>(null);
   const selectionMode = selectedMailKeys.size > 0;
   const loadedMailKeys = threadGroups.map(group => `${group.latestEmail.account_id}\u0000${group.latestEmail.id}`);
   const allLoadedSelected = loadedMailKeys.length > 0 && loadedMailKeys.every(key => selectedMailKeys.has(key));
@@ -150,6 +164,18 @@ export function EmailList({
   const selectedMails = selectedGroups.map(group => group.latestEmail);
   const allSelectedRead = selectedGroups.length > 0 && selectedGroups.every(group => !group.hasUnread);
   const allSelectedUnread = selectedGroups.length > 0 && selectedGroups.every(group => group.hasUnread);
+  // Labels and folders belong to one account, so they are offered only while
+  // the selection stays inside one — which is always true unless the combined
+  // view is open.
+  const selectionAccountId = selectedMails.length > 0
+    && selectedMails.every(mail => mail.account_id === selectedMails[0].account_id)
+    ? selectedMails[0].account_id
+    : null;
+  // A tick means every selected conversation already carries it, which is also
+  // what decides whether clicking applies or removes.
+  const sharedLabelIds = selectedGroups.length === 0 ? [] : selectedGroups
+    .map(group => group.labelIds)
+    .reduce((shared, labelIds) => shared.filter(id => labelIds.includes(id)));
 
   const clearSelection = () => setSelectedMailKeys(new Set());
 
@@ -177,7 +203,10 @@ export function EmailList({
     setBulkActionPending(true);
     try {
       await onBulkAction(action, selectedMails);
-      if (action !== "read" && action !== "unread") clearSelection();
+      // Only an action that takes the mail out of this list ends the selection.
+      // Reading, and tagging, leave it where it is, and the next tag is usually
+      // meant for the same messages.
+      if (!["read", "unread", "label"].includes(action.kind)) clearSelection();
     } finally {
       setBulkActionPending(false);
     }
@@ -186,7 +215,30 @@ export function EmailList({
   useEffect(() => {
     clearSelection();
     setSelectionMenuOpen(false);
+    setRowLabelMenu(null);
   }, [activeTab, activeAccountId]);
+
+  useEffect(() => {
+    if (!rowLabelMenu) return;
+    const close = (event: MouseEvent) => {
+      if (!rowLabelMenuRef.current?.contains(event.target as Node)) setRowLabelMenu(null);
+    };
+    const escape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setRowLabelMenu(null);
+    };
+    // The anchor moves with the list, so the menu closes rather than following.
+    const dismiss = () => setRowLabelMenu(null);
+    document.addEventListener("mousedown", close);
+    document.addEventListener("keydown", escape);
+    listRef.current?.addEventListener("scroll", dismiss);
+    window.addEventListener("resize", dismiss);
+    return () => {
+      document.removeEventListener("mousedown", close);
+      document.removeEventListener("keydown", escape);
+      listRef.current?.removeEventListener("scroll", dismiss);
+      window.removeEventListener("resize", dismiss);
+    };
+  }, [rowLabelMenu]);
 
   useEffect(() => {
     const visible = new Set(loadedMailKeys);
@@ -337,13 +389,19 @@ export function EmailList({
             ))}
           </div>
           <ToolbarTip label={tr.mail.forceRefresh}>
+            {/* While it is syncing the button is disabled, and the shared
+                disabled style dimmed the spinner to almost nothing — so the
+                dimming is left to the case it is meant for: no account to
+                refresh. The press itself is felt through the scale. */}
             <button
               type="button"
               onClick={onRefresh}
               disabled={isUserSyncing || !accessToken}
-              className="p-1.5 rounded-md hover:bg-white/10 text-zinc-500 transition-all disabled:opacity-20"
+              className={`rounded-md p-1.5 transition-all hover:bg-white/10 active:scale-90 ${
+                isUserSyncing ? "text-blue-500" : "text-zinc-500 disabled:opacity-20"
+              }`}
             >
-              <RefreshCw className={`w-3.5 h-3.5 ${isUserSyncing ? "animate-spin text-blue-500" : ""}`} />
+              <RefreshCw className={`w-3.5 h-3.5 ${isUserSyncing ? "animate-spin" : ""}`} />
             </button>
           </ToolbarTip>
         </div>
@@ -458,33 +516,50 @@ export function EmailList({
             {tr.mail.selectedCount.replace("{count}", String(selectedMailKeys.size))}
           </span>
           <div className="flex shrink-0 items-center gap-0.5">
+            {selectionAccountId && (
+              <LabelPicker
+                labels={gmailLabelsByAccount[selectionAccountId] ?? []}
+                labelIds={sharedLabelIds}
+                disabled={bulkActionPending}
+                onToggle={(labelId, applied) => runBulkAction({ kind: "label", labelId, applied })}
+                onCreate={name => onCreateGmailLabel(selectionAccountId, name)}
+              />
+            )}
+            {selectionAccountId && (customMailboxesByAccount[selectionAccountId]?.length ?? 0) > 0 && (
+              <FolderPicker
+                mailboxes={customMailboxesByAccount[selectionAccountId] ?? []}
+                currentRole={activeTab}
+                disabled={bulkActionPending}
+                onMove={mailbox => runBulkAction({ kind: "folder", role: mailbox.role })}
+              />
+            )}
             {(activeTab === "inbox" || activeTab === "sent") && (
-              <BulkActionButton label={tr.actions.archive} disabled={bulkActionPending} onClick={() => void runBulkAction("archive")}>
+              <BulkActionButton label={tr.actions.archive} disabled={bulkActionPending} onClick={() => void runBulkAction({ kind: "archive" })}>
                 <Archive className="h-3.5 w-3.5" />
               </BulkActionButton>
             )}
             {(activeTab === "archive" || activeTab === "spam" || activeTab === "trash") && (
-              <BulkActionButton label={activeTab === "spam" ? tr.actions.notSpam : tr.actions.restoreInbox} disabled={bulkActionPending} onClick={() => void runBulkAction("inbox")} hoverClassName="hover:text-emerald-400">
+              <BulkActionButton label={activeTab === "spam" ? tr.actions.notSpam : tr.actions.restoreInbox} disabled={bulkActionPending} onClick={() => void runBulkAction({ kind: "inbox" })} hoverClassName="hover:text-emerald-400">
                 <Inbox className="h-3.5 w-3.5" />
               </BulkActionButton>
             )}
             {!allSelectedRead && (
-              <BulkActionButton label={tr.actions.markAsRead} disabled={bulkActionPending} onClick={() => void runBulkAction("read")}>
+              <BulkActionButton label={tr.actions.markAsRead} disabled={bulkActionPending} onClick={() => void runBulkAction({ kind: "read" })}>
                 <MailOpen className="h-3.5 w-3.5" />
               </BulkActionButton>
             )}
             {!allSelectedUnread && (
-              <BulkActionButton label={tr.actions.markAsUnread} disabled={bulkActionPending} onClick={() => void runBulkAction("unread")}>
+              <BulkActionButton label={tr.actions.markAsUnread} disabled={bulkActionPending} onClick={() => void runBulkAction({ kind: "unread" })}>
                 <Mail className="h-3.5 w-3.5" />
               </BulkActionButton>
             )}
             {(activeTab === "inbox" || activeTab === "archive") && (
-              <BulkActionButton label={tr.actions.reportSpam} disabled={bulkActionPending} onClick={() => void runBulkAction("spam")} hoverClassName="hover:text-orange-400">
+              <BulkActionButton label={tr.actions.reportSpam} disabled={bulkActionPending} onClick={() => void runBulkAction({ kind: "spam" })} hoverClassName="hover:text-orange-400">
                 <ShieldAlert className="h-3.5 w-3.5" />
               </BulkActionButton>
             )}
             {activeTab !== "trash" && (
-              <BulkActionButton label={tr.actions.moveTrash} disabled={bulkActionPending} onClick={() => void runBulkAction("trash")} hoverClassName="hover:text-red-400">
+              <BulkActionButton label={tr.actions.moveTrash} disabled={bulkActionPending} onClick={() => void runBulkAction({ kind: "trash" })} hoverClassName="hover:text-red-400">
                 <Trash2 className="h-3.5 w-3.5" />
               </BulkActionButton>
             )}
@@ -583,6 +658,30 @@ export function EmailList({
                     }`}
                   >
                     <Star className={`h-3.5 w-3.5 ${isStarred ? "fill-current" : ""}`} />
+                  </button>
+                </ToolbarTip>
+                <ToolbarTip label={tr.labels.manage}>
+                  <button
+                    type="button"
+                    aria-haspopup="menu"
+                    aria-expanded={rowLabelMenu?.mail.id === mail.id
+                      && rowLabelMenu?.mail.account_id === mail.account_id}
+                    onClick={event => {
+                      const anchor = event.currentTarget.getBoundingClientRect();
+                      setRowLabelMenu(current => current?.mail.id === mail.id && current.mail.account_id === mail.account_id
+                        ? null
+                        : {
+                          mail,
+                          labelIds: group.labelIds,
+                          // Enough room for the menu below the button, and for
+                          // its own width to the right of it.
+                          left: Math.min(anchor.left, window.innerWidth - 272),
+                          top: Math.min(anchor.bottom + 4, window.innerHeight - 320),
+                        });
+                    }}
+                    className="flex h-4 w-4 items-center justify-center rounded-sm text-zinc-600 transition-colors hover:text-[var(--app-accent)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--app-accent)]"
+                  >
+                    <Tag className="h-3.5 w-3.5" />
                   </button>
                 </ToolbarTip>
               </div>
@@ -684,6 +783,33 @@ export function EmailList({
           </div>
         )}
       </div>
+      {rowLabelMenu && createPortal(
+        <div
+          ref={rowLabelMenuRef}
+          role="menu"
+          aria-label={tr.labels.manage}
+          style={{ left: rowLabelMenu.left, top: rowLabelMenu.top }}
+          className="fixed z-[220] w-64 overflow-hidden rounded-lg border border-white/10 bg-[var(--color-surface-popover)] shadow-2xl"
+        >
+          <LabelMenu
+            labels={gmailLabelsByAccount[rowLabelMenu.mail.account_id] ?? []}
+            labelIds={rowLabelMenu.labelIds}
+            onToggle={async (labelId, applied) => {
+              await onToggleThreadLabel(rowLabelMenu.mail, labelId, applied);
+              // The list rebuilds from the cache after the change, so the menu
+              // keeps its own copy of what the conversation now carries.
+              setRowLabelMenu(current => current && {
+                ...current,
+                labelIds: applied
+                  ? [...current.labelIds, labelId]
+                  : current.labelIds.filter(id => id !== labelId),
+              });
+            }}
+            onCreate={name => onCreateGmailLabel(rowLabelMenu.mail.account_id, name)}
+          />
+        </div>,
+        document.body,
+      )}
     </section>
   );
 }

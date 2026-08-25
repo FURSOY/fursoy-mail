@@ -3274,6 +3274,83 @@ pub fn get_gmail_labels_for_account(
     Ok(labels)
 }
 
+/// Makes one label's membership match exactly what the server reported for one
+/// cached mailbox. The mailbox scope is the point: a search only ever answers
+/// for the mailbox it ran in, so a message cached elsewhere must not lose a
+/// label because this particular search could not see it.
+///
+/// Returns how many cached messages changed.
+pub fn set_label_membership(
+    app: &AppHandle,
+    account_id: &str,
+    label_id: &str,
+    mail_label: &str,
+    member_ids: &[String],
+) -> Result<usize, String> {
+    let db_path = get_db_path(app);
+    let mut conn = Connection::open(db_path).map_err(database_error)?;
+    set_label_membership_from_conn(&mut conn, account_id, label_id, mail_label, member_ids)
+}
+
+fn set_label_membership_from_conn(
+    conn: &mut Connection,
+    account_id: &str,
+    label_id: &str,
+    mail_label: &str,
+    member_ids: &[String],
+) -> Result<usize, String> {
+    let tx = conn.transaction().map_err(database_error)?;
+    let mut changed = 0usize;
+    {
+        let cached: std::collections::HashSet<String> = tx
+            .prepare(
+                "SELECT el.email_id FROM email_labels el
+                 JOIN emails e ON e.account_id = el.account_id AND e.id = el.email_id
+                 WHERE el.account_id = ?1 AND el.label_id = ?2 AND e.label = ?3",
+            )
+            .map_err(database_error)?
+            .query_map(params![account_id, label_id, mail_label], |row| row.get(0))
+            .map_err(database_error)?
+            .filter_map(Result::ok)
+            .collect();
+        let reported: std::collections::HashSet<&String> = member_ids.iter().collect();
+
+        let mut add = tx
+            .prepare(
+                "INSERT OR IGNORE INTO email_labels (account_id, email_id, label_id)
+                 SELECT ?1, ?2, ?3
+                 WHERE EXISTS (
+                     SELECT 1 FROM emails WHERE account_id = ?1 AND id = ?2 AND label = ?4
+                 )",
+            )
+            .map_err(database_error)?;
+        let mut remove = tx
+            .prepare(
+                "DELETE FROM email_labels
+                 WHERE account_id = ?1 AND email_id = ?2 AND label_id = ?3",
+            )
+            .map_err(database_error)?;
+        for email_id in member_ids {
+            if cached.contains(email_id) {
+                continue;
+            }
+            // A UID the server reports but this cache has not downloaded yet is
+            // not an error: the message arrives with the label already on it.
+            changed += add
+                .execute(params![account_id, email_id, label_id, mail_label])
+                .map_err(database_error)?;
+        }
+        for email_id in cached.iter().filter(|id| !reported.contains(id)) {
+            remove
+                .execute(params![account_id, email_id, label_id])
+                .map_err(database_error)?;
+            changed += 1;
+        }
+    }
+    tx.commit().map_err(database_error)?;
+    Ok(changed)
+}
+
 pub fn set_thread_gmail_label_local(
     app: &AppHandle,
     account_id: &str,
@@ -3997,6 +4074,7 @@ mod tests {
                 account_id TEXT NOT NULL,
                 thread_key TEXT NOT NULL,
                 unread INTEGER NOT NULL,
+                label TEXT NOT NULL DEFAULT 'inbox',
                 PRIMARY KEY (account_id, id)
             );
             CREATE TABLE email_labels (
@@ -4218,6 +4296,38 @@ mod tests {
             (false, true)
         );
         assert!(read_tags(&conn, "account-a", "imap:inbox:2").is_empty());
+    }
+
+    #[test]
+    fn label_membership_follows_one_mailbox_at_a_time() {
+        let mut conn = seed_flag_state_database();
+        conn.execute_batch(
+            "INSERT INTO emails (id, account_id, thread_key, unread, label) VALUES
+                 ('imap:archive:5', 'account-a', 'thread-5', 0, 'archive');
+             INSERT INTO gmail_labels (account_id, id, name) VALUES
+                 ('account-a', 'Work', 'Work');
+             INSERT INTO email_labels (account_id, email_id, label_id) VALUES
+                 ('account-a', 'imap:inbox:1', 'Work'),
+                 ('account-a', 'imap:archive:5', 'Work');",
+        )
+        .expect("seed label membership");
+
+        // The inbox search reports message 2 only: message 1 lost the label,
+        // message 2 gained it, and the archived message is none of its business.
+        let changed = set_label_membership_from_conn(
+            &mut conn,
+            "account-a",
+            "Work",
+            "inbox",
+            &["imap:inbox:2".to_string()],
+        )
+        .expect("apply membership");
+
+        assert_eq!(changed, 2);
+        assert_eq!(read_tags(&conn, "account-a", "imap:inbox:1"), Vec::<String>::new());
+        assert_eq!(read_tags(&conn, "account-a", "imap:inbox:2"), vec!["Work".to_string()]);
+        // Cached under another label, so this search could not have seen it.
+        assert_eq!(read_tags(&conn, "account-a", "imap:archive:5"), vec!["Work".to_string()]);
     }
 
     #[test]
