@@ -1,5 +1,9 @@
 use serde::{Deserialize, Serialize};
-use std::{fs, path::PathBuf, sync::Mutex};
+use std::{
+    fs,
+    path::PathBuf,
+    sync::{Mutex, OnceLock},
+};
 use tauri::{AppHandle, Manager};
 
 #[cfg(target_os = "windows")]
@@ -172,26 +176,50 @@ fn controls_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(dir.join(APP_CONTROLS_FILE))
 }
 
+/// The settings live in one small file that is read on every sync pass, every
+/// watcher cycle and every notification. Parsing it each time is pure waste:
+/// this process is the only writer, so what it last wrote is what the file
+/// says.
+fn controls_cache() -> &'static Mutex<Option<AppControls>> {
+    static CACHE: OnceLock<Mutex<Option<AppControls>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+fn remember_app_controls(controls: &AppControls) {
+    if let Ok(mut cache) = controls_cache().lock() {
+        *cache = Some(controls.clone());
+    }
+}
+
 pub fn read_app_controls(app: &AppHandle) -> AppControls {
+    if let Some(controls) = controls_cache().lock().ok().and_then(|cache| cache.clone()) {
+        return controls;
+    }
     let Ok(path) = controls_path(app) else {
         return AppControls::default();
     };
     let Ok(text) = fs::read_to_string(path) else {
-        return AppControls::default();
+        let defaults = AppControls::default();
+        remember_app_controls(&defaults);
+        return defaults;
     };
     let mut controls: AppControls = serde_json::from_str(&text).unwrap_or_default();
     if controls.legacy_notifications_muted {
         controls.notification_mode = "off".into();
         controls.legacy_notifications_muted = false;
     }
-    normalize_app_controls(controls)
+    let controls = normalize_app_controls(controls);
+    remember_app_controls(&controls);
+    controls
 }
 
 pub fn write_app_controls(app: &AppHandle, controls: &AppControls) -> Result<(), String> {
     let path = controls_path(app)?;
     let json = serde_json::to_string_pretty(controls).map_err(|e| e.to_string())?;
     crate::safe_fs::atomic_write(&path, json.as_bytes())
-        .map_err(|e| format!("Ayarlar kaydedilemedi: {e}"))
+        .map_err(|e| format!("Ayarlar kaydedilemedi: {e}"))?;
+    remember_app_controls(controls);
+    Ok(())
 }
 
 #[tauri::command]

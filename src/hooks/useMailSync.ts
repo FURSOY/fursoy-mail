@@ -2,11 +2,42 @@ import { useCallback, useEffect, useRef, useState, useTransition, type MutableRe
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { AppLocale, AppLanguage } from "../i18n";
-import { updateNotificationBaseline } from "../mailSyncState";
+import {
+  countMissedMail, emailCacheKey, latestInboxDates, updateNotificationBaseline,
+} from "../mailSyncState";
 import { syncIntervalDelayMs } from "../syncInterval";
 import type { Account, AppControls, EmailSummary, OtpMode } from "../types";
 import { tauriApi, type ImapChangeEvent } from "../tauriApi";
-import { extractVerificationCode, isAuthFailure, isInQuietHours, isMailListTab, isSessionRevoked, MAIL_PAGE_SIZE } from "../utils";
+import { extractVerificationCode, isAuthFailure, isInQuietHours, isMailListTab, isSessionRevoked } from "../utils";
+
+/// Where the newest mail this app has already accounted for is remembered, so
+/// a run can tell what arrived while it was not running.
+const LAST_NOTIFIED_STORAGE_KEY = "mailLastNotifiedDates";
+
+function readLastNotifiedDates(): Record<string, number> {
+  try {
+    const stored = JSON.parse(localStorage.getItem(LAST_NOTIFIED_STORAGE_KEY) ?? "{}");
+    if (!stored || typeof stored !== "object") return {};
+    return Object.fromEntries(
+      Object.entries(stored as Record<string, unknown>)
+        .filter((entry): entry is [string, number] => typeof entry[1] === "number"),
+    );
+  } catch {
+    return {};
+  }
+}
+
+function writeLastNotifiedDates(dates: Record<string, number>): void {
+  try {
+    localStorage.setItem(LAST_NOTIFIED_STORAGE_KEY, JSON.stringify(dates));
+  } catch {
+    // A full or unavailable store only costs the catch-up summary.
+  }
+}
+
+/// How long watcher events are collected before the cache is published. Short
+/// enough to still read as instant, long enough that a burst costs one pass.
+const WATCHER_PUBLISH_DELAY_MS = 400;
 
 /// How long a refresh the user pressed stays visibly running, even when the
 /// work itself was instant.
@@ -39,14 +70,16 @@ interface UseMailSyncOptions {
   notificationReadyAccountIdsRef: MutableRefObject<Set<string>>;
   notificationBaselineEpochRef: MutableRefObject<number>;
   pendingUnreadBadgeDeltasRef: MutableRefObject<Map<string, { delta: number; expiresAt: number }>>;
-  emailsLength: number;
   syncIntervalSeconds: number;
   notificationDuration: number;
   notificationInfinite: boolean;
   otpMode: OtpMode;
   appLanguage: AppLanguage;
   locale: AppLocale;
-  loadEmails: () => Promise<EmailSummary[]>;
+  loadEmails: (options?: { merge?: boolean }) => Promise<EmailSummary[]>;
+  /// Reloads the conversation the reader has open when one of these accounts
+  /// changed, so a reply arriving in it appears without reselecting the thread.
+  refreshOpenThread: (accountIds: Set<string>) => void;
   shouldDeferNetwork: (userInitiated?: boolean) => Promise<boolean>;
   refreshAccessToken: (accountId: string) => Promise<{ authenticated: boolean }>;
   upsertToken: (accountId: string, accessToken: string) => void;
@@ -86,9 +119,9 @@ export function useMailSync(options: UseMailSyncOptions) {
     activeAccountIdRef, expiredAccountsRef, tokenExpiredRef, appControlsRef, activeTabRef,
     syncIntervalRef, syncChainIdRef, backgroundSyncRef, recentNotificationsRef,
     knownEmailIdsRef, notificationReadyAccountIdsRef, notificationBaselineEpochRef,
-    pendingUnreadBadgeDeltasRef, emailsLength, syncIntervalSeconds,
+    pendingUnreadBadgeDeltasRef, syncIntervalSeconds,
     notificationDuration, notificationInfinite, otpMode, appLanguage, locale,
-    loadEmails, shouldDeferNetwork, refreshAccessToken, upsertToken,
+    loadEmails, refreshOpenThread, shouldDeferNetwork, refreshAccessToken, upsertToken,
     clearExpiredAccount, setSessionExpired, markAccountExpired,
     markSessionExpired, showToast,
   } = options;
@@ -104,6 +137,7 @@ export function useMailSync(options: UseMailSyncOptions) {
   const pendingSyncAccountIdsRef = useRef<Set<string>>(new Set());
   const pendingFullSyncRef = useRef(false);
   const pendingUserSyncRef = useRef(false);
+  const quietHoursHeldRef = useRef(0);
   // Accounts become watchable only once their credential is loaded, which
   // happens after the account list is published. Keying the watcher effect on
   // the account list alone would start it while no account had a token yet and
@@ -191,17 +225,51 @@ export function useMailSync(options: UseMailSyncOptions) {
         if (pending.expiresAt <= now) pendingUnreadBadgeDeltasRef.current.delete(id);
         else if (accountId === null || accountId === id) pendingDelta += pending.delta;
       }
-      startDataTransition(() => setInboxUnread(Math.max(0, count + pendingDelta)));
+      const unread = Math.max(0, count + pendingDelta);
+      startDataTransition(() => setInboxUnread(unread));
+      // Once the window is hidden the tray is all that is left on screen, so it
+      // carries whether anything is waiting and how much.
+      void tauriApi.setUnreadIndicator(
+        unread,
+        unread > 0
+          ? locale.messages.unreadWaiting.replace("{count}", String(unread))
+          : locale.app.name,
+      ).catch(() => {});
       return count;
     } catch {
       return 0;
     }
-  }, [activeAccountIdRef, pendingUnreadBadgeDeltasRef]);
+  }, [activeAccountIdRef, locale, pendingUnreadBadgeDeltasRef]);
 
-  const notifyNewEmails = useCallback(async (newEmails: EmailSummary[]) => {
-    if (newEmails.length === 0) return;
+  /// One notification for mail the user was never told about individually:
+  /// what a fullscreen app, quiet hours, or a closed application swallowed, and
+  /// the tail of a burst too long to announce one message at a time.
+  const notifySummary = useCallback(async (count: number, kind: "missed" | "more") => {
+    if (count <= 0) return;
+    const template = kind === "more" ? locale.messages.moreNewMail : locale.messages.unreadWaiting;
+    await tauriApi.showCustomNotification({
+      title: locale.messages.newMailTitle,
+      body: template.replace("{count}", String(count)),
+      kind: "summary",
+      duration: notificationInfiniteRef.current ? 0 : notificationDurationRef.current * 1000,
+      multiAccount: accountsRef.current.length > 1,
+      dismissAllLabel: locale.common.dismissAll,
+    }).catch(error => console.error("Summary notification failed:", error));
+  }, [accountsRef, locale]);
+
+  const notifyNewEmails = useCallback(async (newEmails: EmailSummary[], missedCount = 0) => {
     const controls = appControlsRef.current;
-    if (controls.notificationMode === "off" || isInQuietHours(controls)) return;
+    if (controls.notificationMode === "off") return;
+    if (isInQuietHours(controls)) {
+      // Quiet hours silence the announcement, not the arrival: what came in is
+      // counted so it can be summed up once the quiet ends.
+      quietHoursHeldRef.current += newEmails.length + missedCount;
+      return;
+    }
+    const held = quietHoursHeldRef.current + missedCount;
+    quietHoursHeldRef.current = 0;
+    await notifySummary(held, "missed");
+    if (newEmails.length === 0) return;
     try {
       for (const email of newEmails.slice(0, 5)) {
         const senderName = email.sender.split("<")[0].replace(/"/g, "").trim() || email.sender;
@@ -212,11 +280,12 @@ export function useMailSync(options: UseMailSyncOptions) {
         const title = senderName.slice(0, 64);
         const notificationBody = (email.subject || email.snippet || "").trim().slice(0, 100) || locale.messages.newMessage;
         const notificationKey = title + notificationBody;
-        const previous = recentNotificationsRef.current[notificationKey];
-        recentNotificationsRef.current[notificationKey] = previous &&
-          (previous.accountId !== email.account_id || previous.messageId !== email.id)
-          ? null
-          : { accountId: email.account_id, messageId: email.id };
+        // Two mails can share a title and a body, and the platform hands only
+        // those back when its own notification is clicked. Keeping the newest
+        // opens the right one far more often than keeping neither, which is
+        // what made such a notification do nothing at all.
+        recentNotificationsRef.current[notificationKey] =
+          { accountId: email.account_id, messageId: email.id };
         const notificationKeys = Object.keys(recentNotificationsRef.current);
         while (notificationKeys.length > 100) {
           const oldest = notificationKeys.shift();
@@ -241,7 +310,9 @@ export function useMailSync(options: UseMailSyncOptions) {
     } catch (error) {
       console.error("Notification error:", error);
     }
-  }, [accountsRef, appControlsRef, appLanguage, locale, otpMode, recentNotificationsRef]);
+    // A burst longer than the wall of popups anybody wants: the rest is a count.
+    await notifySummary(newEmails.length - 5, "more");
+  }, [accountsRef, appControlsRef, appLanguage, locale, notifySummary, otpMode, recentNotificationsRef]);
 
   const clearPeriodicSync = useCallback(() => {
     syncChainIdRef.current += 1;
@@ -282,15 +353,22 @@ export function useMailSync(options: UseMailSyncOptions) {
     suppressNotifications: boolean,
   ) => {
     const readyAccountIds = notificationReadyAccountIdsRef.current;
-    const establishesBaseline = [...changedAccountIds]
-      .some(accountId => !readyAccountIds.has(accountId));
-    // The first successful sync builds a broad local baseline. Later ones read
-    // only the normal first page and merge it into the known-id set.
-    const freshInbox = await tauriApi.getEmailsByLabel({
-      label: "inbox",
-      accountId: null,
-      limit: establishesBaseline ? 5_000 : undefined,
-    });
+    // Accounts this run has not notified for yet: their unread mail may have
+    // arrived while the application was closed, which nothing else reports.
+    const firstRoundAccountIds = new Set(
+      [...changedAccountIds].filter(accountId => !readyAccountIds.has(accountId)),
+    );
+    // The first successful sync has to know every message the inbox already
+    // holds, or all of it would read as new. That takes ids and nothing else:
+    // reading it as full summaries put megabytes of subjects and snippets
+    // through the bridge before the window was even usable.
+    if (firstRoundAccountIds.size > 0) {
+      const known = await tauriApi.getInboxEmailKeys(null).catch(() => []);
+      for (const key of known) {
+        knownEmailIdsRef.current.add(emailCacheKey({ account_id: key.accountId, id: key.id }));
+      }
+    }
+    const freshInbox = await tauriApi.getEmailsByLabel({ label: "inbox", accountId: null });
     const newUnreadEmails = updateNotificationBaseline({
       freshInbox,
       knownEmailIds: knownEmailIdsRef.current,
@@ -298,16 +376,24 @@ export function useMailSync(options: UseMailSyncOptions) {
       successfullySyncedAccountIds: changedAccountIds,
       suppressNotifications,
     });
-    await notifyNewEmails(newUnreadEmails);
+    const lastSeen = readLastNotifiedDates();
+    const missed = suppressNotifications
+      ? 0
+      : countMissedMail(freshInbox, firstRoundAccountIds, lastSeen);
+    writeLastNotifiedDates({ ...lastSeen, ...latestInboxDates(freshInbox) });
+    await notifyNewEmails(newUnreadEmails, missed);
     // A custom folder and a label tab each have their own list, and the
     // watcher that just wrote to the cache is often watching exactly one of
     // them. Refreshing only the fixed tabs is what left those lists stale
-    // until the user switched away and back.
-    if (isMailListTab(activeTabRef.current) && emailsLength <= MAIL_PAGE_SIZE) await loadEmails();
+    // until the user switched away and back. Merging keeps the pages already
+    // scrolled into: a list that had been paged through used to stop updating
+    // altogether rather than lose them.
+    if (isMailListTab(activeTabRef.current)) await loadEmails({ merge: true });
+    refreshOpenThread(changedAccountIds);
     await refreshUnreadCount();
   }, [
-    activeTabRef, emailsLength, knownEmailIdsRef, loadEmails,
-    notificationReadyAccountIdsRef, notifyNewEmails, refreshUnreadCount,
+    activeTabRef, knownEmailIdsRef, loadEmails, notificationReadyAccountIdsRef,
+    notifyNewEmails, refreshOpenThread, refreshUnreadCount,
   ]);
 
   const runBackgroundSync = useCallback(async (syncOptions?: SyncOptions): Promise<boolean> => {
@@ -458,12 +544,27 @@ export function useMailSync(options: UseMailSyncOptions) {
   // The watcher has already written the change to the cache, so this only has
   // to publish it: no sync, no second connection to the server.
   useEffect(() => {
+    // Several mailboxes, or several accounts, can report a change in the same
+    // second. Each publish re-reads a page of the inbox and the unread count,
+    // so the events are collected into one pass instead of one each.
+    let timer: number | null = null;
+    const changed = new Set<string>();
     const unlistenPromise = listen<ImapChangeEvent>("imap-mailbox-changed", event => {
       const accountId = event.payload.accountId;
       if (!accountId) return;
-      void publishCacheChanges(new Set([accountId]), false);
+      changed.add(accountId);
+      if (timer !== null) return;
+      timer = window.setTimeout(() => {
+        timer = null;
+        const accountIds = new Set(changed);
+        changed.clear();
+        void publishCacheChanges(accountIds, false);
+      }, WATCHER_PUBLISH_DELAY_MS);
     });
-    return () => { void unlistenPromise.then(unlisten => unlisten()); };
+    return () => {
+      if (timer !== null) window.clearTimeout(timer);
+      void unlistenPromise.then(unlisten => unlisten());
+    };
   }, [publishCacheChanges]);
 
   // The watcher is the only thing still talking to the server while the window

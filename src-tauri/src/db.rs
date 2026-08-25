@@ -2883,6 +2883,56 @@ pub fn get_thread_groups_by_label(
     .map_err(database_error)
 }
 
+/// Just enough of a message to recognise it again. The notification baseline
+/// needs every id the inbox already holds and nothing else: reading them as
+/// full summaries meant megabytes of subjects and snippets crossing the bridge
+/// on the first sync of every account.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EmailKey {
+    pub account_id: String,
+    pub id: String,
+}
+
+#[tauri::command]
+pub fn get_inbox_email_keys(
+    window: tauri::WebviewWindow,
+    app: tauri::AppHandle,
+    account_id: Option<String>,
+    limit: Option<u32>,
+) -> Result<Vec<EmailKey>, String> {
+    crate::require_command_window(&window, &["main"])?;
+    let db_path = get_db_path(&app);
+    let conn = Connection::open(db_path).map_err(database_error)?;
+    let limit = i64::from(limit.unwrap_or(5_000).clamp(1, 20_000));
+    let read = |sql: &str, params: &[&dyn rusqlite::ToSql]| -> Result<Vec<EmailKey>, String> {
+        let mut statement = conn.prepare(sql).map_err(database_error)?;
+        let rows = statement
+            .query_map(params, |row| {
+                Ok(EmailKey {
+                    account_id: row.get(0)?,
+                    id: row.get(1)?,
+                })
+            })
+            .map_err(database_error)?;
+        Ok(rows.filter_map(Result::ok).collect())
+    };
+    match account_id {
+        Some(account_id) => read(
+            "SELECT account_id, id FROM emails
+             WHERE label = 'inbox' AND account_id = ?1
+             ORDER BY date DESC LIMIT ?2",
+            &[&account_id, &limit],
+        ),
+        None => read(
+            "SELECT account_id, id FROM emails
+             WHERE label = 'inbox' AND account_id != ''
+             ORDER BY date DESC LIMIT ?1",
+            &[&limit],
+        ),
+    }
+}
+
 #[tauri::command]
 pub fn get_local_emails(
     window: tauri::WebviewWindow,

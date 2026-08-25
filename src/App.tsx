@@ -22,7 +22,7 @@ import {
   type RemoteImageMode, type CustomMailbox, type GmailLabel, DEFAULT_APP_CONTROLS,
 } from "./types";
 import {
-  STARTUP_NETWORK_DELAY_MS,
+  MAIL_WAKE_THROTTLE_MS, STARTUP_NETWORK_DELAY_MS,
   MAX_MAIL_LIST_CACHE_ENTRIES, MAIL_PAGE_SIZE, ZOOM_STEPS,
   isMailListTab, isSessionRevoked, extractVerificationCode,
   readMailZoom, readThemePreset, getAutoMailViewMode, parseMailtoUrl,
@@ -77,6 +77,19 @@ function emailKey(email: EmailSummary): string {
 function threadKey(group: ThreadGroup): string {
   const email = group.latestEmail;
   return `${email.account_id}\u0000${email.thread_id || email.id}`;
+}
+
+/// Puts a freshly read first page back at the top without throwing away the
+/// pages the user already scrolled into. Anything older than the refreshed page
+/// is still theirs to look at; anything inside it comes from the new read, so a
+/// thread that moved or disappeared does not survive as a duplicate.
+function mergeRefreshedPage(fresh: ThreadGroup[], loaded: ThreadGroup[]): ThreadGroup[] {
+  if (fresh.length === 0 || loaded.length <= fresh.length) return fresh;
+  const freshKeys = new Set(fresh.map(threadKey));
+  const oldestFresh = fresh[fresh.length - 1].latestEmail.date;
+  const tail = loaded.filter(group =>
+    !freshKeys.has(threadKey(group)) && group.latestEmail.date < oldestFresh);
+  return [...fresh, ...tail];
 }
 
 function updateGroupLabel(group: ThreadGroup, mail: EmailSummary, labelId: string, applied: boolean): ThreadGroup {
@@ -397,6 +410,11 @@ function App() {
     shouldDeferNetwork: shouldDeferNetworkForGameMode,
   });
 
+  // The notification listener is registered once, so it reaches the current
+  // open handler through a ref rather than closing over the first render's.
+  const openMailFromListRef = useRef<(mail: EmailSummary) => Promise<void>>(async () => {});
+  const activeMailRef = useRef<EmailSummary | null>(null);
+
   useEffect(() => {
     const updateScrollTimers = new Set<number>();
     const openNotificationMail = async (messageId: string, accountId?: string) => {
@@ -411,10 +429,15 @@ function App() {
       startTabTransition(() => setActiveTab("inbox"));
       setSelectedMail(mailKey(accountId, messageId));
       setNotificationFocusVersion(version => version + 1);
-      await loadEmails("inbox");
+      const loaded = await loadEmails("inbox");
       await getCurrentWindow().show();
       await getCurrentWindow().unminimize();
       await getCurrentWindow().setFocus();
+      // Opening from a notification is opening the mail, so it has to go
+      // through the same handler a click in the list does — selecting it alone
+      // left the message unread, on the server as well as in the list.
+      const opened = loaded.find(mail => emailKey(mail) === mailKey(accountId, messageId));
+      if (opened) await openMailFromListRef.current(opened);
     };
 
     const unlistenCustomPromise = listen<{ emailId?: string; accountId?: string }>("open-notification-mail", async (event) => {
@@ -459,7 +482,10 @@ function App() {
   const mailCacheKey = (label: string, accountId: string | null) =>
     `${accountId ?? "__all_accounts__"}\u0000${label}`;
 
-  const loadEmails = async (tab?: string, options?: { append?: boolean; cursor?: ThreadGroup | null }) => {
+  const loadEmails = async (
+    tab?: string,
+    options?: { append?: boolean; cursor?: ThreadGroup | null; merge?: boolean },
+  ) => {
     try {
       const label = tab || activeTabRef.current;
       if (!isMailListTab(label)) {
@@ -488,12 +514,15 @@ function App() {
       if (adjusted.length > 0) {
         mailPageCursorRef.current = adjusted[adjusted.length - 1];
       }
+
       const cacheKey = mailCacheKey(label, accountId);
       const cachedGroups = readMailListCache(tabEmailCacheRef.current, cacheKey) ?? [];
       const cachedKeys = new Set(cachedGroups.map(threadKey));
       const nextGroups = options?.append
         ? [...cachedGroups, ...adjusted.filter(group => !cachedKeys.has(threadKey(group)))]
-        : adjusted;
+        : options?.merge
+          ? mergeRefreshedPage(adjusted, cachedGroups)
+          : adjusted;
       writeMailListCache(tabEmailCacheRef.current, cacheKey, nextGroups, MAX_MAIL_LIST_CACHE_ENTRIES);
       startDataTransition(() => {
         setMailThreadGroups(nextGroups);
@@ -707,14 +736,17 @@ function App() {
     notificationReadyAccountIdsRef,
     notificationBaselineEpochRef,
     pendingUnreadBadgeDeltasRef,
-    emailsLength: emails.length,
     syncIntervalSeconds: syncIntervalValue,
     notificationDuration: notifDuration,
     notificationInfinite: notifInfinite,
     otpMode,
     appLanguage,
     locale: tr,
-    loadEmails: () => loadEmails(),
+    loadEmails: (options?: { merge?: boolean }) => loadEmails(undefined, options),
+    refreshOpenThread: (accountIds: Set<string>) => {
+      const mail = activeMailRef.current;
+      if (mail && accountIds.has(mail.account_id)) setThreadRefreshKey(version => version + 1);
+    },
     shouldDeferNetwork: shouldDeferNetworkForGameMode,
     refreshAccessToken,
     upsertToken,
@@ -819,6 +851,24 @@ function App() {
       await win.setFocus();
     });
 
+    // While the window is out of sight and notifications are muted the engine
+    // deliberately sits still, so the moment it comes back — or the machine is
+    // online again — is exactly when the mail has to be fetched, rather than
+    // waiting out the periodic timer and the watcher's backoff.
+    let lastWakeAt = 0;
+    const wakeMail = () => {
+      if (Object.keys(accountTokensRef.current).length === 0) return;
+      const now = Date.now();
+      if (now - lastWakeAt < MAIL_WAKE_THROTTLE_MS) return;
+      lastWakeAt = now;
+      void tauriApi.wakeImapWatchers().catch(() => {});
+      void backgroundSyncRef.current();
+    };
+    const unlistenVisible = getCurrentWindow().onFocusChanged(({ payload: focused }) => {
+      if (focused) wakeMail();
+    });
+    window.addEventListener("online", wakeMail);
+
     const handleIframeMessage = (e: MessageEvent) => {
       if (e.data && e.data.type === "open_url" && typeof e.data.url === "string") {
         openExternalMailUrlRef.current(e.data.url);
@@ -831,8 +881,10 @@ function App() {
       if (startupSyncTimer !== null) window.clearTimeout(startupSyncTimer);
       window.removeEventListener("keydown", handleKeyDown);
       window.removeEventListener("message", handleIframeMessage);
+      window.removeEventListener("online", wakeMail);
       clearPeriodicSync();
       unlistenFocus.then(f => f());
+      unlistenVisible.then(f => f());
     };
   }, [shouldDeferNetworkForGameMode, markSessionExpired]);
 
@@ -1386,6 +1438,9 @@ function App() {
   const displayEmails = hasSearchQuery ? (searchResults ?? []) : emails;
   const threadGroups = hasSearchQuery ? (searchThreadGroups ?? []) : mailThreadGroups;
   const activeMail = [...displayEmails, ...emails].find(m => emailKey(m) === selectedMail);
+  // The sync hook reaches the open conversation through this, since it is
+  // registered long before the reader has one.
+  activeMailRef.current = activeMail ?? null;
   const activeThreadGroup = activeMail
     ? threadGroups.find(group => sameEmail(group.latestEmail, activeMail))
       ?? mailThreadGroups.find(group => sameEmail(group.latestEmail, activeMail))
@@ -1570,6 +1625,7 @@ function App() {
     setComposeTo, setShowCompose, showToast, tr,
   ]);
   openExternalMailUrlRef.current = openExternalMailUrl;
+  openMailFromListRef.current = handleMailClick;
 
   useEffect(() => {
     let disposed = false;

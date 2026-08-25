@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,
-    sync::Mutex,
+    sync::{atomic::AtomicBool, Mutex},
     time::{Duration, Instant},
 };
 use tauri::{AppHandle, Emitter, Manager};
@@ -38,6 +38,10 @@ pub struct NotificationPayload {
 pub struct PendingNotification {
     lifecycle: tokio::sync::Mutex<()>,
     queue: Mutex<NotificationQueue>,
+    /// Notifications held back while something is running fullscreen, and
+    /// whether the task that waits for that to end is already running.
+    deferred: Mutex<VecDeque<NotificationPayload>>,
+    releasing: AtomicBool,
 }
 
 #[derive(Default)]
@@ -64,8 +68,62 @@ impl Default for PendingNotification {
         Self {
             lifecycle: tokio::sync::Mutex::new(()),
             queue: Mutex::new(NotificationQueue::default()),
+            deferred: Mutex::new(VecDeque::new()),
+            releasing: AtomicBool::new(false),
         }
     }
+}
+
+/// How many notifications wait out a fullscreen app. Coming back from a long
+/// game to a wall of popups helps nobody, so only the newest few are kept —
+/// what was missed beyond them is what the summary notification is for.
+const MAX_DEFERRED_NOTIFICATIONS: usize = 6;
+/// How often the wait for fullscreen to end is re-checked. It only runs while
+/// something is actually waiting.
+const FULLSCREEN_RELEASE_POLL: Duration = Duration::from_secs(5);
+
+/// Holds a notification back until nothing is running fullscreen any more.
+/// Dropping it outright, which is what used to happen, meant the mail was
+/// synced, recorded as seen, and never announced at all.
+fn defer_until_fullscreen_ends(app: &AppHandle, payload: NotificationPayload) {
+    let state = app.state::<PendingNotification>();
+    {
+        let Ok(mut deferred) = state.deferred.lock() else {
+            return;
+        };
+        if deferred.len() >= MAX_DEFERRED_NOTIFICATIONS {
+            deferred.pop_front();
+        }
+        deferred.push_back(payload);
+    }
+    if state.releasing.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::time::sleep(FULLSCREEN_RELEASE_POLL).await;
+            if is_fullscreen() {
+                continue;
+            }
+            let held: Vec<NotificationPayload> = {
+                let state = app.state::<PendingNotification>();
+                let Ok(mut deferred) = state.deferred.lock() else {
+                    break;
+                };
+                deferred.drain(..).collect()
+            };
+            for payload in held {
+                if let Err(error) = deliver_notification(&app, payload).await {
+                    eprintln!("[NOTIFY] deferred notification failed: {error}");
+                }
+            }
+            break;
+        }
+        app.state::<PendingNotification>()
+            .releasing
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    });
 }
 
 #[tauri::command]
@@ -116,6 +174,69 @@ pub fn is_fullscreen() -> bool {
     }
 }
 
+/// The id the tray is built with, so the unread indicator can find it again.
+pub const TRAY_ID: &str = "main";
+/// The longest tooltip Windows will show on a tray icon.
+const MAX_TOOLTIP_CHARS: usize = 120;
+
+/// Marks the tray icon while mail is waiting, and puts the number in its
+/// tooltip. A tray icon is 16 to 32 pixels across, where a drawn count would be
+/// a smudge — the dot says there is something, the tooltip says how much.
+#[tauri::command]
+pub fn set_unread_indicator(
+    window: tauri::WebviewWindow,
+    app: AppHandle,
+    count: u32,
+    tooltip: String,
+) -> Result<(), String> {
+    crate::require_command_window(&window, &["main"])?;
+    let Some(tray) = app.tray_by_id(TRAY_ID) else {
+        return Ok(());
+    };
+    tray.set_tooltip(Some(tooltip.chars().take(MAX_TOOLTIP_CHARS).collect::<String>()))
+        .map_err(|error| error.to_string())?;
+    let Some(base) = app.default_window_icon().cloned() else {
+        return Ok(());
+    };
+    let icon = if count == 0 {
+        base
+    } else {
+        with_unread_dot(&base)
+    };
+    tray.set_icon(Some(icon)).map_err(|error| error.to_string())
+}
+
+/// The same icon with a dot in its lower-right corner: a white ring so it stays
+/// visible on a light taskbar, filled with the accent red.
+fn with_unread_dot(base: &tauri::image::Image<'_>) -> tauri::image::Image<'static> {
+    let (width, height) = (base.width(), base.height());
+    let mut rgba = base.rgba().to_vec();
+    let radius = (width.min(height) as f32 * 0.32).max(3.0);
+    let centre_x = width as f32 - radius - 0.5;
+    let centre_y = height as f32 - radius - 0.5;
+    for y in 0..height {
+        for x in 0..width {
+            let offset_x = x as f32 + 0.5 - centre_x;
+            let offset_y = y as f32 + 0.5 - centre_y;
+            let distance = (offset_x * offset_x + offset_y * offset_y).sqrt();
+            if distance > radius {
+                continue;
+            }
+            let index = ((y * width + x) * 4) as usize;
+            let Some(pixel) = rgba.get_mut(index..index + 4) else {
+                continue;
+            };
+            let ring = distance > radius - (radius * 0.28).max(1.0);
+            pixel.copy_from_slice(if ring {
+                &[255, 255, 255, 255]
+            } else {
+                &[239, 68, 68, 255]
+            });
+        }
+    }
+    tauri::image::Image::new_owned(rgba, width, height)
+}
+
 const NOTIF_W: f64 = 340.0;
 const MARGIN: f64 = 16.0;
 const TASKBAR_H: f64 = 48.0;
@@ -158,10 +279,6 @@ pub async fn show_custom_notification(
         return Ok(());
     }
 
-    if is_fullscreen() {
-        return Ok(());
-    }
-
     let payload = NotificationPayload {
         title,
         body,
@@ -177,6 +294,16 @@ pub async fn show_custom_notification(
         copy_failed_label,
         dismiss_all_label,
     };
+    if is_fullscreen() {
+        defer_until_fullscreen_ends(&app, payload);
+        return Ok(());
+    }
+    deliver_notification(&app, payload).await
+}
+
+/// Shows one notification, reusing the window when it is already up. Everything
+/// that decides *whether* to notify has happened before this point.
+async fn deliver_notification(app: &AppHandle, payload: NotificationPayload) -> Result<(), String> {
     let state = app.state::<PendingNotification>();
     let _lifecycle_guard = state.lifecycle.lock().await;
     let mut payload_queued = false;

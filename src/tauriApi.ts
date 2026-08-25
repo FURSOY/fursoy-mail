@@ -40,7 +40,7 @@ export interface SavedAttachment {
 export interface CustomNotificationInput {
   title: string;
   body: string;
-  kind: "mail" | "update";
+  kind: "mail" | "update" | "summary";
   code?: string | null;
   emailId?: string | null;
   duration: number;
@@ -121,6 +121,7 @@ export const tauriApi = {
     invoke<void>("start_imap_watch", { accountId, mailboxRole }),
   stopImapWatch: (accountId: string, mailboxRole = "inbox") =>
     invoke<void>("stop_imap_watch", { accountId, mailboxRole }),
+  wakeImapWatchers: () => invoke<void>("wake_imap_watchers"),
   getAccounts: () => invoke<Account[]>("get_accounts"),
   getAccountAuth: (accountId: string) =>
     invoke<AuthInfo | null>("get_account_auth", { accountId }),
@@ -130,6 +131,8 @@ export const tauriApi = {
     invoke<void>("remove_account", { accountId }),
   reorderAccounts: (orderedIds: string[]) =>
     invoke<void>("reorder_accounts", { orderedIds }),
+  getInboxEmailKeys: (accountId: string | null, limit?: number) =>
+    invoke<Array<{ accountId: string; id: string }>>("get_inbox_email_keys", { accountId, limit }),
   getEmailsByLabel: (input: EmailPageInput) =>
     invoke<EmailSummary[]>("get_emails_by_label", { ...input }),
   getThreadGroupsByLabel: (input: ThreadPageInput) =>
@@ -258,6 +261,8 @@ export const tauriApi = {
   setAppLanguage: (language: AppControls["appLanguage"]) =>
     invoke<AppControls>("set_app_language", { language }),
   isSystemFullscreen: () => invoke<boolean>("is_system_fullscreen"),
+  setUnreadIndicator: (count: number, tooltip: string) =>
+    invoke<void>("set_unread_indicator", { count, tooltip }),
   showCustomNotification: (notification: CustomNotificationInput) =>
     invoke<void>("show_custom_notification", { ...notification }),
 };

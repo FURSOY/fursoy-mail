@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 import { enqueueMailMutation, inboxUnreadDelta, runAuthenticatedMailAction } from "../mailActionState";
-import { emailCacheKey, MAX_KNOWN_EMAIL_IDS, updateNotificationBaseline } from "../mailSyncState";
+import {
+  countMissedMail, emailCacheKey, latestInboxDates, MAX_KNOWN_EMAIL_IDS, updateNotificationBaseline,
+} from "../mailSyncState";
 import type { EmailSummary } from "../types";
 
 function mail(id: string, accountId = "account-a", overrides: Partial<EmailSummary> = {}): EmailSummary {
@@ -262,5 +264,34 @@ describe("multi-account notification baseline", () => {
 
     expect(suppressed).toEqual([]);
     expect(nextSync).toEqual([]);
+  });
+});
+
+describe("missed mail", () => {
+  const inbox = [
+    mail("a", "account-a", { date: 300, unread: true }),
+    mail("b", "account-a", { date: 100, unread: true }),
+    mail("c", "account-a", { date: 400, unread: false }),
+    mail("d", "account-b", { date: 500, unread: true }),
+  ];
+
+  it("counts only unread mail newer than the last one it announced", () => {
+    const missed = countMissedMail(inbox, new Set(["account-a"]), { "account-a": 200 });
+    expect(missed).toBe(1);
+  });
+
+  it("says nothing on an account it has never notified for", () => {
+    // A first run has told the user nothing, so nothing was missed.
+    expect(countMissedMail(inbox, new Set(["account-a"]), {})).toBe(0);
+  });
+
+  it("ignores accounts outside the round", () => {
+    expect(countMissedMail(inbox, new Set(["account-a"]), { "account-a": 0, "account-b": 0 })).toBe(2);
+    expect(countMissedMail(inbox, new Set(["account-b"]), { "account-b": 0 })).toBe(1);
+  });
+
+  it("remembers the newest date per account", () => {
+    expect(latestInboxDates(inbox)).toEqual({ "account-a": 400, "account-b": 500 });
+    expect(latestInboxDates([])).toEqual({});
   });
 });

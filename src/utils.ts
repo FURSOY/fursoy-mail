@@ -9,6 +9,9 @@ export const IMAGE_PROXY_BASE = "http://mailimg.localhost/?url=";
 export const MAX_MAIL_LIST_CACHE_ENTRIES = 20;
 export const MAIL_PAGE_SIZE = 100;
 export const STARTUP_NETWORK_DELAY_MS = 5000;
+/// How often bringing the window forward, or the machine coming back online,
+/// may trigger a fetch. Focus changes come in bursts; the mail does not.
+export const MAIL_WAKE_THROTTLE_MS = 5000;
 export const STARTUP_UPDATE_DELAY_MS = 9000;
 export const MAIL_TABS = new Set(["inbox", "starred", "all", "sent", "archive", "spam", "trash"]);
 export const ZOOM_STEPS = [0.5, 0.6, 0.7, 0.8, 0.9, 1, 1.25, 1.5, 1.75, 2];

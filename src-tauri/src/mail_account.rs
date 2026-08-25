@@ -49,6 +49,11 @@ const IDLE_CYCLE: Duration = Duration::from_secs(60);
 /// end the watcher either, because nothing else would start it again.
 const WATCH_RETRY_DELAY: Duration = Duration::from_secs(30);
 const WATCH_RETRY_MAX_DELAY: Duration = Duration::from_secs(300);
+/// How long a watcher waits before asking again whether a server that did not
+/// advertise IDLE offers it after all. Long enough to cost nothing, short
+/// enough that a wrong answer does not last the whole run — and `wake` cuts it
+/// short when the window comes forward.
+const WATCH_IDLE_RECHECK_DELAY: Duration = Duration::from_secs(1800);
 /// Retry and stop are both checked on this granularity, which is what lets a
 /// stopped watcher leave a backoff early.
 const WATCH_STOP_POLL: Duration = Duration::from_secs(1);
@@ -3579,6 +3584,7 @@ pub(crate) fn start_imap_watcher(app: &AppHandle, account_id: &str, role: &str) 
     let watcher = Arc::new(ImapWatcher {
         stop: AtomicBool::new(false),
         idling: AtomicBool::new(false),
+        wake: AtomicBool::new(false),
     });
     watchers.insert(key.clone(), Arc::clone(&watcher));
     drop(watchers);
@@ -3637,6 +3643,11 @@ struct ImapWatcher {
     /// True only while the connection is actually parked on IDLE, which is when
     /// the server can be trusted to report flag changes.
     idling: AtomicBool,
+    /// Set when something outside knows the reason a reconnect was waiting is
+    /// gone — the network came back, or the window was opened. A watcher that
+    /// backed off for five minutes should not spend them once the machine is
+    /// online again.
+    wake: AtomicBool,
 }
 
 /// Keyed by `(account_id, mailbox_role)` rather than just the account: the
@@ -3684,6 +3695,11 @@ enum WatchStep {
     /// this attempt ever reached a healthy IDLE, which is what separates a
     /// dropped connection from a server or credential that is not working.
     Retry { idled: bool },
+    /// The server did not offer IDLE, so there is nothing to park on. Asking
+    /// again costs one login every half hour, which is worth it: a capability
+    /// read can come back wrong, and giving up for the whole run left the
+    /// account on the periodic timer with nothing said about it.
+    IdleUnsupported,
 }
 
 fn watch_imap_account(app: AppHandle, account_id: String, role: String, watcher: Arc<ImapWatcher>) {
@@ -3691,6 +3707,12 @@ fn watch_imap_account(app: AppHandle, account_id: String, role: String, watcher:
     while !watcher.stop.load(Ordering::Relaxed) {
         match watch_imap_session(&app, &account_id, &role, &watcher) {
             WatchStep::Done => break,
+            WatchStep::IdleUnsupported => {
+                if !watch_sleep(&watcher, WATCH_IDLE_RECHECK_DELAY) {
+                    break;
+                }
+                retry_delay = WATCH_RETRY_DELAY;
+            }
             WatchStep::Retry { idled } => {
                 // A connection that worked and then dropped is not evidence of
                 // anything being wrong, so it starts the backoff over.
@@ -3726,11 +3748,30 @@ fn watch_sleep(watcher: &ImapWatcher, duration: Duration) -> bool {
         if watcher.stop.load(Ordering::Relaxed) {
             return false;
         }
+        if watcher.wake.swap(false, Ordering::Relaxed) {
+            break;
+        }
         let slice = remaining.min(WATCH_STOP_POLL);
         std::thread::sleep(slice);
         remaining -= slice;
     }
     !watcher.stop.load(Ordering::Relaxed)
+}
+
+/// Ends the backoff of every watcher that is waiting to reconnect, and asks the
+/// ones that are connected to run a pass. Called when the machine comes back
+/// online and when the window is opened, which are the two moments the user
+/// expects mail to be there already.
+#[tauri::command]
+pub fn wake_imap_watchers(window: tauri::WebviewWindow) -> Result<(), String> {
+    crate::require_command_window(&window, &["main"])?;
+    let watchers = imap_watchers()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for watcher in watchers.values() {
+        watcher.wake.store(true, Ordering::Relaxed);
+    }
+    Ok(())
 }
 
 /// Holds one connection for as long as it stays healthy: park on IDLE, and on
@@ -3783,9 +3824,9 @@ fn watch_imap_session(app: &AppHandle, account_id: &str, role: &str, watcher: &I
     if !session_supports(&mut session, "IDLE") {
         // Without IDLE the periodic sync is the only freshness this server can
         // offer, and a parked connection would buy nothing.
-        imap_log(|| "watcher: server does not advertise IDLE, not watching".to_string());
+        imap_log(|| "watcher: server does not advertise IDLE, asking again later".to_string());
         session.logout().ok();
-        return WatchStep::Done;
+        return WatchStep::IdleUnsupported;
     }
     let condstore = session_supports(&mut session, "CONDSTORE");
     imap_log(|| format!("watcher: connected role={role}, condstore={condstore}"));
@@ -4870,6 +4911,7 @@ mod tests {
             Arc::new(ImapWatcher {
                 stop: AtomicBool::new(false),
                 idling: AtomicBool::new(true),
+                wake: AtomicBool::new(false),
             })
         };
         {

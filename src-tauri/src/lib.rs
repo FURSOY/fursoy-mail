@@ -397,7 +397,7 @@ pub fn run() {
             let mute_item = mute_i.clone();
             let pause_item = pause_i.clone();
 
-            let _tray = TrayIconBuilder::new()
+            let _tray = TrayIconBuilder::with_id(notify::TRAY_ID)
                 .icon(app.default_window_icon().unwrap().clone())
                 .menu(&menu)
                 .show_menu_on_left_click(false)
@@ -511,6 +511,7 @@ pub fn run() {
             mail_account::sync_imap_emails,
             mail_account::start_imap_watch,
             mail_account::stop_imap_watch,
+            mail_account::wake_imap_watchers,
             db::get_accounts,
             db::get_account_auth,
             auth::remove_account,
@@ -519,6 +520,7 @@ pub fn run() {
             db::get_local_emails,
             db::search_local_emails,
             db::get_emails_by_label,
+            db::get_inbox_email_keys,
             db::get_thread_groups_by_label,
             db::get_custom_imap_mailboxes,
             db::get_gmail_labels,
@@ -555,6 +557,7 @@ pub fn run() {
             compose::save_and_reveal_attachment,
             db::get_email_attachments,
             notify::show_custom_notification,
+            notify::set_unread_indicator,
             notify::get_pending_notification,
             notify::get_screen_info,
             notify::is_system_fullscreen,
