@@ -285,7 +285,7 @@
   <div id="wrapper">
     <div id="stack"></div>
     <div id="progressBar"></div>
-    <div id="dismissAll">Tümünü Kapat</div>
+    <div id="dismissAll">Dismiss all</div>
   </div>
 
   <script type="module">
@@ -470,6 +470,7 @@
         copiedLabel: data.copiedLabel || 'Copied',
         copyFailedLabel: data.copyFailedLabel || 'Could not copy · Try again',
       });
+      document.getElementById('dismissAll').textContent = data.dismissAllLabel || 'Dismiss all';
       render();
 
       const duration = data.duration !== undefined ? data.duration : 5000;

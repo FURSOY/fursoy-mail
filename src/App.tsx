@@ -4,7 +4,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { getCurrent, onOpenUrl } from "@tauri-apps/plugin-deep-link";
 import {
-  Edit3, Inbox, AlertTriangle, CheckCircle, XCircle,
+  Edit3, Inbox, AlertTriangle, CheckCircle, XCircle, X,
 } from "lucide-react";
 import { LocaleContext, locales, type AppLanguage } from "./i18n";
 import { surfaces, themePresets, type ThemePresetName } from "./theme";
@@ -19,12 +19,12 @@ import {
 import {
   type EmailSummary, type ThreadGroup, type AppControls, type OtpMode, type RenderMode,
   type MailZoom, type DensityMode, type MailViewMode, type MailViewPreference,
-  type RemoteImageMode, type GmailLabel, DEFAULT_APP_CONTROLS,
+  type RemoteImageMode, type CustomMailbox, type GmailLabel, DEFAULT_APP_CONTROLS,
 } from "./types";
 import {
-  MAIL_TABS, STARTUP_NETWORK_DELAY_MS,
+  STARTUP_NETWORK_DELAY_MS,
   MAX_MAIL_LIST_CACHE_ENTRIES, MAIL_PAGE_SIZE, ZOOM_STEPS,
-  isAuthFailure, extractVerificationCode,
+  isMailListTab, isSessionRevoked, extractVerificationCode,
   readMailZoom, readThemePreset, getAutoMailViewMode, parseMailtoUrl,
 } from "./utils";
 import { addBoundedSetValue, MAX_RECENTLY_READ_EMAILS, MAX_REMOTE_IMAGE_EMAILS } from "./boundedSet";
@@ -77,10 +77,6 @@ function emailKey(email: EmailSummary): string {
 function threadKey(group: ThreadGroup): string {
   const email = group.latestEmail;
   return `${email.account_id}\u0000${email.thread_id || email.id}`;
-}
-
-function isMailView(value: string): boolean {
-  return MAIL_TABS.has(value) || value.startsWith("gmail:");
 }
 
 function updateGroupLabel(group: ThreadGroup, mail: EmailSummary, labelId: string, applied: boolean): ThreadGroup {
@@ -177,6 +173,7 @@ function App() {
   const [emails, setEmails] = useState<EmailSummary[]>([]);
   const [mailThreadGroups, setMailThreadGroups] = useState<ThreadGroup[]>([]);
   const [gmailLabelsByAccount, setGmailLabelsByAccount] = useState<Record<string, GmailLabel[]>>({});
+  const [customMailboxesByAccount, setCustomMailboxesByAccount] = useState<Record<string, CustomMailbox[]>>({});
   const {
     accounts, accountsLoaded, accountTokens, activeAccountId,
     tokenExpired, expiredAccountIds,
@@ -465,7 +462,7 @@ function App() {
   const loadEmails = async (tab?: string, options?: { append?: boolean; cursor?: ThreadGroup | null }) => {
     try {
       const label = tab || activeTabRef.current;
-      if (!isMailView(label)) {
+      if (!isMailListTab(label)) {
         startDataTransition(() => setEmails([]));
         setMailThreadGroups([]);
         return [];
@@ -523,7 +520,7 @@ function App() {
   const loadOlderEmails = async () => {
     const label = activeTabRef.current;
     const accountId = activeAccountIdRef.current;
-    if (!isMailView(label) || !hasMoreEmails || isLoadingMoreEmailsRef.current) return false;
+    if (!isMailListTab(label) || !hasMoreEmails || isLoadingMoreEmailsRef.current) return false;
 
     isLoadingMoreEmailsRef.current = true;
     setIsLoadingMoreEmails(true);
@@ -692,8 +689,11 @@ function App() {
     startPeriodicSync,
   } = useMailSync({
     accounts,
+    accountTokens,
     accountsRef,
     accountTokensRef,
+    activeAccountId,
+    activeTab,
     activeAccountIdRef,
     expiredAccountsRef,
     tokenExpiredRef,
@@ -736,6 +736,17 @@ function App() {
     return () => { cancelled = true; };
   }, [accounts, isUserSyncing, isBackgroundSyncing]);
 
+  useEffect(() => {
+    let cancelled = false;
+    void Promise.all(accounts.map(async account => {
+      const mailboxes = await tauriApi.getCustomImapMailboxes(account.id).catch(() => []);
+      return [account.id, mailboxes] as const;
+    })).then(entries => {
+      if (!cancelled) setCustomMailboxesByAccount(Object.fromEntries(entries));
+    });
+    return () => { cancelled = true; };
+  }, [accounts, isUserSyncing, isBackgroundSyncing]);
+
   const openExternalMailUrlRef = useRef<(url: string) => void>(() => {});
 
   useEffect(() => {
@@ -755,31 +766,26 @@ function App() {
             if (await shouldDeferNetworkForGameMode(false)) {
               console.log("System in fullscreen/game mode, delaying startup sync.");
             } else {
-              // Refresh tokens for all accounts — even those with no cached access token,
-              // since refresh_access_token reads the refresh token directly from keyring.
+              // Refresh sessions for all accounts — even those with no cached
+              // access token, since refresh_access_token reads the stored
+              // credential directly from the keyring. Password accounts report
+              // themselves as authenticated without a renewal round trip.
               for (const acc of loadedAccounts) {
-                if (acc.provider !== "google") {
-                  clearExpiredAccount(acc.id);
-                  continue;
-                }
                 try {
                   const refreshed = await refreshAccessToken(acc.id);
                   if (cancelled) return;
                   if (refreshed.authenticated) upsertToken(acc.id, "active");
                   clearExpiredAccount(acc.id);
                 } catch (refreshError) {
-                  if (isAuthFailure(refreshError)) {
-                    // Only force re-login if we also have no cached token.
-                    // If there IS a cached token, the keyring failure may be transient
-                    // (Windows Credential Manager timing issue in dev mode).
-                    // The sync will naturally detect expiry when the cached token stops working.
-                    if (!accountTokensRef.current[acc.id]) {
-                      markAccountExpired(acc.id);
-                    } else {
-                      console.warn("Startup refresh failed; cached credential remains in use.");
-                    }
+                  // Startup is the worst moment to trust a failure: the network
+                  // may not be up yet and the credential store may still be
+                  // waking. Only a credential the provider itself rejected ends
+                  // the session; anything else keeps it, and the sync will find
+                  // out for real when the stored token stops working.
+                  if (isSessionRevoked(refreshError)) {
+                    markAccountExpired(acc.id);
                   } else {
-                    console.log("Token refresh skipped.");
+                    console.warn("Startup refresh failed; the stored session remains in use.");
                   }
                 }
               }
@@ -835,7 +841,7 @@ function App() {
       window.clearTimeout(mailListLoadingTimerRef.current);
       mailListLoadingTimerRef.current = null;
     }
-    if (!isMailView(activeTab)) {
+    if (!isMailListTab(activeTab)) {
       setIsMailListLoading(false);
       startDataTransition(() => setEmails([]));
       setMailThreadGroups([]);
@@ -875,50 +881,14 @@ function App() {
     };
   }, [activeTab, activeAccountId]);
 
+  // IMAP synchronizes each mailbox in full rather than paging a remote cursor,
+  // so there is no separate backfill phase to poll for.
   useEffect(() => {
     if (!accountsLoaded) return;
-    const activeAccount = activeAccountId
-      ? accounts.find(account => account.id === activeAccountId)
-      : null;
-    const usesOnlyImap = activeAccount?.provider === "imap" ||
-      (activeAccountId === null && accounts.length > 0 && accounts.every(account => account.provider === "imap"));
-    if (usesOnlyImap) {
-      setIsMailboxBackfilling(false);
-      setMailboxDownloadPending(false);
-      setMailboxDownloadState("completed");
-      return;
-    }
-    let cancelled = false;
-    const label = activeTab;
-    const accountId = activeAccountId;
-    const refreshBackfillStatus = async () => {
-      const status = await tauriApi.getMailboxDownloadStatus(accountId)
-        .catch(() => ({ running: false, pending: false, state: "completed" as const, retryAfter: null }));
-      if (!cancelled && isMailContextCurrent(label, accountId)) {
-        setIsMailboxBackfilling(status.running);
-        setMailboxDownloadPending(status.pending);
-        setMailboxDownloadState(status.state);
-        if (!searchQuery.trim() && !isAdvancedSearchActive(advancedSearch) && !status.running && !status.pending && isMailView(label)) {
-          const cursor = mailPageCursorRef.current;
-          const nextPage = await tauriApi.getThreadGroupsByLabel({
-            label,
-            accountId,
-            limit: 1,
-            beforeDate: cursor?.latestEmail.date ?? null,
-            beforeAccountId: cursor?.latestEmail.account_id ?? null,
-            beforeThreadId: cursor ? (cursor.latestEmail.thread_id || cursor.latestEmail.id) : null,
-          }).catch(() => []);
-          if (!cancelled && isMailContextCurrent(label, accountId)) setHasMoreEmails(nextPage.length > 0);
-        }
-      }
-    };
-    void refreshBackfillStatus();
-    const timer = window.setInterval(() => { void refreshBackfillStatus(); }, 2000);
-    return () => {
-      cancelled = true;
-      window.clearInterval(timer);
-    };
-  }, [accounts, accountsLoaded, activeAccountId, activeTab, searchQuery, advancedSearch]);
+    setIsMailboxBackfilling(false);
+    setMailboxDownloadPending(false);
+    setMailboxDownloadState("completed");
+  }, [accountsLoaded]);
 
   useEffect(() => {
     const unlistenPromise = listen("mail-search-index-ready", () => {
@@ -1115,7 +1085,18 @@ function App() {
   function handleSwitchAccount(accountId: string | null) {
     if (accountId === activeAccountIdRef.current) return;
     setSelectedMail(null);
-    const nextTab = activeTabRef.current.startsWith("gmail:") ? "inbox" : activeTabRef.current;
+    // A label belongs to the account it was read from, so it cannot follow the
+    // switch. A folder can, whenever the account being switched to has one by
+    // the same name — which is also true of the combined view.
+    const reachableMailboxes = accountId
+      ? (customMailboxesByAccount[accountId] ?? [])
+      : Object.values(customMailboxesByAccount).flat();
+    const keepsFolder = activeTabRef.current.startsWith("custom:")
+      && reachableMailboxes.some(mailbox => mailbox.role === activeTabRef.current);
+    const nextTab = (activeTabRef.current.startsWith("gmail:")
+      || (activeTabRef.current.startsWith("custom:") && !keepsFolder))
+      ? "inbox"
+      : activeTabRef.current;
     const cached = readMailListCache(tabEmailCacheRef.current, mailCacheKey(nextTab, accountId));
     if (cached !== undefined) {
       setMailThreadGroups(cached);
@@ -1134,6 +1115,11 @@ function App() {
     void refreshUnreadCount();
   }
 
+  const localizedLabelError = (error: unknown): string => {
+    const key = String(error).replace(/^Error:\s*/i, "").trim();
+    return (tr.mailAccount.errors as Record<string, string>)[key] ?? key;
+  };
+
   const handleCreateGmailLabel = async (accountId: string, name: string): Promise<GmailLabel | null> => {
     try {
       const label = await tauriApi.createGmailLabel(accountId, name);
@@ -1146,7 +1132,7 @@ function App() {
       return label;
     } catch (error) {
       console.error("Create Gmail label failed:", error);
-      showToast(`${tr.labels.createFailed}: ${error}`, "error");
+      showToast(`${tr.labels.createFailed}: ${localizedLabelError(error)}`, "error");
       return null;
     }
   };
@@ -1167,7 +1153,7 @@ function App() {
       return true;
     } catch (error) {
       console.error("Rename Gmail label failed:", error);
-      showToast(`${tr.labels.renameFailed}: ${error}`, "error");
+      showToast(`${tr.labels.renameFailed}: ${localizedLabelError(error)}`, "error");
       return false;
     }
   };
@@ -1180,7 +1166,7 @@ function App() {
       return true;
     } catch (error) {
       console.error("Move Gmail label failed:", error);
-      showToast(`${tr.labels.moveFailed}: ${error}`, "error");
+      showToast(`${tr.labels.moveFailed}: ${localizedLabelError(error)}`, "error");
       return false;
     }
   };
@@ -1202,7 +1188,7 @@ function App() {
       return true;
     } catch (error) {
       console.error("Update Gmail label color failed:", error);
-      showToast(`${tr.labels.colorFailed}: ${error}`, "error");
+      showToast(`${tr.labels.colorFailed}: ${localizedLabelError(error)}`, "error");
       return false;
     }
   };
@@ -1233,7 +1219,7 @@ function App() {
       showToast(tr.labels.deleted, "success");
     } catch (error) {
       console.error("Delete Gmail label failed:", error);
-      showToast(`${tr.labels.deleteFailed}: ${error}`, "error");
+      showToast(`${tr.labels.deleteFailed}: ${localizedLabelError(error)}`, "error");
     }
   };
 
@@ -1261,7 +1247,7 @@ function App() {
       showToast(tr.labels.updated, "success");
     } catch (error) {
       console.error("Update Gmail labels failed:", error);
-      showToast(`${tr.labels.updateFailed}: ${error}`, "error");
+      showToast(`${tr.labels.updateFailed}: ${localizedLabelError(error)}`, "error");
       throw error;
     }
   };
@@ -1407,6 +1393,16 @@ function App() {
   const activeMailLabels = activeMail ? (gmailLabelsByAccount[activeMail.account_id] ?? []) : [];
   const activeMailLabelIds = activeThreadGroup?.labelIds ?? [];
   const sidebarGmailLabels = activeAccountId ? (gmailLabelsByAccount[activeAccountId] ?? []) : [];
+  // With every account shown at once, the folders of all of them are listed:
+  // a user folder is browsed by its own label, which reads across accounts the
+  // same way the inbox does. Two accounts with the same folder name share one
+  // row, which is what the combined list is for.
+  const sidebarCustomMailboxes = activeAccountId
+    ? (customMailboxesByAccount[activeAccountId] ?? [])
+    : Object.values(customMailboxesByAccount)
+      .flat()
+      .filter((mailbox, index, all) => all.findIndex(other => other.role === mailbox.role) === index)
+      .sort((left, right) => left.name.localeCompare(right.name));
   const activeMailKey = activeMail ? emailKey(activeMail) : null;
   const selectedMailViewMode = mailViewPreference === "auto" ? getAutoMailViewMode(windowWidth) : mailViewPreference;
   const mailViewMode: MailViewMode = selectedMailViewMode === "single-toggle" ? "split" : selectedMailViewMode;
@@ -1446,7 +1442,7 @@ function App() {
     composeTo, setComposeTo, composeSubject, setComposeSubject, composeBody, setComposeBody,
     composeHtmlAppend, setComposeHtmlAppend, composeAccountId, setComposeAccountId,
     composeSendError, setComposeSendError,
-    handleArchive, handleTrash, handleReportSpam, handleMoveToInbox,
+    handleArchive, handleTrash, handleReportSpam, handleMoveToInbox, handleMoveToMailbox,
     handleReply, handleComposeSend, handleMarkAsUnread, handleForward,
   } = useMailActions({
     locale: tr,
@@ -1739,6 +1735,7 @@ function App() {
           onAddAccount={() => setMailAccountModalOpen(true)}
           onLogoutAccount={handleLogoutAccount}
           expiredAccountIds={expiredAccountIds}
+          customMailboxes={sidebarCustomMailboxes}
           gmailLabels={sidebarGmailLabels}
           onRenameGmailLabel={handleRenameGmailLabel}
           onMoveGmailLabel={handleMoveGmailLabel}
@@ -1879,6 +1876,7 @@ function App() {
               accounts={accounts}
               activeAccountId={activeAccountId}
               gmailLabelsByAccount={gmailLabelsByAccount}
+              customMailboxesByAccount={customMailboxesByAccount}
             />
             {activeMail ? (
               <EmailReader
@@ -1920,6 +1918,8 @@ function App() {
                 onReportSpam={handleReportSpam}
                 onTrash={handleTrash}
                 onMoveToInbox={handleMoveToInbox}
+                customMailboxes={customMailboxesByAccount[activeMail.account_id] ?? []}
+                onMoveToMailbox={handleMoveToMailbox}
                 onMarkAsUnread={handleMarkAsUnread}
                 onForward={(mail) => { void handleForward(mail); }}
                 onOpenUrl={openExternalMailUrl}
@@ -1967,12 +1967,23 @@ function App() {
                 )
               : tr.messages.reloginRequired}
           </div>
-          <button
-            onClick={() => setMailAccountModalOpen(true)}
-            className="px-3 py-1 bg-white text-red-600 text-xs font-semibold rounded hover:bg-red-50 transition-colors"
-          >
-            {tr.messages.signIn}
-          </button>
+          <div className="flex items-center gap-1">
+            <button
+              onClick={() => setMailAccountModalOpen(true)}
+              className="px-3 py-1 bg-white text-red-600 text-xs font-semibold rounded hover:bg-red-50 transition-colors"
+            >
+              {tr.messages.signIn}
+            </button>
+            <ToolbarTip label={tr.common.close}>
+              <button
+                type="button"
+                onClick={() => setSessionExpired(false)}
+                className="flex h-6 w-6 items-center justify-center rounded text-white/80 transition-colors hover:bg-white/20 hover:text-white"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            </ToolbarTip>
+          </div>
         </div>
       )}
 

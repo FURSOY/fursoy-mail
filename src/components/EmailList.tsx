@@ -5,7 +5,7 @@ import {
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { useLocale } from "../i18n";
-import type { Account, EmailSummary, GmailLabel, ThreadGroup, MailViewPreference } from "../types";
+import type { Account, EmailSummary, GmailLabel, ThreadGroup, MailViewPreference, CustomMailbox } from "../types";
 import { formatDate, splitSearchHighlight } from "../utils";
 import { ToolbarTip } from "./ToolbarTip";
 import { LabelChips } from "./MailLabels";
@@ -52,6 +52,7 @@ interface EmailListProps {
   accounts?: Account[];
   activeAccountId?: string | null;
   gmailLabelsByAccount: Record<string, GmailLabel[]>;
+  customMailboxesByAccount: Record<string, CustomMailbox[]>;
 }
 
 export type BulkMailAction = "archive" | "inbox" | "read" | "unread" | "spam" | "trash";
@@ -107,10 +108,11 @@ export function EmailList({
   activeTab, usesOverlaySidebar, onMenuOpen,
   mailViewPreference, onViewPreferenceChange,
   onRefresh, onLoadMore, hasMoreEmails, isLoadingMoreEmails, isMailListLoading, mailAppendVersion, notificationFocusVersion, isMailboxBackfilling, mailboxDownloadPending, mailboxDownloadState, accessToken,
-  accounts, activeAccountId, gmailLabelsByAccount,
+  accounts, activeAccountId, gmailLabelsByAccount, customMailboxesByAccount,
 }: EmailListProps) {
   const tr = useLocale();
   const activeGmailLabelId = activeTab.startsWith("gmail:") ? activeTab.slice(6) : null;
+  const accountCustomMailboxes = activeAccountId ? (customMailboxesByAccount[activeAccountId] ?? []) : [];
   const activeFolderLabel = ({
     inbox: tr.nav.inbox,
     starred: tr.nav.starred,
@@ -123,6 +125,9 @@ export function EmailList({
     ?? (activeGmailLabelId && activeAccountId
       ? gmailLabelsByAccount[activeAccountId]?.find(label => label.id === activeGmailLabelId)?.name
       : null)
+    // A user folder names its own list; without this it fell back to the
+    // label heading, which is not what the list is showing.
+    ?? accountCustomMailboxes.find(mailbox => mailbox.role === activeTab)?.name
     ?? tr.labels.title;
   const showAccountBadge = activeAccountId === null && (accounts?.length ?? 0) > 1;
   const listRef = useRef<HTMLDivElement>(null);
@@ -389,6 +394,7 @@ export function EmailList({
             <AdvancedSearchPanel
               criteria={advancedSearch}
               gmailLabels={activeAccountId ? (gmailLabelsByAccount[activeAccountId] ?? []) : []}
+              customMailboxes={accountCustomMailboxes}
               onClose={() => setAdvancedSearchOpen(false)}
               onApply={(criteria) => {
                 clearSelection();

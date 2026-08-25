@@ -67,9 +67,9 @@ export function searchSidebarTab(
   if (!searchActive) return currentTab;
   if (!criteria.locationExplicit) {
     if (criteria.starred) return "starred";
-    return /^(inbox|starred|all|sent|archive|spam|trash|gmail:.+)$/.test(currentTab) ? currentTab : "";
+    return /^(inbox|starred|all|sent|archive|spam|trash|gmail:.+|custom:.+)$/.test(currentTab) ? currentTab : "";
   }
-  if (/^(inbox|starred|all|sent|archive|spam|trash|gmail:.+)$/.test(criteria.location)) {
+  if (/^(inbox|starred|all|sent|archive|spam|trash|gmail:.+|custom:.+)$/.test(criteria.location)) {
     return criteria.location;
   }
   return "";

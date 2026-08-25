@@ -7,13 +7,14 @@ import {
   Download, FileText, Image, ImageOff, File, Type, Link2, List, ListOrdered, Paperclip, Undo2, Redo2, Star,
 } from "lucide-react";
 import { locales, useLocale } from "../i18n";
-import type { EmailSummary, GmailLabel, MailViewMode, MailZoom, RenderMode, AttachmentPayload, SavedDraft } from "../types";
+import type { CustomMailbox, EmailSummary, GmailLabel, MailViewMode, MailZoom, RenderMode, AttachmentPayload, SavedDraft } from "../types";
 import { tauriApi, type EmailAttachmentInfo } from "../tauriApi";
 import { calculateReplyAllRecipients, calculateReplyRecipients, areValidRecipients } from "../mailRecipients";
 import type { ReplySendRequest } from "../hooks/useMailActions";
 import { buildReplyBody } from "../mailCompose";
 import { extractInlineReplyBody, inlineReplyStorageKey, parseStoredInlineReplyDraft, type StoredInlineReplyDraft } from "../inlineReplyDraft";
 import { LabelChips, LabelPicker } from "./MailLabels";
+import { FolderPicker } from "./FolderPicker";
 
 type AttachmentInfo = EmailAttachmentInfo;
 
@@ -437,6 +438,8 @@ interface EmailReaderProps {
   gmailLabelIds: string[];
   onToggleGmailLabel: (labelId: string, applied: boolean) => Promise<void>;
   onCreateGmailLabel: (name: string) => Promise<GmailLabel | null>;
+  customMailboxes: CustomMailbox[];
+  onMoveToMailbox: (mail: EmailSummary, mailbox: CustomMailbox) => Promise<void>;
 }
 
 // ── Main component ─────────────────────────────────────────────────────────────
@@ -455,6 +458,7 @@ export function EmailReader({
   onOpenUrl, mailScrollRef, relayoutKey, threadEmails, hasMoreThreadEmails, isLoadingOlderThread,
   threadMemoryLimitReached, onLoadOlderThread, accessToken, showToast,
   searchQuery, gmailLabels, gmailLabelIds, onToggleGmailLabel, onCreateGmailLabel,
+  customMailboxes, onMoveToMailbox,
 }: EmailReaderProps) {
   const tr = useLocale();
   const replyEditableRef = useRef<HTMLDivElement>(null);
@@ -1093,19 +1097,9 @@ export function EmailReader({
       if (replyFocusTimerRef.current) clearTimeout(replyFocusTimerRef.current);
       replyFocusTimerRef.current = window.setTimeout(() => replyEditableRef.current?.focus(), 100);
     };
-    const activateAndRefresh = () => {
-      activate(email);
-      void tauriApi.refreshEmailFromGmail(email.account_id, email.id)
-        .then(refreshed => {
-          setReplyTarget(current => current && current.id === email.id && current.account_id === email.account_id
-            ? refreshed
-            : current);
-        })
-        .catch(() => undefined);
-    };
     if (replyTarget && (replyTarget.id !== email.id || replyTarget.account_id !== email.account_id)) {
-      void persistReplyDraft().catch(() => undefined).finally(activateAndRefresh);
-    } else activateAndRefresh();
+      void persistReplyDraft().catch(() => undefined).finally(() => activate(email));
+    } else activate(email);
   };
   const captureReplyHost = useCallback((node: HTMLDivElement | null) => setReplyPortalHost(node), []);
 
@@ -1155,6 +1149,13 @@ export function EmailReader({
             onToggle={onToggleGmailLabel}
             onCreate={onCreateGmailLabel}
           />
+          {customMailboxes.length > 0 && (
+            <FolderPicker
+              mailboxes={customMailboxes}
+              currentRole={activeTab}
+              onMove={mailbox => onMoveToMailbox(activeMail, mailbox)}
+            />
+          )}
           {showRestoreBtn && (
             <ToolbarTip label={activeTab === "spam" ? tr.actions.notSpam : tr.actions.restoreInbox}>
               <button type="button" onClick={() => onMoveToInbox(activeMail)} className="p-2 rounded-md hover:bg-white/5 text-zinc-400 hover:text-emerald-400 transition-colors">

@@ -168,12 +168,17 @@ fn microsoft_client_id() -> String {
         .unwrap_or_else(|| DEFAULT_MICROSOFT_CLIENT_ID.to_string())
 }
 
+/// `force_consent` decides whether Google is asked for the consent screen. It
+/// is the only way to be handed a refresh token, but it also spends one of the
+/// hundred a client may hold per account, so it is asked for exactly when this
+/// app has no working refresh token left to fall back on.
 fn build_authorization_url(
     provider: DiscoveredProvider,
     email: &str,
     state: &str,
     nonce: &str,
     challenge: &str,
+    force_consent: bool,
 ) -> Result<String, String> {
     let (endpoint, client_id, scopes) = match provider {
         DiscoveredProvider::Google => (
@@ -202,7 +207,7 @@ fn build_authorization_url(
         .append_pair("code_challenge_method", "S256")
         .append_pair(
             "prompt",
-            if provider == DiscoveredProvider::Google {
+            if provider == DiscoveredProvider::Google && force_consent {
                 "consent"
             } else {
                 "select_account"
@@ -319,6 +324,75 @@ async fn wait_for_callback(
     }
 }
 
+/// What a token endpoint's refusal says about the credential that was sent.
+/// Only `Revoked` is worth a new sign-in for; the other two say nothing about
+/// the stored refresh token, so they must not cost the user their session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TokenRequestError {
+    /// The grant will never work again: revoked, expired, or superseded.
+    Revoked,
+    /// Nothing was learned — a network failure, throttling, or a server fault.
+    Unavailable,
+    /// A response arrived, but not one carrying a usable token.
+    Invalid,
+}
+
+impl TokenRequestError {
+    fn code(self) -> &'static str {
+        match self {
+            TokenRequestError::Revoked => "mail_oauth_refresh_revoked",
+            TokenRequestError::Unavailable => "mail_oauth_token_unavailable",
+            TokenRequestError::Invalid => "mail_oauth_token_invalid",
+        }
+    }
+}
+
+/// Both Google and Microsoft answer a dead grant with a 4xx carrying
+/// `error: invalid_grant`. Everything else — 429, a 5xx, a captive portal's
+/// HTML — describes the moment rather than the credential, and the stored
+/// refresh token is still the right thing to try again with.
+fn classify_token_failure(status: reqwest::StatusCode, body: &str) -> TokenRequestError {
+    if !matches!(status.as_u16(), 400 | 401) {
+        return TokenRequestError::Unavailable;
+    }
+    let error = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| value["error"].as_str().map(str::to_string))
+        .unwrap_or_default();
+    if error == "invalid_grant" {
+        TokenRequestError::Revoked
+    } else {
+        TokenRequestError::Unavailable
+    }
+}
+
+async fn request_token(
+    endpoint: &str,
+    params: &[(&str, String)],
+) -> Result<OAuthTokenResponse, TokenRequestError> {
+    let response = reqwest::Client::new()
+        .post(endpoint)
+        .form(params)
+        .send()
+        .await
+        .map_err(|_| TokenRequestError::Unavailable)?;
+    let status = response.status();
+    if !status.is_success() {
+        // An OAuth error response is a code and a description; the request
+        // carried the secrets, the failure body does not.
+        let body = response.text().await.unwrap_or_default();
+        return Err(classify_token_failure(status, &body));
+    }
+    let token = response
+        .json::<OAuthTokenResponse>()
+        .await
+        .map_err(|_| TokenRequestError::Invalid)?;
+    if token.access_token.is_empty() || token.expires_in <= 0 {
+        return Err(TokenRequestError::Invalid);
+    }
+    Ok(token)
+}
+
 async fn exchange_code(
     provider: DiscoveredProvider,
     code: &str,
@@ -349,23 +423,14 @@ async fn exchange_code(
             params.push(("client_secret", secret));
         }
     }
-    let response = reqwest::Client::new()
-        .post(endpoint)
-        .form(&params)
-        .send()
+    request_token(endpoint, &params)
         .await
-        .map_err(|_| "mail_oauth_token_failed".to_string())?;
-    if !response.status().is_success() {
-        return Err("mail_oauth_token_failed".to_string());
-    }
-    let token = response
-        .json::<OAuthTokenResponse>()
-        .await
-        .map_err(|_| "mail_oauth_token_invalid".to_string())?;
-    if token.access_token.is_empty() || token.expires_in <= 0 {
-        return Err("mail_oauth_token_invalid".to_string());
-    }
-    Ok(token)
+        .map_err(|error| match error {
+            TokenRequestError::Invalid => "mail_oauth_token_invalid".to_string(),
+            // The user is standing in front of an interactive sign-in here, so
+            // every other reason ends the same way: the attempt did not work.
+            _ => "mail_oauth_token_failed".to_string(),
+        })
 }
 
 pub(crate) async fn refresh_mail_oauth_token(
@@ -382,6 +447,11 @@ pub(crate) async fn refresh_mail_oauth_token(
     };
     let stored = crate::db::load_tokens(account_id)
         .ok_or_else(|| "mail_oauth_refresh_token_missing".to_string())?;
+    if stored.refresh_token.is_empty() {
+        // The marker a revoked grant leaves behind. Asking the server again
+        // would only repeat the same answer, so fail without the round trip.
+        return Err("mail_oauth_refresh_revoked".to_string());
+    }
     let (endpoint, client_id, scopes) = match provider {
         DiscoveredProvider::Google => (
             "https://oauth2.googleapis.com/token",
@@ -408,22 +478,14 @@ pub(crate) async fn refresh_mail_oauth_token(
             params.push(("client_secret", secret));
         }
     }
-    let response = reqwest::Client::new()
-        .post(endpoint)
-        .form(&params)
-        .send()
-        .await
-        .map_err(|_| "mail_oauth_token_failed".to_string())?;
-    if !response.status().is_success() {
-        return Err("mail_oauth_token_failed".to_string());
-    }
-    let token = response
-        .json::<OAuthTokenResponse>()
-        .await
-        .map_err(|_| "mail_oauth_token_invalid".to_string())?;
-    if token.access_token.is_empty() || token.expires_in <= 0 {
-        return Err("mail_oauth_token_invalid".to_string());
-    }
+    let token = request_token(endpoint, &params).await.map_err(|error| {
+        if error == TokenRequestError::Revoked {
+            // Record it, so every later attempt fails here instead of on the
+            // network, and so the next sign-in asks for consent again.
+            let _ = crate::db::mark_oauth_session_revoked(account_id);
+        }
+        error.code().to_string()
+    })?;
     let expires_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|_| "mail_oauth_token_invalid".to_string())?
@@ -433,7 +495,13 @@ pub(crate) async fn refresh_mail_oauth_token(
         account_id,
         &crate::db::StoredTokens {
             access_token: token.access_token,
-            refresh_token: token.refresh_token.unwrap_or(stored.refresh_token),
+            // A provider that rotates its refresh tokens sends a new one;
+            // Google sends none and keeps the old one alive. An empty string is
+            // neither, and storing it would end the account's session for good.
+            refresh_token: token
+                .refresh_token
+                .filter(|value| !value.is_empty())
+                .unwrap_or(stored.refresh_token),
             expires_at: Some(expires_at),
         },
     )?;
@@ -587,7 +655,18 @@ pub async fn start_mail_oauth(
     let state = random_string(32);
     let nonce = random_string(32);
     let (verifier, challenge) = pkce_pair();
-    let authorization_url = build_authorization_url(provider, &email, &state, &nonce, &challenge)?;
+    // Without a refresh token this app cannot renew anything, so the consent
+    // screen has to run; with one, a silent re-authorization keeps it.
+    let has_refresh_token = crate::db::load_tokens(&email)
+        .is_some_and(|tokens| !tokens.refresh_token.is_empty());
+    let authorization_url = build_authorization_url(
+        provider,
+        &email,
+        &state,
+        &nonce,
+        &challenge,
+        !has_refresh_token,
+    )?;
     let code = wait_for_callback(&app, state, authorization_url).await?;
     let token = exchange_code(provider, &code, &verifier).await?;
     let (authorized_email, picture) = authorized_identity(provider, &token, &nonce).await?;
@@ -680,7 +759,10 @@ pub fn cancel_mail_oauth(
 
 #[cfg(test)]
 mod tests {
-    use super::{account_input, normalize_email, provider_for_domain, DiscoveredProvider};
+    use super::{
+        account_input, build_authorization_url, classify_token_failure, normalize_email,
+        provider_for_domain, DiscoveredProvider, TokenRequestError,
+    };
 
     #[test]
     fn discovers_known_consumer_providers() {
@@ -707,6 +789,57 @@ mod tests {
             "person@gmail.com"
         );
         assert!(normalize_email("not-an-email").is_err());
+    }
+
+    #[test]
+    fn only_a_rejected_grant_ends_the_session() {
+        assert_eq!(
+            classify_token_failure(
+                reqwest::StatusCode::BAD_REQUEST,
+                r#"{"error":"invalid_grant","error_description":"Token has been expired or revoked."}"#
+            ),
+            TokenRequestError::Revoked
+        );
+        // A throttled or broken endpoint says nothing about the credential.
+        assert_eq!(
+            classify_token_failure(reqwest::StatusCode::TOO_MANY_REQUESTS, ""),
+            TokenRequestError::Unavailable
+        );
+        assert_eq!(
+            classify_token_failure(reqwest::StatusCode::INTERNAL_SERVER_ERROR, "<html>"),
+            TokenRequestError::Unavailable
+        );
+        // A misconfigured client is not something a new sign-in can repair.
+        assert_eq!(
+            classify_token_failure(
+                reqwest::StatusCode::UNAUTHORIZED,
+                r#"{"error":"invalid_client"}"#
+            ),
+            TokenRequestError::Unavailable
+        );
+        assert_eq!(
+            classify_token_failure(reqwest::StatusCode::BAD_REQUEST, "not json"),
+            TokenRequestError::Unavailable
+        );
+    }
+
+    #[test]
+    fn consent_is_requested_only_without_a_refresh_token() {
+        let with_consent =
+            build_authorization_url(DiscoveredProvider::Google, "person@gmail.com", "s", "n", "c", true)
+                .unwrap_or_default();
+        let without_consent =
+            build_authorization_url(DiscoveredProvider::Google, "person@gmail.com", "s", "n", "c", false)
+                .unwrap_or_default();
+        // A build without client credentials configured returns an error for
+        // both, which would make this assertion vacuous.
+        if with_consent.is_empty() || without_consent.is_empty() {
+            return;
+        }
+        assert!(with_consent.contains("prompt=consent"));
+        assert!(with_consent.contains("access_type=offline"));
+        assert!(without_consent.contains("prompt=select_account"));
+        assert!(without_consent.contains("access_type=offline"));
     }
 
     #[test]

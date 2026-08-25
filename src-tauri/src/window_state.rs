@@ -27,8 +27,8 @@ fn state_path(app: &AppHandle) -> Result<PathBuf, String> {
     let dir = app
         .path()
         .app_data_dir()
-        .map_err(|e| format!("Pencere ayar klasoru bulunamadi: {e}"))?;
-    fs::create_dir_all(&dir).map_err(|e| format!("Pencere ayar klasoru olusturulamadi: {e}"))?;
+        .map_err(|e| format!("Window settings folder could not be found: {e}"))?;
+    fs::create_dir_all(&dir).map_err(|e| format!("Window settings folder could not be created: {e}"))?;
     Ok(dir.join(WINDOW_STATE_FILE))
 }
 
@@ -53,25 +53,25 @@ pub fn restore_window_state(app: &AppHandle) -> Result<(), String> {
 
     window
         .set_size(PhysicalSize::new(state.width, state.height))
-        .map_err(|e| format!("Pencere boyutu geri yüklenemedi: {e}"))?;
+        .map_err(|e| format!("Window size could not be restored: {e}"))?;
     if saved_position_is_visible(app, &state) {
         window
             .set_position(PhysicalPosition::new(state.x, state.y))
-            .map_err(|e| format!("Pencere konumu geri yüklenemedi: {e}"))?;
+            .map_err(|e| format!("Window position could not be restored: {e}"))?;
     } else {
         window
             .center()
-            .map_err(|e| format!("Pencere ortalanamadı: {e}"))?;
+            .map_err(|e| format!("Window could not be centered: {e}"))?;
     }
 
     if state.fullscreen {
         window
             .set_fullscreen(true)
-            .map_err(|e| format!("Tam ekran durumu geri yüklenemedi: {e}"))?;
+            .map_err(|e| format!("Fullscreen state could not be restored: {e}"))?;
     } else if state.maximized {
         window
             .maximize()
-            .map_err(|e| format!("Ekranı kaplama durumu geri yüklenemedi: {e}"))?;
+            .map_err(|e| format!("Maximized state could not be restored: {e}"))?;
     }
     Ok(())
 }
@@ -83,7 +83,7 @@ pub fn save_window_state(window: &Window) -> Result<(), String> {
 
     let is_minimized = window
         .is_minimized()
-        .map_err(|e| format!("Pencere durumu okunamadı: {e}"))?;
+        .map_err(|e| format!("Window state could not be read: {e}"))?;
     if is_minimized {
         return Ok(());
     }
@@ -94,10 +94,10 @@ pub fn save_window_state(window: &Window) -> Result<(), String> {
 
     let size = window
         .outer_size()
-        .map_err(|e| format!("Pencere boyutu okunamadı: {e}"))?;
+        .map_err(|e| format!("Window size could not be read: {e}"))?;
     let position = window
         .outer_position()
-        .map_err(|e| format!("Pencere konumu okunamadı: {e}"))?;
+        .map_err(|e| format!("Window position could not be read: {e}"))?;
 
     if size.width < 600 || size.height < 600 {
         return Ok(());
@@ -123,10 +123,10 @@ pub fn save_window_state(window: &Window) -> Result<(), String> {
     let app = window.app_handle();
     let path = state_path(&app)?;
     let json = serde_json::to_string_pretty(&state)
-        .map_err(|e| format!("Pencere durumu hazırlanamadı: {e}"))?;
+        .map_err(|e| format!("Window state could not be prepared: {e}"))?;
 
     crate::safe_fs::atomic_write(&path, json.as_bytes())
-        .map_err(|e| format!("Pencere durumu kaydedilemedi: {e}"))
+        .map_err(|e| format!("Window state could not be saved: {e}"))
 }
 
 /// Captures the normal window bounds after Windows finishes a

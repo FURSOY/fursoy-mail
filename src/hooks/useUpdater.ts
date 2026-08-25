@@ -61,6 +61,7 @@ export function useUpdater({ locale, showToast, shouldDeferNetwork }: UseUpdater
             code: null,
             emailId: null,
             duration: 10_000,
+            dismissAllLabel: locale.common.dismissAll,
           });
         }
       } else {

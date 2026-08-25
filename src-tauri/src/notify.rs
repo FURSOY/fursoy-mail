@@ -31,6 +31,8 @@ pub struct NotificationPayload {
     pub copied_label: Option<String>,
     #[serde(rename = "copyFailedLabel")]
     pub copy_failed_label: Option<String>,
+    #[serde(rename = "dismissAllLabel")]
+    pub dismiss_all_label: Option<String>,
 }
 
 pub struct PendingNotification {
@@ -134,6 +136,7 @@ pub async fn show_custom_notification(
     copy_label: Option<String>,
     copied_label: Option<String>,
     copy_failed_label: Option<String>,
+    dismiss_all_label: Option<String>,
 ) -> Result<(), String> {
     crate::require_command_window(&window, &["main"])?;
     if kind.as_deref() == Some("mail") {
@@ -172,6 +175,7 @@ pub async fn show_custom_notification(
         copy_label,
         copied_label,
         copy_failed_label,
+        dismiss_all_label,
     };
     let state = app.state::<PendingNotification>();
     let _lifecycle_guard = state.lifecycle.lock().await;
@@ -256,7 +260,7 @@ pub async fn show_custom_notification(
         .visible(false)
         .build()
         .map(|_| ())
-        .map_err(|e| format!("Bildirim penceresi oluşturulamadı: {e}"));
+        .map_err(|e| format!("Notification window could not be created: {e}"));
 
         if result.is_err() {
             if let Some(state) = app_clone.try_state::<PendingNotification>() {
@@ -269,11 +273,11 @@ pub async fn show_custom_notification(
         }
         let _ = result_sender.send(result);
     })
-    .map_err(|e| format!("Bildirim penceresi başlatılamadı: {e}"))?;
+    .map_err(|e| format!("Notification window could not be started: {e}"))?;
     tokio::time::timeout(std::time::Duration::from_secs(5), result_receiver)
         .await
-        .map_err(|_| "Bildirim penceresi zamanında başlatılamadı.".to_string())?
-        .map_err(|_| "Bildirim penceresi başlatılamadı.".to_string())?
+        .map_err(|_| "Notification window did not start in time.".to_string())?
+        .map_err(|_| "Notification window could not be started.".to_string())?
 }
 
 /// Called by notification window to get the initial payload
@@ -312,6 +316,7 @@ mod tests {
             copy_label: None,
             copied_label: None,
             copy_failed_label: None,
+            dismiss_all_label: None,
         }
     }
 
@@ -328,10 +333,7 @@ mod tests {
 
 /// Called by notification window to get screen info for repositioning
 #[tauri::command]
-pub fn get_screen_info(
-    window: tauri::WebviewWindow,
-    app: AppHandle,
-) -> Result<(f64, f64), String> {
+pub fn get_screen_info(window: tauri::WebviewWindow, app: AppHandle) -> Result<(f64, f64), String> {
     crate::require_command_window(&window, &["notification"])?;
     if let Ok(Some(monitor)) = app.primary_monitor() {
         let size = monitor.size();
@@ -348,10 +350,10 @@ pub fn get_screen_info(
 pub fn show_main_window(window: &tauri::WebviewWindow) -> Result<(), String> {
     window
         .show()
-        .map_err(|e| format!("Ana pencere gösterilemedi: {e}"))?;
+        .map_err(|e| format!("Main window could not be shown: {e}"))?;
     window
         .unminimize()
-        .map_err(|e| format!("Ana pencere geri yüklenemedi: {e}"))?;
+        .map_err(|e| format!("Main window could not be restored: {e}"))?;
     // Force WebView2 to re-render at correct DPI after being hidden.
     // Skip if maximized/fullscreen — set_size would un-maximize the window.
     let is_maximized = window.is_maximized().unwrap_or(false);
@@ -360,23 +362,20 @@ pub fn show_main_window(window: &tauri::WebviewWindow) -> Result<(), String> {
         if let Ok(size) = window.inner_size() {
             window
                 .set_size(tauri::PhysicalSize::new(size.width + 1, size.height))
-                .map_err(|e| format!("Ana pencere yeniden çizilemedi: {e}"))?;
+                .map_err(|e| format!("Main window could not be redrawn: {e}"))?;
             window
                 .set_size(tauri::PhysicalSize::new(size.width, size.height))
-                .map_err(|e| format!("Ana pencere boyutu geri yüklenemedi: {e}"))?;
+                .map_err(|e| format!("Main window size could not be restored: {e}"))?;
         }
     }
     window
         .set_focus()
-        .map_err(|e| format!("Ana pencereye odaklanılamadı: {e}"))
+        .map_err(|e| format!("Main window could not be focused: {e}"))
 }
 
 /// Called by notification window to focus the main window reliably via Rust
 #[tauri::command]
-pub fn focus_main_window(
-    window: tauri::WebviewWindow,
-    app: AppHandle,
-) -> Result<(), String> {
+pub fn focus_main_window(window: tauri::WebviewWindow, app: AppHandle) -> Result<(), String> {
     crate::require_command_window(&window, &["notification"])?;
     if let Some(window) = app.get_webview_window("main") {
         show_main_window(&window)?;

@@ -1,17 +1,17 @@
 # FURSOY Mail
 
-FURSOY Mail is a lightweight Windows Gmail client built around fast notifications and one-click access to verification codes.
+FURSOY Mail is a lightweight Windows mail client built around fast notifications and one-click access to verification codes.
 
-Instead of making users open Gmail, find a message, select a code, and copy it manually, FURSOY Mail detects likely OTP and verification codes and makes them available directly from the desktop notification.
+Instead of making users open a webmail page, find a message, select a code, and copy it manually, FURSOY Mail detects likely OTP and verification codes and makes them available directly from the desktop notification.
 
 [Download the latest Windows release](https://github.com/FURSOY/FURSOY-Mail/releases/latest)
 
 ## Highlights
 
-- Fast desktop notifications for new Gmail messages
+- Fast desktop notifications for new messages
 - OTP and verification-code detection with one-click copy
 - Notification modes for all mail, OTP-only, or no notifications
-- Multiple Google accounts with account-aware notifications
+- Multiple accounts with account-aware notifications
 - Local mail cache and search
 - Inbox, archive, sent, spam, and trash views
 - Compose, reply, reply all, forward, archive, trash, and restore actions
@@ -27,9 +27,13 @@ Instead of making users open Gmail, find a message, select a code, and copy it m
 FURSOY Mail currently supports:
 
 - Windows
-- Google and Gmail accounts
+- Any mail account reachable over IMAP and SMTP
 
-Other operating systems and email providers are not currently supported.
+Setup starts from an email address. Gmail and Outlook sign in through the
+browser and connect with OAuth; Yahoo and iCloud use app passwords; other
+domains fall back to manual server settings.
+
+Other operating systems are not currently supported.
 
 ## Installation
 

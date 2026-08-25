@@ -155,7 +155,20 @@ export function LabelPicker({
                 setQuery(event.target.value);
                 setChoosingCreateLocation(false);
               }}
-              onKeyDown={event => { if (event.key === "Enter") void createLabel(null); }}
+              onKeyDown={event => {
+                if (event.key !== "Enter") return;
+                // Enter on a name that already exists means "use that one",
+                // not "make a second one and fail on the duplicate".
+                const existing = labels.find(label =>
+                  label.name.toLocaleLowerCase() === query.trim().toLocaleLowerCase());
+                if (existing) {
+                  setPendingId(existing.id);
+                  void onToggle(existing.id, !labelIds.includes(existing.id))
+                    .finally(() => setPendingId(null));
+                  return;
+                }
+                void createLabel(null);
+              }}
               placeholder={tr.labels.search}
               aria-label={tr.labels.search}
               className="min-w-0 flex-1 bg-transparent text-xs text-zinc-200 outline-none placeholder:text-zinc-600"

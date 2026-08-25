@@ -6,6 +6,7 @@ import {
   formatRelativeTime,
   isAuthFailure,
   isNoUpdateError,
+  isSessionRevoked,
   minutesFromTime,
   normalizeComposerLinkUrl,
   parseMailtoUrl,
@@ -24,6 +25,21 @@ describe("error classification", () => {
 
   it("does not treat an insufficient-scope response as an expired token", () => {
     expect(isAuthFailure("403 Request had insufficient authentication scopes")).toBe(false);
+  });
+
+  it("separates a rejected credential from a refresh that could not run", () => {
+    expect(isSessionRevoked("mail_oauth_refresh_revoked")).toBe(true);
+    expect(isSessionRevoked(new Error("invalid_grant"))).toBe(true);
+    expect(isSessionRevoked("mail_oauth_refresh_token_missing")).toBe(true);
+    // Reachability, not the credential: the stored session must survive these.
+    expect(isSessionRevoked("mail_oauth_token_unavailable")).toBe(false);
+    expect(isSessionRevoked(new Error("401 Unauthorized"))).toBe(false);
+    expect(isSessionRevoked("connection timed out")).toBe(false);
+  });
+
+  it("keeps a refresh that could not be completed out of the auth failures", () => {
+    expect(isAuthFailure("mail_oauth_refresh_revoked")).toBe(true);
+    expect(isAuthFailure("mail_oauth_token_unavailable")).toBe(false);
   });
 
   it("recognizes updater responses that mean there is no newer version", () => {

@@ -122,15 +122,41 @@ describe("authenticated mail actions", () => {
     expect(deps.markAccountExpired).not.toHaveBeenCalled();
   });
 
-  it("marks only the affected account expired when refresh fails", async () => {
+  it("marks only the affected account expired when the credential is rejected", async () => {
     const deps = dependencies();
-    deps.refreshAccessToken.mockRejectedValueOnce(new Error("refresh failed"));
+    deps.refreshAccessToken.mockRejectedValueOnce(new Error("mail_oauth_refresh_revoked"));
 
     await expect(runAuthenticatedMailAction({
       accountId: "account-b", currentToken: "expired-token", reloginRequiredMessage: "Relogin",
       action: vi.fn(async () => { throw new Error("401 Unauthorized"); }),
       ...deps,
-    })).rejects.toThrow("refresh failed");
+    })).rejects.toThrow("mail_oauth_refresh_revoked");
+
+    expect(deps.markAccountExpired).toHaveBeenCalledWith("account-b");
+  });
+
+  it("keeps the session when the refresh could not be completed", async () => {
+    const deps = dependencies();
+    deps.refreshAccessToken.mockRejectedValueOnce(new Error("mail_oauth_token_unavailable"));
+
+    await expect(runAuthenticatedMailAction({
+      accountId: "account-b", currentToken: "expired-token", reloginRequiredMessage: "Relogin",
+      action: vi.fn(async () => { throw new Error("401 Unauthorized"); }),
+      ...deps,
+    })).rejects.toThrow("mail_oauth_token_unavailable");
+
+    expect(deps.markAccountExpired).not.toHaveBeenCalled();
+  });
+
+  it("asks for a new sign-in when the refresh reports no session", async () => {
+    const deps = dependencies();
+    deps.refreshAccessToken.mockResolvedValueOnce({ authenticated: false });
+
+    await expect(runAuthenticatedMailAction({
+      accountId: "account-b", currentToken: "expired-token", reloginRequiredMessage: "Relogin",
+      action: vi.fn(async () => { throw new Error("401 Unauthorized"); }),
+      ...deps,
+    })).rejects.toThrow("Relogin");
 
     expect(deps.markAccountExpired).toHaveBeenCalledWith("account-b");
   });

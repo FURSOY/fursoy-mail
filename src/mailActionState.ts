@@ -1,5 +1,5 @@
 import type { EmailSummary } from "./types";
-import { isAuthFailure } from "./utils";
+import { isAuthFailure, isSessionRevoked } from "./utils";
 
 export type MailMutationQueue = Map<string, Promise<void>>;
 
@@ -40,16 +40,23 @@ export async function runAuthenticatedMailAction(options: AuthenticatedMailActio
     await action(currentToken);
   } catch (error) {
     if (!isAuthFailure(error)) throw error;
+    let refreshed: { authenticated: boolean };
     try {
-      const refreshed = await refreshAccessToken(accountId);
-      if (!refreshed.authenticated) throw new Error(reloginRequiredMessage);
-      upsertToken(accountId, "active");
-      clearExpiredAccount(accountId);
-      await action("active");
+      refreshed = await refreshAccessToken(accountId);
     } catch (refreshError) {
-      markAccountExpired(accountId);
+      // A refresh that could not be completed says nothing about the stored
+      // credential, so the account keeps its session and the next action tries
+      // again. Only a credential the provider rejected costs a sign-in.
+      if (isSessionRevoked(refreshError)) markAccountExpired(accountId);
       throw refreshError;
     }
+    if (!refreshed.authenticated) {
+      markAccountExpired(accountId);
+      throw new Error(reloginRequiredMessage);
+    }
+    upsertToken(accountId, "active");
+    clearExpiredAccount(accountId);
+    await action("active");
   }
 }
 

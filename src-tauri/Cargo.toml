@@ -27,8 +27,10 @@ serde_json = "1"
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 tokio = { version = "1.37", features = ["full"] }
-imap-rs = "0.2.4"
 imap = "2.4.1"
+# Already compiled as `imap`'s own parser. Named directly because `imap` drops
+# the CONDSTORE parts of a response it has no fields for.
+imap-proto = "0.10.2"
 native-tls = "0.2"
 lettre = { version = "0.11.22", default-features = false, features = ["smtp-transport", "pool", "hostname", "builder", "tokio1-native-tls"] }
 mailparse = "0.16"

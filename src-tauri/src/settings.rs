@@ -11,10 +11,7 @@ use windows::{
         RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE, REG_OPTION_NON_VOLATILE,
         REG_SZ, REG_VALUE_TYPE,
     },
-    Win32::UI::{
-        Shell::ShellExecuteW,
-        WindowsAndMessaging::SW_SHOWNORMAL,
-    },
+    Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL},
 };
 
 #[cfg(target_os = "windows")]
@@ -279,6 +276,12 @@ pub fn set_app_language(
     let mut controls = read_app_controls(&app);
     controls.app_language = language;
     write_app_controls(&app, &controls)?;
+    if let Some(handles) = app.try_state::<crate::TrayMenuHandles>() {
+        let (mute_label, pause_label, quit_label) = crate::tray_labels(&controls.app_language);
+        let _ = handles.mute.set_text(mute_label);
+        let _ = handles.pause.set_text(pause_label);
+        let _ = handles.quit.set_text(quit_label);
+    }
     Ok(controls)
 }
 
@@ -316,7 +319,13 @@ fn reg_open(access: windows::Win32::System::Registry::REG_SAM_FLAGS) -> Result<H
     let subkey = to_wide_null(r"Software\Microsoft\Windows\CurrentVersion\Run");
     let mut hkey = HKEY::default();
     let err = unsafe {
-        RegOpenKeyExW(HKEY_CURRENT_USER, PCWSTR(subkey.as_ptr()), Some(0), access, &mut hkey)
+        RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            PCWSTR(subkey.as_ptr()),
+            Some(0),
+            access,
+            &mut hkey,
+        )
     };
     if err == ERROR_SUCCESS {
         Ok(hkey)
@@ -331,21 +340,24 @@ fn write_startup_value(command: &str) -> Result<(), String> {
     let value_name = to_wide_null(STARTUP_VALUE_NAME);
     let data: Vec<u16> = command.encode_utf16().chain(std::iter::once(0)).collect();
     let bytes = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 2) };
-    let err = unsafe {
-        RegSetValueExW(
-            hkey,
-            PCWSTR(value_name.as_ptr()),
-            None,
-            REG_SZ,
-            Some(bytes),
-        )
-    };
-    unsafe { let _ = RegCloseKey(hkey); }
-    if err == ERROR_SUCCESS { Ok(()) } else { Err(format!("Baslangic kaydi eklenemedi: {err:?}")) }
+    let err =
+        unsafe { RegSetValueExW(hkey, PCWSTR(value_name.as_ptr()), None, REG_SZ, Some(bytes)) };
+    unsafe {
+        let _ = RegCloseKey(hkey);
+    }
+    if err == ERROR_SUCCESS {
+        Ok(())
+    } else {
+        Err(format!("Baslangic kaydi eklenemedi: {err:?}"))
+    }
 }
 
 #[cfg(target_os = "windows")]
-fn write_registry_string(subkey: &str, value_name: Option<&str>, value: &str) -> Result<(), String> {
+fn write_registry_string(
+    subkey: &str,
+    value_name: Option<&str>,
+    value: &str,
+) -> Result<(), String> {
     let subkey = to_wide_null(subkey);
     let mut hkey = HKEY::default();
     let err = unsafe {
@@ -370,8 +382,7 @@ fn write_registry_string(subkey: &str, value_name: Option<&str>, value: &str) ->
         .as_ref()
         .map_or(PCWSTR::null(), |name| PCWSTR(name.as_ptr()));
     let data = to_wide_null(value);
-    let bytes =
-        unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 2) };
+    let bytes = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 2) };
     let err = unsafe { RegSetValueExW(hkey, value_name_ptr, None, REG_SZ, Some(bytes)) };
     unsafe {
         let _ = RegCloseKey(hkey);
@@ -459,9 +470,14 @@ fn delete_startup_value() -> Result<(), String> {
     };
     let value_name = to_wide_null(STARTUP_VALUE_NAME);
     let err = unsafe { RegDeleteValueW(hkey, PCWSTR(value_name.as_ptr())) };
-    unsafe { let _ = RegCloseKey(hkey); }
-    if err == ERROR_SUCCESS || err == ERROR_FILE_NOT_FOUND { Ok(()) }
-    else { Err(format!("Baslangic kaydi silinemedi: {err:?}")) }
+    unsafe {
+        let _ = RegCloseKey(hkey);
+    }
+    if err == ERROR_SUCCESS || err == ERROR_FILE_NOT_FOUND {
+        Ok(())
+    } else {
+        Err(format!("Baslangic kaydi silinemedi: {err:?}"))
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -475,10 +491,19 @@ fn read_startup_value() -> Result<Option<String>, String> {
     let mut size: u32 = 0;
     // First call: get required buffer size
     let size_err = unsafe {
-        RegQueryValueExW(hkey, PCWSTR(value_name.as_ptr()), None, Some(&mut data_type), None, Some(&mut size))
+        RegQueryValueExW(
+            hkey,
+            PCWSTR(value_name.as_ptr()),
+            None,
+            Some(&mut data_type),
+            None,
+            Some(&mut size),
+        )
     };
     if size_err != ERROR_SUCCESS {
-        unsafe { let _ = RegCloseKey(hkey); }
+        unsafe {
+            let _ = RegCloseKey(hkey);
+        }
         return if size_err == ERROR_FILE_NOT_FOUND {
             Ok(None)
         } else {
@@ -486,7 +511,9 @@ fn read_startup_value() -> Result<Option<String>, String> {
         };
     }
     if size == 0 {
-        unsafe { let _ = RegCloseKey(hkey); }
+        unsafe {
+            let _ = RegCloseKey(hkey);
+        }
         return Ok(None);
     }
     let mut buffer = vec![0u8; size as usize];
@@ -500,13 +527,19 @@ fn read_startup_value() -> Result<Option<String>, String> {
             Some(&mut size),
         )
     };
-    unsafe { let _ = RegCloseKey(hkey); }
-    if err != ERROR_SUCCESS { return Ok(None); }
+    unsafe {
+        let _ = RegCloseKey(hkey);
+    }
+    if err != ERROR_SUCCESS {
+        return Ok(None);
+    }
     let words: Vec<u16> = buffer
         .chunks_exact(2)
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
         .collect();
-    let s = String::from_utf16_lossy(&words).trim_end_matches('\0').to_string();
+    let s = String::from_utf16_lossy(&words)
+        .trim_end_matches('\0')
+        .to_string();
     Ok(if s.is_empty() { None } else { Some(s) })
 }
 
@@ -536,10 +569,7 @@ pub fn get_launch_at_startup(window: tauri::WebviewWindow) -> Result<bool, Strin
 }
 
 #[tauri::command]
-pub fn set_launch_at_startup(
-    window: tauri::WebviewWindow,
-    enabled: bool,
-) -> Result<bool, String> {
+pub fn set_launch_at_startup(window: tauri::WebviewWindow, enabled: bool) -> Result<bool, String> {
     crate::require_command_window(&window, &["main"])?;
     #[cfg(target_os = "windows")]
     {

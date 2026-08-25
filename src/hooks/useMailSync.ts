@@ -1,24 +1,27 @@
 import { useCallback, useEffect, useRef, useState, useTransition, type MutableRefObject } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { AppLocale, AppLanguage } from "../i18n";
 import { updateNotificationBaseline } from "../mailSyncState";
 import { syncIntervalDelayMs } from "../syncInterval";
 import type { Account, AppControls, EmailSummary, OtpMode } from "../types";
-import { tauriApi } from "../tauriApi";
-import { extractVerificationCode, isAuthFailure, isInQuietHours, MAIL_PAGE_SIZE, MAIL_TABS } from "../utils";
+import { tauriApi, type ImapChangeEvent } from "../tauriApi";
+import { extractVerificationCode, isAuthFailure, isInQuietHours, isMailListTab, isSessionRevoked, MAIL_PAGE_SIZE } from "../utils";
 
 interface SyncOptions {
   userInitiated?: boolean;
   suppressNotifications?: boolean;
-  eventDriven?: boolean;
   accountId?: string;
   accountIds?: string[];
 }
 
 interface UseMailSyncOptions {
   accounts: Account[];
+  accountTokens: Record<string, string>;
   accountsRef: MutableRefObject<Account[]>;
   accountTokensRef: MutableRefObject<Record<string, string>>;
+  activeAccountId: string | null;
+  activeTab: string;
   activeAccountIdRef: MutableRefObject<string | null>;
   expiredAccountsRef: MutableRefObject<Set<string>>;
   tokenExpiredRef: MutableRefObject<boolean>;
@@ -50,10 +53,33 @@ interface UseMailSyncOptions {
   showToast: (message: string, type?: "error" | "success" | "info") => void;
 }
 
+/// Which mailbox role a tab corresponds to for live-push purposes, or `null`
+/// when the tab has no single IMAP mailbox behind it (a cross-mailbox view
+/// like starred/all, or a Gmail label, which is not an IMAP mailbox at all).
+function watchableFolderRole(tab: string): string | null {
+  switch (tab) {
+    case "sent": return "sent";
+    case "archive": return "archive";
+    case "spam": return "junk";
+    case "trash": return "trash";
+    default:
+      return tab.startsWith("custom:") ? tab : null;
+  }
+}
+
+interface WatchTarget {
+  accountId: string;
+  role: string;
+}
+
+function watchTargetKey(target: WatchTarget): string {
+  return JSON.stringify(target);
+}
+
 export function useMailSync(options: UseMailSyncOptions) {
   const {
-    accounts, accountsRef, accountTokensRef, activeAccountIdRef,
-    expiredAccountsRef, tokenExpiredRef, appControlsRef, activeTabRef,
+    accounts, accountTokens, accountsRef, accountTokensRef, activeAccountId, activeTab,
+    activeAccountIdRef, expiredAccountsRef, tokenExpiredRef, appControlsRef, activeTabRef,
     syncIntervalRef, syncChainIdRef, backgroundSyncRef, recentNotificationsRef,
     knownEmailIdsRef, notificationReadyAccountIdsRef, notificationBaselineEpochRef,
     pendingUnreadBadgeDeltasRef, emailsLength, syncIntervalSeconds,
@@ -73,7 +99,31 @@ export function useMailSync(options: UseMailSyncOptions) {
   const backgroundSyncFlightRef = useRef<Promise<boolean> | null>(null);
   const pendingSyncAccountIdsRef = useRef<Set<string>>(new Set());
   const pendingFullSyncRef = useRef(false);
-  const pendingEventDrivenSyncRef = useRef(false);
+  // Accounts become watchable only once their credential is loaded, which
+  // happens after the account list is published. Keying the watcher effect on
+  // the account list alone would start it while no account had a token yet and
+  // never re-run, so derive the set from token state and restart only when the
+  // membership itself changes, not on every token value update. Every
+  // token-bearing account always wants its inbox watched; the account and tab
+  // currently open in the UI additionally wants its own folder watched, when
+  // that folder maps to a single IMAP mailbox at all (see watchableFolderRole).
+  const watchableTargets = new Map<string, WatchTarget>();
+  for (const account of accounts) {
+    if (!accountTokens[account.id]) continue;
+    const inboxTarget: WatchTarget = { accountId: account.id, role: "inbox" };
+    watchableTargets.set(watchTargetKey(inboxTarget), inboxTarget);
+    if (account.id === activeAccountId) {
+      const role = watchableFolderRole(activeTab);
+      if (role) {
+        const target: WatchTarget = { accountId: account.id, role };
+        watchableTargets.set(watchTargetKey(target), target);
+      }
+    }
+  }
+  const watchableKey = [...watchableTargets.keys()].sort().join("|");
+  const watchableTargetsRef = useRef<Map<string, WatchTarget>>(watchableTargets);
+  watchableTargetsRef.current = watchableTargets;
+  const watchedTargetsRef = useRef<Map<string, WatchTarget>>(new Map());
   syncIntervalSecondsRef.current = syncIntervalSeconds;
   notificationDurationRef.current = notificationDuration;
   notificationInfiniteRef.current = notificationInfinite;
@@ -88,19 +138,30 @@ export function useMailSync(options: UseMailSyncOptions) {
       return token;
     } catch (error) {
       if (!isAuthFailure(error)) throw error;
+      let refreshed: { authenticated: boolean };
       try {
-        const refreshed = await refreshAccessToken(accountId);
-        if (!refreshed.authenticated) throw new Error(locale.messages.reloginRequired);
-        upsertToken(accountId, "active");
-        clearExpiredAccount(accountId);
-        setSessionExpired(false);
-        await tauriApi.syncEmails(accountId, force);
-        return "active";
-      } catch {
-        console.error("Token refresh failed.");
+        refreshed = await refreshAccessToken(accountId);
+      } catch (refreshError) {
+        // Only a credential the provider rejected means the account has to be
+        // signed in to again. A refresh that could not be reached — no network
+        // yet after a resume, a throttled or failing endpoint — leaves the
+        // stored session intact for the next round.
+        if (!isSessionRevoked(refreshError)) throw new Error(locale.messages.refreshFailed);
+        console.error("The stored session was rejected.");
         markAccountExpired(accountId);
         throw new Error(locale.messages.reloginRequired);
       }
+      if (!refreshed.authenticated) {
+        markAccountExpired(accountId);
+        throw new Error(locale.messages.reloginRequired);
+      }
+      upsertToken(accountId, "active");
+      clearExpiredAccount(accountId);
+      setSessionExpired(false);
+      // The renewed session is what the retry proves; a mailbox that fails now
+      // is a sync problem, not an expired account.
+      await tauriApi.syncEmails(accountId, force);
+      return "active";
     }
   }, [clearExpiredAccount, locale, markAccountExpired, refreshAccessToken, setSessionExpired, upsertToken]);
 
@@ -169,6 +230,7 @@ export function useMailSync(options: UseMailSyncOptions) {
           copyLabel: locale.common.copy,
           copiedLabel: locale.common.copied,
           copyFailedLabel: locale.common.copyFailedRetry,
+          dismissAllLabel: locale.common.dismissAll,
         });
       }
     } catch (error) {
@@ -184,19 +246,18 @@ export function useMailSync(options: UseMailSyncOptions) {
     }
   }, [syncChainIdRef, syncIntervalRef]);
 
+  // The backend watcher delivers inbox changes promptly, but it only covers the
+  // inbox of servers that support IDLE. This timer is what keeps every other
+  // mailbox current, and the floor under an account whose watcher cannot run.
   const startPeriodicSync = useCallback(() => {
     clearPeriodicSync();
-    const legacyAccountIds = accountsRef.current
-      .filter(account => account.provider === "google")
-      .map(account => account.id);
-    if (legacyAccountIds.length === 0) return;
     const chainId = syncChainIdRef.current;
     const scheduleNext = () => {
       if (syncChainIdRef.current !== chainId) return;
       syncIntervalRef.current = window.setTimeout(async () => {
         if (syncChainIdRef.current !== chainId) return;
         if (Object.keys(accountTokensRef.current).length > 0 && !tokenExpiredRef.current) {
-          await backgroundSyncRef.current({ accountIds: legacyAccountIds });
+          await backgroundSyncRef.current();
         }
         scheduleNext();
       }, syncIntervalDelayMs(syncIntervalSecondsRef.current));
@@ -207,6 +268,42 @@ export function useMailSync(options: UseMailSyncOptions) {
   useEffect(() => {
     if (Object.keys(accountTokensRef.current).length > 0) startPeriodicSync();
   }, [syncIntervalSeconds]);
+
+  // Everything that has to happen once an account's cache has moved, whether
+  // this app fetched the change or the backend watcher did. Reads only local
+  // state, so a watcher event costs no network.
+  const publishCacheChanges = useCallback(async (
+    changedAccountIds: Set<string>,
+    suppressNotifications: boolean,
+  ) => {
+    const readyAccountIds = notificationReadyAccountIdsRef.current;
+    const establishesBaseline = [...changedAccountIds]
+      .some(accountId => !readyAccountIds.has(accountId));
+    // The first successful sync builds a broad local baseline. Later ones read
+    // only the normal first page and merge it into the known-id set.
+    const freshInbox = await tauriApi.getEmailsByLabel({
+      label: "inbox",
+      accountId: null,
+      limit: establishesBaseline ? 5_000 : undefined,
+    });
+    const newUnreadEmails = updateNotificationBaseline({
+      freshInbox,
+      knownEmailIds: knownEmailIdsRef.current,
+      readyAccountIds,
+      successfullySyncedAccountIds: changedAccountIds,
+      suppressNotifications,
+    });
+    await notifyNewEmails(newUnreadEmails);
+    // A custom folder and a label tab each have their own list, and the
+    // watcher that just wrote to the cache is often watching exactly one of
+    // them. Refreshing only the fixed tabs is what left those lists stale
+    // until the user switched away and back.
+    if (isMailListTab(activeTabRef.current) && emailsLength <= MAIL_PAGE_SIZE) await loadEmails();
+    await refreshUnreadCount();
+  }, [
+    activeTabRef, emailsLength, knownEmailIdsRef, loadEmails,
+    notificationReadyAccountIdsRef, notifyNewEmails, refreshUnreadCount,
+  ]);
 
   const runBackgroundSync = useCallback(async (syncOptions?: SyncOptions): Promise<boolean> => {
     const requestedAccountIds = syncOptions?.accountId
@@ -222,7 +319,7 @@ export function useMailSync(options: UseMailSyncOptions) {
     const userInitiated = syncOptions?.userInitiated ?? false;
     const baselineEpoch = notificationBaselineEpochRef.current;
     if (appControlsRef.current.mailSyncPaused && !userInitiated) return false;
-    if (appControlsRef.current.notificationMode === "off" && !userInitiated && !syncOptions?.eventDriven) {
+    if (appControlsRef.current.notificationMode === "off" && !userInitiated) {
       const isVisible = await getCurrentWindow().isVisible().catch(() => true);
       if (!isVisible) return false;
     }
@@ -240,6 +337,8 @@ export function useMailSync(options: UseMailSyncOptions) {
         const token = tokens[account.id];
         if (!token || expiredAccountsRef.current.has(account.id)) continue;
         try {
+          // A sync the user asked for must not answer from a checkpoint that
+          // cannot see a message read or starred on another device.
           await syncAccountWithAutoRefresh(account.id, token, userInitiated);
           anySuccess = true;
           successfullySyncedAccountIds.add(account.id);
@@ -249,28 +348,9 @@ export function useMailSync(options: UseMailSyncOptions) {
       }
 
       if (anySuccess) {
-        const readyAccountIds = notificationReadyAccountIdsRef.current;
-        const establishesBaseline = [...successfullySyncedAccountIds]
-          .some(accountId => !readyAccountIds.has(accountId));
-        // The first successful sync builds a broad local baseline. Later syncs
-        // read only the normal first page and merge it into the known-id set.
-        const freshInbox = await tauriApi.getEmailsByLabel({
-          label: "inbox",
-          accountId: null,
-          limit: establishesBaseline ? 5_000 : undefined,
-        });
         const suppressNotifications = syncOptions?.suppressNotifications === true ||
           baselineEpoch !== notificationBaselineEpochRef.current;
-        const newUnreadEmails = updateNotificationBaseline({
-          freshInbox,
-          knownEmailIds: knownEmailIdsRef.current,
-          readyAccountIds,
-          successfullySyncedAccountIds,
-          suppressNotifications,
-        });
-        await notifyNewEmails(newUnreadEmails);
-        if (MAIL_TABS.has(activeTabRef.current) && emailsLength <= MAIL_PAGE_SIZE) await loadEmails();
-        await refreshUnreadCount();
+        await publishCacheChanges(successfullySyncedAccountIds, suppressNotifications);
       }
       return anySuccess;
     } catch (error) {
@@ -286,10 +366,9 @@ export function useMailSync(options: UseMailSyncOptions) {
       else setIsBackgroundSyncing(false);
     }
   }, [
-    accountsRef, accountTokensRef, activeTabRef, appControlsRef, emailsLength,
-    expiredAccountsRef, knownEmailIdsRef, loadEmails, locale, markSessionExpired,
-    notificationBaselineEpochRef, notificationReadyAccountIdsRef, notifyNewEmails,
-    refreshUnreadCount, shouldDeferNetwork, showToast, syncAccountWithAutoRefresh,
+    accountsRef, accountTokensRef, appControlsRef, expiredAccountsRef, locale,
+    markSessionExpired, notificationBaselineEpochRef, publishCacheChanges,
+    shouldDeferNetwork, showToast, syncAccountWithAutoRefresh,
   ]);
 
   const backgroundSync = useCallback((syncOptions?: SyncOptions): Promise<boolean> => {
@@ -303,7 +382,6 @@ export function useMailSync(options: UseMailSyncOptions) {
       } else {
         pendingFullSyncRef.current = true;
       }
-      pendingEventDrivenSyncRef.current ||= syncOptions?.eventDriven === true;
       return existing;
     }
 
@@ -314,12 +392,10 @@ export function useMailSync(options: UseMailSyncOptions) {
         backgroundSyncFlightRef.current = null;
         const runAll = pendingFullSyncRef.current;
         const accountIds = [...pendingSyncAccountIdsRef.current];
-        const eventDriven = pendingEventDrivenSyncRef.current;
         pendingFullSyncRef.current = false;
-        pendingEventDrivenSyncRef.current = false;
         pendingSyncAccountIdsRef.current.clear();
         if (runAll || accountIds.length > 0) {
-          void backgroundSync(runAll ? { eventDriven } : { accountIds, eventDriven });
+          void backgroundSync(runAll ? undefined : { accountIds });
         }
       }
     };
@@ -329,51 +405,61 @@ export function useMailSync(options: UseMailSyncOptions) {
 
   backgroundSyncRef.current = backgroundSync;
 
+  // The watchers themselves live in Rust: one connection per watched (account,
+  // mailbox) pair, parked on IDLE. This effect only owns which pairs have one,
+  // and starts or stops the ones that changed — the inbox for every
+  // token-bearing account, plus whatever folder is currently open in the UI.
   useEffect(() => {
-    let cancelled = false;
-    const timers = new Set<number>();
-    const wait = (milliseconds: number) => new Promise<void>(resolve => {
-      const timer = window.setTimeout(() => {
-        timers.delete(timer);
-        resolve();
-      }, milliseconds);
-      timers.add(timer);
-    });
-
-    const watchAccount = async (accountId: string) => {
-      while (!cancelled) {
-        try {
-          const outcome = await tauriApi.waitForImapChange(accountId);
-          if (cancelled) return;
-          if (outcome === "changed") {
-            await backgroundSyncRef.current({ accountId, eventDriven: true });
-          } else {
-            await wait(Math.max(syncIntervalDelayMs(syncIntervalSecondsRef.current), 60_000));
-            if (!cancelled) await backgroundSyncRef.current({ accountId, eventDriven: true });
-          }
-        } catch (error) {
-          if (cancelled) return;
-          if (isAuthFailure(error)) {
-            markAccountExpired(accountId, false);
-            return;
-          }
-          await wait(30_000);
-        }
-      }
-    };
-
-    for (const account of accounts) {
-      if (account.provider === "imap" && accountTokensRef.current[account.id]) {
-        void watchAccount(account.id);
-      }
+    const watched = watchedTargetsRef.current;
+    const wanted = watchableTargetsRef.current;
+    for (const [key, target] of [...watched]) {
+      if (wanted.has(key)) continue;
+      watched.delete(key);
+      void tauriApi.stopImapWatch(target.accountId, target.role).catch(() => {});
     }
+    for (const [key, target] of wanted) {
+      if (watched.has(key)) continue;
+      watched.set(key, target);
+      void tauriApi.startImapWatch(target.accountId, target.role).catch(() => {
+        // A watcher that could not start leaves the mailbox on the periodic
+        // sync, so let the next change try again.
+        watched.delete(key);
+      });
+    }
+  }, [watchableKey]);
 
+  // The watcher has already written the change to the cache, so this only has
+  // to publish it: no sync, no second connection to the server.
+  useEffect(() => {
+    const unlistenPromise = listen<ImapChangeEvent>("imap-mailbox-changed", event => {
+      const accountId = event.payload.accountId;
+      if (!accountId) return;
+      void publishCacheChanges(new Set([accountId]), false);
+    });
+    return () => { void unlistenPromise.then(unlisten => unlisten()); };
+  }, [publishCacheChanges]);
+
+  // The watcher is the only thing still talking to the server while the window
+  // sits idle, so a session it finds revoked has to reach the UI from here.
+  // Otherwise the account simply stops receiving mail with nothing said.
+  useEffect(() => {
+    const unlistenPromise = listen<ImapChangeEvent>("mail-session-expired", event => {
+      const accountId = event.payload.accountId;
+      if (!accountId) return;
+      markAccountExpired(accountId);
+    });
+    return () => { void unlistenPromise.then(unlisten => unlisten()); };
+  }, [markAccountExpired]);
+
+  useEffect(() => {
+    const watched = watchedTargetsRef.current;
     return () => {
-      cancelled = true;
-      for (const timer of timers) window.clearTimeout(timer);
-      timers.clear();
+      for (const target of watched.values()) {
+        void tauriApi.stopImapWatch(target.accountId, target.role).catch(() => {});
+      }
+      watched.clear();
     };
-  }, [accounts, accountTokensRef, backgroundSyncRef, markAccountExpired]);
+  }, []);
 
   return {
     isUserSyncing,

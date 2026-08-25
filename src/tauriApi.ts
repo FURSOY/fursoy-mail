@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Account, AppControls, AttachmentPayload, AuthInfo, DraftContent, DraftPage, EmailSummary, GmailLabel, SavedDraft, SendOutcome, ThreadGroup } from "./types";
+import type { Account, AppControls, AttachmentPayload, AuthInfo, CustomMailbox, DraftContent, DraftPage, EmailSummary, GmailLabel, SavedDraft, SendOutcome, ThreadGroup } from "./types";
 import type { AdvancedSearchCriteria } from "./advancedSearch";
 
 export interface MailboxDownloadStatus {
@@ -50,9 +50,13 @@ export interface CustomNotificationInput {
   copyLabel?: string;
   copiedLabel?: string;
   copyFailedLabel?: string;
+  dismissAllLabel?: string;
 }
 
-export type ImapIdleOutcome = "changed" | "unsupported";
+/** Emitted by the backend watcher after a server-reported change reached the local cache. */
+export interface ImapChangeEvent {
+  accountId: string;
+}
 
 export type MailSecurity = "tls" | "starttls";
 
@@ -113,13 +117,13 @@ export const tauriApi = {
     invoke<Account>("add_mail_account", { input }),
   syncImapEmails: (accountId: string) =>
     invoke<void>("sync_imap_emails", { accountId }),
-  waitForImapChange: (accountId: string) =>
-    invoke<ImapIdleOutcome>("wait_for_imap_change", { accountId }),
+  startImapWatch: (accountId: string, mailboxRole = "inbox") =>
+    invoke<void>("start_imap_watch", { accountId, mailboxRole }),
+  stopImapWatch: (accountId: string, mailboxRole = "inbox") =>
+    invoke<void>("stop_imap_watch", { accountId, mailboxRole }),
   getAccounts: () => invoke<Account[]>("get_accounts"),
   getAccountAuth: (accountId: string) =>
     invoke<AuthInfo | null>("get_account_auth", { accountId }),
-  startGoogleOAuth: () => invoke<AuthInfo>("start_google_oauth"),
-  cancelGoogleOAuth: () => invoke<void>("cancel_google_oauth"),
   refreshAccessToken: (accountId: string) =>
     invoke<AuthInfo>("refresh_access_token", { accountId }),
   removeAccount: (accountId: string) =>
@@ -130,6 +134,8 @@ export const tauriApi = {
     invoke<EmailSummary[]>("get_emails_by_label", { ...input }),
   getThreadGroupsByLabel: (input: ThreadPageInput) =>
     invoke<ThreadGroup[]>("get_thread_groups_by_label", { ...input }),
+  getCustomImapMailboxes: (accountId: string) =>
+    invoke<CustomMailbox[]>("get_custom_imap_mailboxes", { accountId }),
   getGmailLabels: (accountId: string) =>
     invoke<GmailLabel[]>("get_gmail_labels", { accountId }),
   createGmailLabel: (accountId: string, name: string) =>
@@ -178,8 +184,6 @@ export const tauriApi = {
     invoke<string>("fetch_attachment_data", { emailId, accountId, attachmentDbId }),
   saveAndRevealAttachment: (emailId: string, accountId: string, attachmentDbId: string) =>
     invoke<SavedAttachment>("save_and_reveal_attachment", { emailId, accountId, attachmentDbId }),
-  refreshEmailFromGmail: (accountId: string, messageId: string) =>
-    invoke<EmailSummary>("refresh_email_from_gmail", { accountId, messageId }),
   getThreadEmails: (threadId: string, accountId: string, limit = 20, offset = 0) =>
     invoke<EmailSummary[]>("get_thread_emails", { threadId, accountId, limit, offset }),
   markAsRead: (accountId: string, messageId: string) =>
@@ -196,6 +200,8 @@ export const tauriApi = {
     invoke<void>("trash_email", { accountId, threadId }),
   moveToInbox: (accountId: string, threadId: string) =>
     invoke<void>("move_to_inbox", { accountId, threadId }),
+  moveToMailbox: (accountId: string, threadId: string, mailboxRole: string) =>
+    invoke<void>("move_to_mailbox", { accountId, threadId, mailboxRole }),
   sendReply: (input: {
     accountId: string;
     to: string;
@@ -242,8 +248,6 @@ export const tauriApi = {
     invoke<SendOutcome>("send_draft", { accountId, draftId, verificationMessageId }),
   deleteDraft: (accountId: string, draftId: string) =>
     invoke<void>("delete_draft", { accountId, draftId }),
-  verifySentMessage: (accountId: string, messageId: string) =>
-    invoke<boolean>("verify_sent_message", { accountId, messageId }),
   getLaunchAtStartup: () => invoke<boolean>("get_launch_at_startup"),
   setLaunchAtStartup: (enabled: boolean) =>
     invoke<boolean>("set_launch_at_startup", { enabled }),

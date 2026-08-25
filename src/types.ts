@@ -40,6 +40,13 @@ export interface GmailLabel {
   text_color: string | null;
 }
 
+// A user-named IMAP folder with no recognized system role (not Inbox/Sent/
+// Archive/etc.). `role` is the label to pass to `getEmailsByLabel`.
+export interface CustomMailbox {
+  role: string;
+  name: string;
+}
+
 export interface ThreadGroup {
   latestEmail: EmailSummary;
   hasUnread: boolean;

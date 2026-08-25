@@ -78,15 +78,14 @@ export function useMailReader(options: UseMailReaderOptions) {
     const token = getTokenForEmail(activeMail);
     if (!token) return;
     let cancelled = false;
-    void tauriApi.refreshEmailFromGmail(activeMail.account_id, activeMail.id)
-      .then(() => tauriApi.getEmailBody(activeMail.id, activeMail.account_id))
+    void tauriApi.getEmailBody(activeMail.id, activeMail.account_id)
       .then(body => {
         if (cancelled || selectedMail !== activeMailKey) return;
         setSelectedMailBody(body || "");
         setSelectedMailBodyId(activeMailKey);
       })
       .catch(() => {
-        // The locally cached message remains usable when this refresh fails.
+        // The locally cached message remains usable when this read fails.
       });
     return () => { cancelled = true; };
   }, [activeMailKey]);

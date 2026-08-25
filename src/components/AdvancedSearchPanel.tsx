@@ -6,11 +6,12 @@ import {
 } from "../advancedSearch";
 import { useLocale } from "../i18n";
 import { ui } from "../theme";
-import type { GmailLabel } from "../types";
+import type { CustomMailbox, GmailLabel } from "../types";
 
 interface AdvancedSearchPanelProps {
   criteria: AdvancedSearchCriteria;
   gmailLabels: GmailLabel[];
+  customMailboxes: CustomMailbox[];
   onApply: (criteria: AdvancedSearchCriteria) => void;
   onClose: () => void;
 }
@@ -82,7 +83,7 @@ function SearchSelect<T extends string>({
   );
 }
 
-export function AdvancedSearchPanel({ criteria, gmailLabels, onApply, onClose }: AdvancedSearchPanelProps) {
+export function AdvancedSearchPanel({ criteria, gmailLabels, customMailboxes, onApply, onClose }: AdvancedSearchPanelProps) {
   const tr = useLocale();
   const [draft, setDraft] = useState(criteria);
 
@@ -195,6 +196,7 @@ export function AdvancedSearchPanel({ criteria, gmailLabels, onApply, onClose }:
               { value: "archive", label: tr.nav.archive },
               { value: "spam", label: tr.nav.spam },
               { value: "trash", label: tr.nav.trash },
+              ...customMailboxes.map(mailbox => ({ value: mailbox.role, label: mailbox.name })),
               ...gmailLabels.map(label => ({ value: `gmail:${label.id}`, label: label.name })),
             ]}
           />

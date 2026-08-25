@@ -1,9 +1,10 @@
 mod auth;
+mod compose;
 mod db;
-mod gmail;
 mod img_proxy;
 mod mail_account;
 mod mail_oauth;
+mod mutf7;
 mod notify;
 mod safe_fs;
 mod settings;
@@ -26,6 +27,22 @@ pub(crate) fn require_command_window(
         Ok(())
     } else {
         Err("This window is not authorized to perform this action.".to_string())
+    }
+}
+
+/// Live handles to the system tray menu items, kept so their labels can be
+/// updated in place when the app language changes without rebuilding the tray.
+pub struct TrayMenuHandles {
+    pub mute: tauri::menu::CheckMenuItem<tauri::Wry>,
+    pub pause: tauri::menu::CheckMenuItem<tauri::Wry>,
+    pub quit: tauri::menu::MenuItem<tauri::Wry>,
+}
+
+pub(crate) fn tray_labels(language: &str) -> (&'static str, &'static str, &'static str) {
+    if language == "tr" {
+        ("Bildirimleri sessize al", "Mail çekmeyi durdur", "Kapat")
+    } else {
+        ("Mute notifications", "Pause mail sync", "Quit")
     }
 }
 
@@ -176,6 +193,51 @@ impl TokenRefreshFlights {
     }
 }
 
+/// How often stored sessions are checked for an access token about to run out.
+const SESSION_REFRESH_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+/// How much life an access token must have left to be left alone. It is wider
+/// than the margin that makes a token unusable, so a session is renewed before
+/// anything is waiting on it, and a long-running instance keeps its refresh
+/// token in use rather than letting the provider retire it for inactivity.
+const SESSION_REFRESH_LEAD_TIME_SECS: i64 = 900;
+
+/// Renews sessions on a timer instead of waiting for the next failure. Only
+/// accounts whose access token is nearly gone are touched, and each renewal
+/// goes through the same single-flight as every other caller.
+fn spawn_session_refresh_loop(app: tauri::AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::time::sleep(SESSION_REFRESH_CHECK_INTERVAL).await;
+            let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
+                continue;
+            };
+            let now = now.as_secs() as i64;
+            let Ok(account_ids) = db::list_account_ids(&app) else {
+                continue;
+            };
+            for account_id in account_ids {
+                let Some(tokens) = db::load_tokens(&account_id) else {
+                    continue;
+                };
+                // No refresh token means either a password account or a grant
+                // that is already gone; either way there is nothing to renew.
+                if tokens.refresh_token.is_empty() {
+                    continue;
+                }
+                let renew = tokens
+                    .expires_at
+                    .is_none_or(|expires_at| expires_at <= now + SESSION_REFRESH_LEAD_TIME_SECS);
+                if !renew {
+                    continue;
+                }
+                if let Err(error) = auth::refresh_session(app.clone(), &account_id).await {
+                    eprintln!("[AUTH] scheduled session refresh failed: {error}");
+                }
+            }
+        }
+    });
+}
+
 fn is_background_launch() -> bool {
     std::env::args().any(|arg| arg == "--background" || arg == "--hidden" || arg == "--minimized")
 }
@@ -240,7 +302,6 @@ pub fn run() {
         })
         .manage(TokenRefreshFlights::default())
         .manage(img_proxy::ImageProxyState::default())
-        .manage(auth::OAuthFlowState::default())
         .manage(mail_oauth::MailOAuthFlowState::default())
         .manage(notify::PendingNotification::default())
         .manage(settings::AppControlsState::default())
@@ -273,6 +334,7 @@ pub fn run() {
             let _ = dotenvy::dotenv();
 
             db::init_db(app.handle()).expect("Failed to initialize database");
+            spawn_session_refresh_loop(app.handle().clone());
             let search_index_app = app.handle().clone();
             tauri::async_runtime::spawn_blocking(move || {
                 if let Err(error) = db::backfill_email_search_text(&search_index_app) {
@@ -308,10 +370,11 @@ pub fn run() {
                 Manager,
             };
             let controls = settings::read_app_controls(app.handle());
+            let (mute_label, pause_label, quit_label) = tray_labels(&controls.app_language);
             let mute_i = CheckMenuItem::with_id(
                 app,
                 "toggle_mute_notifications",
-                "Bildirimleri sessize al",
+                mute_label,
                 true,
                 controls.notifications_disabled(),
                 None::<&str>,
@@ -319,13 +382,18 @@ pub fn run() {
             let pause_i = CheckMenuItem::with_id(
                 app,
                 "toggle_pause_sync",
-                "Mail çekmeyi durdur",
+                pause_label,
                 true,
                 controls.mail_sync_paused,
                 None::<&str>,
             )?;
-            let quit_i = MenuItem::with_id(app, "quit", "Kapat", true, None::<&str>)?;
+            let quit_i = MenuItem::with_id(app, "quit", quit_label, true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&mute_i, &pause_i, &quit_i])?;
+            app.manage(TrayMenuHandles {
+                mute: mute_i.clone(),
+                pause: pause_i.clone(),
+                quit: quit_i.clone(),
+            });
             let mute_item = mute_i.clone();
             let pause_item = pause_i.clone();
 
@@ -434,8 +502,6 @@ pub fn run() {
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
-            auth::start_google_oauth,
-            auth::cancel_google_oauth,
             auth::refresh_access_token,
             mail_oauth::discover_mail_provider,
             mail_oauth::start_mail_oauth,
@@ -443,7 +509,8 @@ pub fn run() {
             mail_account::test_mail_account,
             mail_account::add_mail_account,
             mail_account::sync_imap_emails,
-            mail_account::wait_for_imap_change,
+            mail_account::start_imap_watch,
+            mail_account::stop_imap_watch,
             db::get_accounts,
             db::get_account_auth,
             auth::remove_account,
@@ -453,6 +520,7 @@ pub fn run() {
             db::search_local_emails,
             db::get_emails_by_label,
             db::get_thread_groups_by_label,
+            db::get_custom_imap_mailboxes,
             db::get_gmail_labels,
             db::search_local_thread_groups,
             db::cancel_local_search,
@@ -461,31 +529,30 @@ pub fn run() {
             db::get_email_body,
             db::get_inbox_unread_count,
             db::get_thread_emails,
-            gmail::sync_emails,
-            gmail::refresh_email_from_gmail,
-            gmail::get_mailbox_download_status,
-            gmail::mark_as_read,
-            gmail::mark_thread_as_read,
-            gmail::mark_as_unread,
-            gmail::archive_email,
-            gmail::create_gmail_label,
-            gmail::rename_gmail_label,
-            gmail::set_gmail_label_color,
-            gmail::delete_gmail_label,
-            gmail::set_thread_gmail_label,
-            gmail::report_spam,
-            gmail::trash_email,
-            gmail::move_to_inbox,
-            gmail::send_reply,
-            gmail::send_email,
-            gmail::list_drafts,
-            gmail::get_draft,
-            gmail::save_draft,
-            gmail::send_draft,
-            gmail::delete_draft,
-            gmail::verify_sent_message,
-            gmail::fetch_attachment_data,
-            gmail::save_and_reveal_attachment,
+            compose::sync_emails,
+            compose::get_mailbox_download_status,
+            compose::mark_as_read,
+            compose::mark_thread_as_read,
+            compose::mark_as_unread,
+            compose::archive_email,
+            mail_account::create_gmail_label,
+            mail_account::rename_gmail_label,
+            mail_account::set_gmail_label_color,
+            mail_account::delete_gmail_label,
+            mail_account::set_thread_gmail_label,
+            compose::report_spam,
+            compose::trash_email,
+            compose::move_to_inbox,
+            compose::move_to_mailbox,
+            compose::send_reply,
+            compose::send_email,
+            compose::list_drafts,
+            compose::get_draft,
+            compose::save_draft,
+            compose::send_draft,
+            compose::delete_draft,
+            compose::fetch_attachment_data,
+            compose::save_and_reveal_attachment,
             db::get_email_attachments,
             notify::show_custom_notification,
             notify::get_pending_notification,

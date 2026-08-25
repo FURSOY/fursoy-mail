@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { allAccountsExpired } from "../accountSessionState";
 import type { Account } from "../types";
 import { tauriApi, type DiscoveredMailProvider, type ImapAccountInput } from "../tauriApi";
 
@@ -50,10 +51,23 @@ export function useAccounts() {
     setAccountTokens(next);
   }, []);
 
+  const syncExpiredBanner = useCallback(() => {
+    const expired = allAccountsExpired(
+      accountsRef.current.map(account => account.id),
+      expiredAccountsRef.current,
+    );
+    if (tokenExpiredRef.current !== expired) {
+      tokenExpiredRef.current = expired;
+      setTokenExpired(expired);
+    }
+    return expired;
+  }, []);
+
   const clearExpiredAccount = useCallback((accountId: string) => {
     expiredAccountsRef.current.delete(accountId);
     setExpiredAccountIds(new Set(expiredAccountsRef.current));
-  }, []);
+    syncExpiredBanner();
+  }, [syncExpiredBanner]);
 
   const expireAccount = useCallback((accountId: string) => {
     if (expiredAccountsRef.current.has(accountId)) {
@@ -62,11 +76,8 @@ export function useAccounts() {
     removeToken(accountId);
     expiredAccountsRef.current.add(accountId);
     setExpiredAccountIds(new Set(expiredAccountsRef.current));
-    return {
-      newlyExpired: true,
-      allExpired: accountsRef.current.every(account => expiredAccountsRef.current.has(account.id)),
-    };
-  }, [removeToken]);
+    return { newlyExpired: true, allExpired: syncExpiredBanner() };
+  }, [removeToken, syncExpiredBanner]);
 
   const setSessionExpired = useCallback((expired: boolean) => {
     tokenExpiredRef.current = expired;
@@ -99,15 +110,6 @@ export function useAccounts() {
     replaceTokens(tokens);
     return loaded;
   }, [loadAccounts, replaceTokens, selectAccount]);
-
-  const connectAccount = useCallback(async () => {
-    const auth = await tauriApi.startGoogleOAuth();
-    const updated = await loadAccounts();
-    upsertToken(auth.email, "active");
-    clearExpiredAccount(auth.email);
-    if (updated.length === 1) selectAccount(auth.email);
-    return { auth, accounts: updated };
-  }, [clearExpiredAccount, loadAccounts, selectAccount, upsertToken]);
 
   const disconnectAccount = useCallback(async (accountId: string) => {
     await tauriApi.removeAccount(accountId);
@@ -169,7 +171,6 @@ export function useAccounts() {
     setSessionExpired,
     loadAccounts,
     initializeAccounts,
-    connectAccount,
     addImapAccount,
     addOAuthMailAccount,
     disconnectAccount,

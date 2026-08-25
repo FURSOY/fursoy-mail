@@ -1,13 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { Inbox, Send, Archive, Mail, Star, ShieldAlert, Trash2, Settings, LogOut, RefreshCw, Plus, Users, AlertTriangle, Tag, Tags, ChevronDown, ChevronLeft, ChevronRight, MoreVertical, Pencil, Palette, Ban, Check } from "lucide-react";
+import { Inbox, Send, Archive, Mail, Star, ShieldAlert, Trash2, Settings, LogOut, RefreshCw, Plus, Users, AlertTriangle, Tag, Tags, Folder, ChevronDown, ChevronLeft, ChevronRight, MoreVertical, Pencil, Palette, Ban, Check } from "lucide-react";
 import { useLocale } from "../i18n";
 import { buildLabelHierarchy, canNestLabelUnder, labelAncestorIds, labelLeafName, labelParentName, nestedLabelName, type LabelHierarchyRow } from "../labelHierarchy";
 import { surfaces, ui } from "../theme";
-import type { Account, GmailLabel } from "../types";
+import type { Account, CustomMailbox, GmailLabel } from "../types";
 import { ProfileAvatar } from "./ProfileAvatar";
 
-type TabName = "inbox" | "starred" | "all" | "sent" | "archive" | "spam" | "trash" | "settings" | `gmail:${string}`;
+type TabName = "inbox" | "starred" | "all" | "sent" | "archive" | "spam" | "trash" | "settings" | `gmail:${string}` | `custom:${string}`;
 
 const GMAIL_LABEL_COLORS = [
   ["#000000", "#ffffff"], ["#434343", "#ffffff"], ["#666666", "#ffffff"], ["#999999", "#ffffff"],
@@ -33,6 +33,7 @@ interface SidebarProps {
   onAddAccount: () => void;
   onLogoutAccount: (accountId: string) => void;
   expiredAccountIds: Set<string>;
+  customMailboxes: CustomMailbox[];
   gmailLabels: GmailLabel[];
   onRenameGmailLabel: (label: GmailLabel, name: string) => Promise<boolean>;
   onMoveGmailLabel: (label: GmailLabel, name: string) => Promise<boolean>;
@@ -44,7 +45,7 @@ export function Sidebar({
   activeTab, goToTab, mobileMenuOpen, setMobileMenuOpen,
   authStatus, isUserSyncing, unreadCount, onLogin, usesOverlaySidebar,
   accounts, activeAccountId, onSwitchAccount, onAddAccount, onLogoutAccount,
-  expiredAccountIds, gmailLabels, onRenameGmailLabel, onMoveGmailLabel, onSetGmailLabelColor, onDeleteGmailLabel,
+  expiredAccountIds, customMailboxes, gmailLabels, onRenameGmailLabel, onMoveGmailLabel, onSetGmailLabelColor, onDeleteGmailLabel,
 }: SidebarProps) {
   const tr = useLocale();
   const [hoveredAccount, setHoveredAccount] = useState<string | null>(null);
@@ -329,6 +330,18 @@ export function Sidebar({
           {navItem("archive", <Archive className="w-4 h-4" />, tr.nav.archive)}
           {navItem("spam", <ShieldAlert className="w-4 h-4" />, tr.nav.spam)}
           {navItem("trash", <Trash2 className="w-4 h-4" />, tr.nav.trash)}
+
+          {customMailboxes.length > 0 && (
+            <>
+              <div className="my-2 border-t border-white/5" />
+              <div className="px-3 pb-1 pt-1 text-[10px] font-semibold uppercase tracking-wide text-zinc-600">
+                {tr.nav.folders}
+              </div>
+              {customMailboxes.map(mailbox =>
+                navItem(mailbox.role as TabName, <Folder className="w-4 h-4" />, mailbox.name)
+              )}
+            </>
+          )}
 
           <div className="my-2 border-t border-white/5" />
 

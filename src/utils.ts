@@ -15,6 +15,16 @@ export const ZOOM_STEPS = [0.5, 0.6, 0.7, 0.8, 0.9, 1, 1.25, 1.5, 1.75, 2];
 export const MIN_ZOOM = ZOOM_STEPS[0];
 export const MAX_ZOOM = ZOOM_STEPS[ZOOM_STEPS.length - 1];
 
+/**
+ * Whether a tab shows a list of mail. The fixed system tabs are only part of
+ * it: a custom IMAP folder and a label each have their own list too, and code
+ * that checks the fixed set alone silently stops working the moment one of
+ * those is open.
+ */
+export function isMailListTab(tab: string): boolean {
+  return MAIL_TABS.has(tab) || tab.startsWith("gmail:") || tab.startsWith("custom:");
+}
+
 export function isNoUpdateError(error: unknown): boolean {
   const message = (error instanceof Error ? error.message : String(error)).toLowerCase();
   return /no update|not available|up to date|guncel|güncel|204/.test(message);
@@ -22,7 +32,19 @@ export function isNoUpdateError(error: unknown): boolean {
 
 export function isAuthFailure(error: unknown): boolean {
   const message = (error instanceof Error ? error.message : String(error)).toLowerCase();
-  return /401|unauthorized|invalid_grant|invalid credentials|unauthenticated|autherror|expected oauth 2 access token|no refresh token|mail_account_auth_failed|mail_oauth_token_failed|session expired|oturum yenilenemedi|oturum bilgisi bulunamad/.test(message);
+  return /401|unauthorized|invalid_grant|invalid credentials|unauthenticated|autherror|expected oauth 2 access token|no refresh token|no session found|mail_account_auth_failed|mail_oauth_token_failed|mail_oauth_refresh_revoked|mail_oauth_refresh_token_missing|session expired|oturum yenilenemedi|oturum bilgisi bulunamad/.test(message);
+}
+
+/**
+ * Whether the stored credential itself is gone, as opposed to a refresh that
+ * could not be completed right now. Only the first is worth sending the user
+ * back to the sign-in screen: a token endpoint that was unreachable, throttled,
+ * or briefly broken leaves a perfectly good session behind, and treating that
+ * as an expiry is what makes an app ask for a password it never needed.
+ */
+export function isSessionRevoked(error: unknown): boolean {
+  const message = (error instanceof Error ? error.message : String(error)).toLowerCase();
+  return /invalid_grant|mail_oauth_refresh_revoked|mail_oauth_refresh_token_missing|no refresh token|no session found|oturum bilgisi bulunamad/.test(message);
 }
 
 export function byteLength(text: string): number {

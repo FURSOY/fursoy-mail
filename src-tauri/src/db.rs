@@ -1,7 +1,5 @@
 use keyring::Entry;
-use rusqlite::{
-    params, Connection, InterruptHandle, OptionalExtension, Result, TransactionBehavior,
-};
+use rusqlite::{params, Connection, InterruptHandle, OptionalExtension, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::sync::{
@@ -33,10 +31,10 @@ fn account_key(email: &str) -> String {
 
 pub fn save_tokens(email: &str, tokens: &StoredTokens) -> Result<(), String> {
     let data =
-        serde_json::to_string(tokens).map_err(|e| format!("Token serileştirilemedi: {e}"))?;
+        serde_json::to_string(tokens).map_err(|e| format!("Token could not be serialized: {e}"))?;
     Entry::new(KEYRING_SERVICE, &account_key(email))
         .and_then(|e| e.set_password(&data))
-        .map_err(|e| format!("Token kaydedilemedi: {e}"))
+        .map_err(|e| format!("Token could not be saved: {e}"))
 }
 
 pub fn load_tokens(email: &str) -> Option<StoredTokens> {
@@ -51,24 +49,47 @@ pub fn load_tokens(email: &str) -> Option<StoredTokens> {
     Some(tokens)
 }
 
+/// Records that the stored refresh token was rejected for good. The account
+/// keeps its entry, so it stays an OAuth account the user can sign in to again,
+/// but the credential is emptied and the access token is dated out: nothing
+/// tries to use it, and nothing spends a round trip renewing it.
+pub fn mark_oauth_session_revoked(email: &str) -> Result<(), String> {
+    let Some(tokens) = load_tokens(email) else {
+        return Ok(());
+    };
+    save_tokens(
+        email,
+        &StoredTokens {
+            access_token: tokens.access_token,
+            refresh_token: String::new(),
+            expires_at: Some(0),
+        },
+    )
+}
+
 pub fn delete_tokens(email: &str) -> Result<(), String> {
     let entry = Entry::new(KEYRING_SERVICE, &account_key(email))
-        .map_err(|e| format!("Oturum bilgisi açılamadı: {e}"))?;
+        .map_err(|e| format!("Session credential could not be opened: {e}"))?;
     match entry.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-        Err(error) => Err(format!("Oturum bilgisi silinemedi: {error}")),
+        Err(error) => Err(format!("Session credential could not be removed: {error}")),
     }
 }
 
+/// How early a stored access token is treated as gone. It has to cover the
+/// whole operation the token is handed to — an IMAP session runs for minutes —
+/// plus any drift between this machine's clock and the token endpoint's.
+const ACCESS_TOKEN_EXPIRY_SKEW_SECS: i64 = 300;
+
 pub fn load_account_access_token(account_id: &str) -> Result<String, String> {
     let tokens = load_tokens(account_id)
-        .ok_or_else(|| "Oturum bilgisi bulunamadı. Lütfen tekrar giriş yapın.".to_string())?;
+        .ok_or_else(|| "No session found. Please sign in again.".to_string())?;
     if let Some(expires_at) = tokens.expires_at {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|_| "Sistem saati geçersiz.".to_string())?
+            .map_err(|_| "System clock is invalid.".to_string())?
             .as_secs() as i64;
-        if expires_at <= now.saturating_add(30) {
+        if expires_at <= now.saturating_add(ACCESS_TOKEN_EXPIRY_SKEW_SECS) {
             return Err("401: Mail account session expired.".to_string());
         }
     }
@@ -468,6 +489,30 @@ pub fn init_db(app: &AppHandle) -> Result<()> {
              PRIMARY KEY (account_id, role)
          );",
     )?;
+    // Checkpoints let a sync skip a mailbox the server reports as unchanged
+    // instead of enumerating every UID. A zero default means "never synced",
+    // which forces one full pass and then starts the incremental path.
+    for (column, definition) in [
+        ("uid_validity", "INTEGER NOT NULL DEFAULT 0"),
+        ("uid_next", "INTEGER NOT NULL DEFAULT 0"),
+        ("exists_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("reconciled_at", "INTEGER NOT NULL DEFAULT 0"),
+        ("highest_mod_seq", "INTEGER NOT NULL DEFAULT 0"),
+    ] {
+        let column_exists: bool = conn
+            .prepare("SELECT COUNT(*) FROM pragma_table_info('imap_mailboxes') WHERE name=?1")
+            .and_then(|mut statement| {
+                statement.query_row(params![column], |row| row.get::<_, i64>(0))
+            })
+            .map(|count| count > 0)
+            .unwrap_or(false);
+        if !column_exists {
+            conn.execute(
+                &format!("ALTER TABLE imap_mailboxes ADD COLUMN {column} {definition}"),
+                [],
+            )?;
+        }
+    }
     conn.execute(
         "CREATE TABLE IF NOT EXISTS account_generations (
             account_id TEXT PRIMARY KEY,
@@ -546,6 +591,21 @@ pub fn init_db(app: &AppHandle) -> Result<()> {
              WHERE account_id = old.account_id AND email_id = old.id;
          END;",
     )?;
+
+    // Which side a label came from. Only a label the server listed may be
+    // pruned when the server stops listing it; one made here has no server
+    // record until it is first applied, and must survive the wait.
+    let origin_exists: bool = conn
+        .prepare("SELECT COUNT(*) FROM pragma_table_info('gmail_labels') WHERE name='origin'")
+        .and_then(|mut statement| statement.query_row([], |row| row.get::<_, i64>(0)))
+        .map(|count| count > 0)
+        .unwrap_or(false);
+    if !origin_exists {
+        conn.execute(
+            "ALTER TABLE gmail_labels ADD COLUMN origin TEXT NOT NULL DEFAULT 'local'",
+            [],
+        )?;
+    }
 
     // Migration: add missing columns to emails
     let mut thread_id_was_missing = false;
@@ -959,60 +1019,17 @@ pub fn get_accounts(
     Ok(iter.filter_map(|r| r.ok()).collect())
 }
 
-pub fn upsert_account(app: &AppHandle, email: &str, picture: &str) -> Result<Account, String> {
+/// Account ids alone, for background work that has no window to be called from.
+pub fn list_account_ids(app: &AppHandle) -> Result<Vec<String>, String> {
     let db_path = get_db_path(app);
-    let mut conn = Connection::open(db_path).map_err(database_error)?;
-    let tx = conn.transaction().map_err(database_error)?;
-
-    let max_order: i32 = tx
-        .query_row(
-            "SELECT COALESCE(MAX(display_order), -1) FROM accounts",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(-1);
-
-    tx.execute(
-        "INSERT INTO account_generations (account_id, generation) VALUES (?1, 1)
-         ON CONFLICT(account_id) DO NOTHING",
-        params![email],
-    )
-    .map_err(database_error)?;
-    let cache_generation: i64 = tx
-        .query_row(
-            "SELECT generation FROM account_generations WHERE account_id = ?1",
-            params![email],
-            |r| r.get(0),
-        )
+    let conn = Connection::open(db_path).map_err(database_error)?;
+    let mut stmt = conn
+        .prepare("SELECT id FROM accounts")
         .map_err(database_error)?;
-
-    tx.execute(
-        "INSERT INTO accounts (id, email, picture, display_order, cache_generation, provider)
-         VALUES (?1, ?2, ?3, ?4, ?5, 'google')
-         ON CONFLICT(id) DO UPDATE SET
-             picture = excluded.picture,
-             cache_generation = excluded.cache_generation,
-             provider = 'google'",
-        params![email, email, picture, max_order + 1, cache_generation],
-    )
-    .map_err(database_error)?;
-
-    let display_order: i32 = tx
-        .query_row(
-            "SELECT display_order FROM accounts WHERE id = ?1",
-            params![email],
-            |r| r.get(0),
-        )
+    let ids = stmt
+        .query_map([], |row| row.get::<_, String>(0))
         .map_err(database_error)?;
-    tx.commit().map_err(database_error)?;
-
-    Ok(Account {
-        id: email.to_string(),
-        email: email.to_string(),
-        picture: picture.to_string(),
-        display_order,
-        provider: "google".to_string(),
-    })
+    Ok(ids.filter_map(|id| id.ok()).collect())
 }
 
 pub fn upsert_imap_account(
@@ -1160,27 +1177,208 @@ pub fn get_imap_account_settings(
     .map_err(database_error)
 }
 
+/// One mailbox's synchronization checkpoint. `uid_validity` of 0 means the
+/// mailbox has never completed a pass, so the next sync must reconcile it fully.
+/// `highest_mod_seq` is the CONDSTORE checkpoint and stays 0 on servers without
+/// it, which is what keeps those on the UID-range path.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct ImapMailboxState {
+    pub uid_validity: u32,
+    pub uid_next: u32,
+    pub exists_count: u32,
+    pub highest_mod_seq: u64,
+    pub reconciled_at: i64,
+}
+
+/// Stores the discovered mailboxes without disturbing existing checkpoints.
+/// A delete-and-reinsert would discard them on every sync and defeat the
+/// incremental path.
+/// Stores the mailbox layout the server just listed and returns the roles that
+/// are no longer part of it, so the caller can drop what was cached under them.
 pub fn replace_imap_mailboxes(
     app: &AppHandle,
     account_id: &str,
     mailboxes: &[(String, String)],
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
     let db_path = get_db_path(app);
     let mut conn = Connection::open(db_path).map_err(database_error)?;
     let tx = conn.transaction().map_err(database_error)?;
-    tx.execute(
-        "DELETE FROM imap_mailboxes WHERE account_id = ?1",
-        params![account_id],
-    )
-    .map_err(database_error)?;
     for (role, mailbox) in mailboxes {
         tx.execute(
-            "INSERT INTO imap_mailboxes (account_id, role, mailbox) VALUES (?1, ?2, ?3)",
+            "INSERT INTO imap_mailboxes (account_id, role, mailbox) VALUES (?1, ?2, ?3)
+             ON CONFLICT(account_id, role) DO UPDATE SET
+                 mailbox = excluded.mailbox,
+                 uid_validity = CASE
+                     WHEN imap_mailboxes.mailbox = excluded.mailbox
+                     THEN imap_mailboxes.uid_validity ELSE 0 END,
+                 uid_next = CASE
+                     WHEN imap_mailboxes.mailbox = excluded.mailbox
+                     THEN imap_mailboxes.uid_next ELSE 0 END,
+                 exists_count = CASE
+                     WHEN imap_mailboxes.mailbox = excluded.mailbox
+                     THEN imap_mailboxes.exists_count ELSE 0 END,
+                 reconciled_at = CASE
+                     WHEN imap_mailboxes.mailbox = excluded.mailbox
+                     THEN imap_mailboxes.reconciled_at ELSE 0 END",
             params![account_id, role, mailbox],
         )
         .map_err(database_error)?;
     }
-    tx.commit().map_err(database_error)
+    let roles: Vec<&str> = mailboxes.iter().map(|(role, _)| role.as_str()).collect();
+    let removed: Vec<String> = {
+        let mut statement = tx
+            .prepare("SELECT role FROM imap_mailboxes WHERE account_id = ?1")
+            .map_err(database_error)?;
+        let stored: Vec<String> = statement
+            .query_map(params![account_id], |row| row.get(0))
+            .map_err(database_error)?
+            .filter_map(Result::ok)
+            .collect();
+        stored
+            .into_iter()
+            .filter(|role| !roles.iter().any(|kept| kept == role))
+            .collect()
+    };
+    let placeholders = std::iter::repeat("?")
+        .take(roles.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut arguments: Vec<&dyn rusqlite::ToSql> = vec![&account_id];
+    for role in &roles {
+        arguments.push(role);
+    }
+    tx.execute(
+        &format!(
+            "DELETE FROM imap_mailboxes WHERE account_id = ?1
+             AND role NOT IN ({})",
+            if placeholders.is_empty() {
+                "''"
+            } else {
+                &placeholders
+            }
+        ),
+        arguments.as_slice(),
+    )
+    .map_err(database_error)?;
+    tx.commit().map_err(database_error)?;
+    Ok(removed)
+}
+
+pub fn get_imap_mailbox_state(
+    app: &AppHandle,
+    account_id: &str,
+    role: &str,
+) -> Result<ImapMailboxState, String> {
+    let db_path = get_db_path(app);
+    let conn = Connection::open(db_path).map_err(database_error)?;
+    get_imap_mailbox_state_from_conn(&conn, account_id, role)
+}
+
+fn get_imap_mailbox_state_from_conn(
+    conn: &Connection,
+    account_id: &str,
+    role: &str,
+) -> Result<ImapMailboxState, String> {
+    conn.query_row(
+        "SELECT uid_validity, uid_next, exists_count, highest_mod_seq, reconciled_at
+         FROM imap_mailboxes WHERE account_id = ?1 AND role = ?2",
+        params![account_id, role],
+        |row| {
+            Ok(ImapMailboxState {
+                uid_validity: row.get::<_, i64>(0)? as u32,
+                uid_next: row.get::<_, i64>(1)? as u32,
+                exists_count: row.get::<_, i64>(2)? as u32,
+                highest_mod_seq: row.get::<_, i64>(3)? as u64,
+                reconciled_at: row.get(4)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(database_error)
+    .map(Option::unwrap_or_default)
+}
+
+pub fn set_imap_mailbox_state(
+    app: &AppHandle,
+    account_id: &str,
+    role: &str,
+    state: ImapMailboxState,
+) -> Result<(), String> {
+    let db_path = get_db_path(app);
+    let conn = Connection::open(db_path).map_err(database_error)?;
+    set_imap_mailbox_state_from_conn(&conn, account_id, role, state)
+}
+
+fn set_imap_mailbox_state_from_conn(
+    conn: &Connection,
+    account_id: &str,
+    role: &str,
+    state: ImapMailboxState,
+) -> Result<(), String> {
+    conn.execute(
+        "UPDATE imap_mailboxes
+         SET uid_validity = ?3, uid_next = ?4, exists_count = ?5,
+             highest_mod_seq = ?6, reconciled_at = ?7
+         WHERE account_id = ?1 AND role = ?2",
+        params![
+            account_id,
+            role,
+            state.uid_validity as i64,
+            state.uid_next as i64,
+            state.exists_count as i64,
+            state.highest_mod_seq as i64,
+            state.reconciled_at,
+        ],
+    )
+    .map_err(database_error)?;
+    Ok(())
+}
+
+/// How many messages the cache holds for a mailbox. Compared against the
+/// server's EXISTS, this is what makes an expunge visible without listing every
+/// remote UID, which is the one thing CONDSTORE cannot report on its own.
+pub fn count_emails_for_label(
+    app: &AppHandle,
+    account_id: &str,
+    label: &str,
+) -> Result<u32, String> {
+    let db_path = get_db_path(app);
+    let conn = Connection::open(db_path).map_err(database_error)?;
+    conn.query_row(
+        "SELECT COUNT(*) FROM emails WHERE account_id = ?1 AND label = ?2",
+        params![account_id, label],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|count| count.max(0) as u32)
+    .map_err(database_error)
+}
+
+/// Which of `ids` the cache already holds. An incremental pass only asks about
+/// the messages the server just reported, so it must not read the whole label.
+pub fn filter_cached_email_ids(
+    app: &AppHandle,
+    account_id: &str,
+    ids: &[String],
+) -> Result<std::collections::HashSet<String>, String> {
+    if ids.is_empty() {
+        return Ok(std::collections::HashSet::new());
+    }
+    let db_path = get_db_path(app);
+    let conn = Connection::open(db_path).map_err(database_error)?;
+    let mut cached = std::collections::HashSet::new();
+    let mut statement = conn
+        .prepare("SELECT id FROM emails WHERE account_id = ?1 AND id = ?2")
+        .map_err(database_error)?;
+    for id in ids {
+        let found: Option<String> = statement
+            .query_row(params![account_id, id], |row| row.get(0))
+            .optional()
+            .map_err(database_error)?;
+        if let Some(found) = found {
+            cached.insert(found);
+        }
+    }
+    Ok(cached)
 }
 
 pub fn get_imap_mailboxes(
@@ -1199,6 +1397,39 @@ pub fn get_imap_mailboxes(
         .query_map(params![account_id], |row| Ok((row.get(0)?, row.get(1)?)))
         .map_err(database_error)?;
     Ok(rows.filter_map(Result::ok).collect())
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct CustomMailbox {
+    /// The label to pass to `get_emails_by_label`, e.g. `custom:Work`.
+    pub role: String,
+    /// Display name derived from the folder's own IMAP path.
+    pub name: String,
+}
+
+/// User-named IMAP folders with no recognized role (not Inbox/Sent/Archive/
+/// etc.) — these are still cached and syncable (see `mailbox_label` in
+/// `mail_account.rs`), just not shown in the fixed system-folder list.
+#[tauri::command]
+pub fn get_custom_imap_mailboxes(
+    window: tauri::WebviewWindow,
+    app: tauri::AppHandle,
+    account_id: String,
+) -> Result<Vec<CustomMailbox>, String> {
+    crate::require_command_window(&window, &["main"])?;
+    // The stored name is the one the server answers to, which is modified
+    // UTF-7: shown as it comes, "Önemli" reads as "&AMY-nemli".
+    let display_name = |mailbox: &str| -> String {
+        crate::mutf7::decode(mailbox.rsplit(['/', '.']).next().unwrap_or(mailbox))
+    };
+    Ok(get_imap_mailboxes(&app, &account_id)?
+        .into_iter()
+        .filter(|(role, _)| role.starts_with("custom:"))
+        .map(|(role, mailbox)| CustomMailbox {
+            name: display_name(&mailbox),
+            role,
+        })
+        .collect())
 }
 
 pub fn get_thread_email_ids(
@@ -1258,17 +1489,6 @@ pub fn set_account_picture(app: &AppHandle, account_id: &str, picture: &str) -> 
         params![account_id, picture],
     )
     .map(|_| ())
-    .map_err(database_error)
-}
-
-pub fn get_account_provider(app: &AppHandle, account_id: &str) -> Result<String, String> {
-    let db_path = get_db_path(app);
-    let conn = Connection::open(db_path).map_err(database_error)?;
-    conn.query_row(
-        "SELECT provider FROM accounts WHERE id = ?1",
-        params![account_id],
-        |row| row.get(0),
-    )
     .map_err(database_error)
 }
 
@@ -1902,44 +2122,6 @@ fn refresh_thread_summary(conn: &Connection, account_id: &str, thread_key: &str)
     Ok(())
 }
 
-fn rebuild_account_thread_summaries(conn: &Connection, account_id: &str) -> Result<()> {
-    let summary_available: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'thread_summaries')",
-        [],
-        |row| row.get(0),
-    )?;
-    if !summary_available {
-        return Ok(());
-    }
-    conn.execute(
-        "DELETE FROM thread_summaries WHERE account_id = ?1",
-        params![account_id],
-    )?;
-    conn.execute(
-        "INSERT INTO thread_summaries (
-             account_id, thread_key, latest_email_id, latest_date,
-             unread_count, message_count, participants
-         )
-         SELECT e.account_id, e.thread_key,
-                (SELECT latest.id
-                 FROM emails latest
-                 WHERE latest.account_id = e.account_id
-                   AND latest.thread_key = e.thread_key
-                   AND latest.label != 'draft'
-                 ORDER BY latest.date DESC, latest.id ASC
-                 LIMIT 1),
-                MAX(e.date),
-                SUM(CASE WHEN e.unread THEN 1 ELSE 0 END),
-                COUNT(*),
-                GROUP_CONCAT(e.sender, char(31))
-         FROM emails e
-         WHERE e.account_id = ?1 AND e.label != 'draft'
-         GROUP BY e.account_id, e.thread_key",
-        params![account_id],
-    )?;
-    Ok(())
-}
-
 pub fn upsert_sync_mail_batch(
     app: &AppHandle,
     account_id: &str,
@@ -2277,7 +2459,11 @@ fn search_thread_groups_from_conn(
     } else if matches!(
         filters.location.as_str(),
         "inbox" | "sent" | "archive" | "spam" | "trash"
-    ) {
+    ) || filters.location.starts_with("custom:")
+    {
+        // A user folder is cached under its own label, so it filters exactly
+        // like a system one. Leaving it out let a search scoped to a folder
+        // quietly return the whole mailbox instead.
         values.push(Value::Text(filters.location.clone()));
         conditions.push("e.label = ?".to_string());
     } else if filters.location == "all" {
@@ -2903,7 +3089,7 @@ pub async fn search_local_thread_groups(
         result.map_err(database_error)
     })
     .await
-    .map_err(|_| "Arama görevi tamamlanamadı.".to_string())?
+    .map_err(|_| "Search task could not complete.".to_string())?
 }
 
 #[tauri::command]
@@ -2914,75 +3100,6 @@ pub fn cancel_local_search(
     crate::require_command_window(&window, &["main"])?;
     coordinator.cancel();
     Ok(())
-}
-
-pub fn replace_gmail_labels(
-    app: &AppHandle,
-    account_id: &str,
-    account_generation: i64,
-    labels: &[GmailLabel],
-) -> Result<(), String> {
-    let db_path = get_db_path(app);
-    let mut conn = Connection::open(db_path).map_err(database_error)?;
-    let tx = conn.transaction().map_err(database_error)?;
-    ensure_account_generation(&tx, account_id, account_generation).map_err(database_error)?;
-    let mut existing_colors = std::collections::HashMap::new();
-    {
-        let mut statement = tx
-            .prepare(
-                "SELECT id, background_color, text_color FROM gmail_labels WHERE account_id = ?1",
-            )
-            .map_err(database_error)?;
-        let rows = statement
-            .query_map(params![account_id], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                ))
-            })
-            .map_err(database_error)?;
-        for row in rows.filter_map(Result::ok) {
-            existing_colors.insert(row.0, (row.1, row.2));
-        }
-    }
-    tx.execute(
-        "DELETE FROM gmail_labels WHERE account_id = ?1",
-        params![account_id],
-    )
-    .map_err(database_error)?;
-    for label in labels {
-        let previous = existing_colors.get(&label.id);
-        let background_color = label
-            .background_color
-            .as_ref()
-            .or_else(|| previous.and_then(|colors| colors.0.as_ref()));
-        let text_color = label
-            .text_color
-            .as_ref()
-            .or_else(|| previous.and_then(|colors| colors.1.as_ref()));
-        tx.execute(
-            "INSERT INTO gmail_labels (account_id, id, name, background_color, text_color)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                account_id,
-                label.id,
-                label.name,
-                background_color,
-                text_color
-            ],
-        )
-        .map_err(database_error)?;
-    }
-    tx.execute(
-        "DELETE FROM email_labels
-         WHERE account_id = ?1 AND label_id != 'STARRED' AND label_id NOT IN (
-             SELECT id FROM gmail_labels WHERE account_id = ?1
-         )",
-        params![account_id],
-    )
-    .map_err(database_error)?;
-    tx.commit().map_err(database_error)
 }
 
 pub fn upsert_gmail_label(app: &AppHandle, label: &GmailLabel) -> Result<(), String> {
@@ -3005,6 +3122,96 @@ pub fn upsert_gmail_label(app: &AppHandle, label: &GmailLabel) -> Result<(), Str
     )
     .map_err(database_error)?;
     Ok(())
+}
+
+/// Seeds a label discovered via IMAP LIST (a Gmail account's real labels,
+/// now that nothing else discovers them — see `discover_imap_mailboxes`).
+/// Only inserts when missing: unlike `upsert_gmail_label`, this must never
+/// overwrite a color or a pending local rename with server-observed defaults
+/// on every sync.
+pub fn seed_gmail_label_if_missing(
+    app: &AppHandle,
+    account_id: &str,
+    id: &str,
+    name: &str,
+) -> Result<(), String> {
+    let db_path = get_db_path(app);
+    let conn = Connection::open(db_path).map_err(database_error)?;
+    conn.execute(
+        "INSERT INTO gmail_labels (account_id, id, name, background_color, text_color, origin)
+         VALUES (?1, ?2, ?3, NULL, NULL, 'server')
+         ON CONFLICT(account_id, id) DO UPDATE SET origin = 'server'",
+        params![account_id, id, name],
+    )
+    .map_err(database_error)?;
+    Ok(())
+}
+
+/// Brings the account's label list in line with what the server just listed.
+/// Only labels the server itself put here are dropped: one made in this app has
+/// no server record until it is first applied to a message, and pruning it
+/// would delete a label the moment it was created.
+///
+/// `renames` carries labels whose stored id is the raw wire name for a display
+/// name the server also reports — the modified UTF-7 rows written before names
+/// were decoded — so they move to the readable id with their messages.
+pub fn reconcile_server_labels(
+    app: &AppHandle,
+    account_id: &str,
+    names: &[String],
+    renames: &[(String, String)],
+) -> Result<(), String> {
+    let db_path = get_db_path(app);
+    let mut conn = Connection::open(db_path).map_err(database_error)?;
+    for (from, to) in renames {
+        if from == to {
+            continue;
+        }
+        // A row already using the readable id leaves nothing to migrate.
+        let taken: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM gmail_labels WHERE account_id = ?1 AND id = ?2)",
+                params![account_id, to],
+                |row| row.get(0),
+            )
+            .map_err(database_error)?;
+        if taken {
+            continue;
+        }
+        rename_gmail_label_from_conn(&mut conn, account_id, from, to, to).map_err(database_error)?;
+    }
+    let tx = conn.transaction().map_err(database_error)?;
+    {
+        let mut keep = std::collections::HashSet::new();
+        for name in names {
+            keep.insert(name.clone());
+        }
+        let mut stale = tx
+            .prepare("SELECT id FROM gmail_labels WHERE account_id = ?1 AND origin = 'server'")
+            .map_err(database_error)?;
+        let listed: Vec<String> = stale
+            .query_map(params![account_id], |row| row.get(0))
+            .map_err(database_error)?
+            .filter_map(Result::ok)
+            .collect();
+        drop(stale);
+        for id in listed {
+            if keep.contains(&id) {
+                continue;
+            }
+            tx.execute(
+                "DELETE FROM email_labels WHERE account_id = ?1 AND label_id = ?2",
+                params![account_id, id],
+            )
+            .map_err(database_error)?;
+            tx.execute(
+                "DELETE FROM gmail_labels WHERE account_id = ?1 AND id = ?2",
+                params![account_id, id],
+            )
+            .map_err(database_error)?;
+        }
+    }
+    tx.commit().map_err(database_error)
 }
 
 pub fn delete_gmail_label_local(
@@ -3035,7 +3242,15 @@ pub fn get_gmail_labels(
     account_id: String,
 ) -> Result<Vec<GmailLabel>, String> {
     crate::require_command_window(&window, &["main"])?;
-    let db_path = get_db_path(&app);
+    get_gmail_labels_for_account(&app, &account_id)
+}
+
+/// The same list, for backend work that has no window behind it.
+pub fn get_gmail_labels_for_account(
+    app: &AppHandle,
+    account_id: &str,
+) -> Result<Vec<GmailLabel>, String> {
+    let db_path = get_db_path(app);
     let conn = Connection::open(db_path).map_err(database_error)?;
     let mut statement = conn
         .prepare(
@@ -3104,6 +3319,92 @@ pub fn gmail_label_exists(
     .map_err(database_error)
 }
 
+pub fn get_gmail_label(
+    app: &AppHandle,
+    account_id: &str,
+    label_id: &str,
+) -> Result<Option<GmailLabel>, String> {
+    let db_path = get_db_path(app);
+    let conn = Connection::open(db_path).map_err(database_error)?;
+    conn.query_row(
+        "SELECT id, account_id, name, background_color, text_color
+         FROM gmail_labels WHERE account_id = ?1 AND id = ?2",
+        params![account_id, label_id],
+        |row| {
+            Ok(GmailLabel {
+                id: row.get(0)?,
+                account_id: row.get(1)?,
+                name: row.get(2)?,
+                background_color: row.get(3)?,
+                text_color: row.get(4)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(database_error)
+}
+
+/// Renames a label's identity (id and display name both change, since an IMAP
+/// tag has no identifier separate from its own name) and repoints every
+/// `email_labels` row that referenced the old id, atomically.
+pub fn rename_gmail_label_local(
+    app: &AppHandle,
+    account_id: &str,
+    old_id: &str,
+    new_id: &str,
+    new_name: &str,
+) -> Result<(), String> {
+    let db_path = get_db_path(app);
+    let mut conn = Connection::open(db_path).map_err(database_error)?;
+    rename_gmail_label_from_conn(&mut conn, account_id, old_id, new_id, new_name)
+        .map_err(database_error)
+}
+
+fn rename_gmail_label_from_conn(
+    conn: &mut Connection,
+    account_id: &str,
+    old_id: &str,
+    new_id: &str,
+    new_name: &str,
+) -> Result<()> {
+    let tx = conn.transaction()?;
+    tx.execute(
+        "UPDATE gmail_labels SET id = ?3, name = ?4 WHERE account_id = ?1 AND id = ?2",
+        params![account_id, old_id, new_id, new_name],
+    )?;
+    tx.execute(
+        "UPDATE OR IGNORE email_labels SET label_id = ?3
+         WHERE account_id = ?1 AND label_id = ?2",
+        params![account_id, old_id, new_id],
+    )?;
+    // A message that already carried the new label keeps the one row it has:
+    // the update above skipped it, and what is left behind is a reference to a
+    // label id that no longer exists.
+    tx.execute(
+        "DELETE FROM email_labels WHERE account_id = ?1 AND label_id = ?2",
+        params![account_id, old_id],
+    )?;
+    tx.commit()
+}
+
+pub fn set_gmail_label_color_local(
+    app: &AppHandle,
+    account_id: &str,
+    label_id: &str,
+    background_color: Option<&str>,
+    text_color: Option<&str>,
+) -> Result<(), String> {
+    let db_path = get_db_path(app);
+    let conn = Connection::open(db_path).map_err(database_error)?;
+    conn.execute(
+        "UPDATE gmail_labels SET background_color = ?3, text_color = ?4
+         WHERE account_id = ?1 AND id = ?2",
+        params![account_id, label_id, background_color, text_color],
+    )
+    .map_err(database_error)?;
+    Ok(())
+}
+
 #[tauri::command]
 pub fn get_email_body(
     window: tauri::WebviewWindow,
@@ -3146,72 +3447,170 @@ pub fn mark_email_as_read_local(app: &AppHandle, id: &str, account_id: &str) -> 
     Ok(())
 }
 
-pub fn archive_thread_local(
-    app: &AppHandle,
-    thread_id: &str,
-    account_id: &str,
-) -> Result<(), String> {
-    let db_path = get_db_path(app);
-    let mut conn = Connection::open(db_path).map_err(database_error)?;
-    let tx = conn.transaction().map_err(database_error)?;
-    tx.execute(
-        "UPDATE emails SET label = 'archive' WHERE thread_key = ?1 AND account_id = ?2 AND label = 'inbox'",
-        params![thread_id, account_id],
-    )
-    .map_err(database_error)?;
-    refresh_thread_summary(&tx, account_id, thread_id).map_err(database_error)?;
-    tx.commit().map_err(database_error)?;
-    Ok(())
+/// One cached message's state as the server just reported it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImapMessageState {
+    pub email_id: String,
+    pub unread: bool,
+    pub starred: bool,
+    /// The tags the server carries for this message. `None` means the pass
+    /// could not read them — an older server, or a Gmail reply that could not
+    /// be parsed — and the cached tags are left untouched instead of being
+    /// mistaken for a message the user just cleared.
+    pub tags: Option<Vec<String>>,
 }
 
-pub fn trash_thread_local(
+/// Writes the read, starred and tag state the IMAP server reports onto cached
+/// messages. Only rows whose state actually differs are touched so an unchanged
+/// mailbox costs no writes and no thread-summary rebuilds.
+/// Returns how many cached messages actually changed, which is what tells a
+/// caller whether the server reported anything the views have to be re-read for.
+pub fn apply_imap_flag_state(
     app: &AppHandle,
-    thread_id: &str,
     account_id: &str,
-) -> Result<(), String> {
+    updates: &[ImapMessageState],
+) -> Result<usize, String> {
+    if updates.is_empty() {
+        return Ok(0);
+    }
     let db_path = get_db_path(app);
     let mut conn = Connection::open(db_path).map_err(database_error)?;
-    let tx = conn.transaction().map_err(database_error)?;
-    tx.execute(
-        "UPDATE emails SET label = 'trash' WHERE thread_key = ?1 AND account_id = ?2 AND label != 'draft'",
-        params![thread_id, account_id],
-    )
-    .map_err(database_error)?;
-    refresh_thread_summary(&tx, account_id, thread_id).map_err(database_error)?;
-    tx.commit().map_err(database_error)?;
-    Ok(())
+    apply_imap_flag_state_from_conn(&mut conn, account_id, updates)
 }
 
-pub fn spam_thread_local(app: &AppHandle, thread_id: &str, account_id: &str) -> Result<(), String> {
-    let db_path = get_db_path(app);
-    let mut conn = Connection::open(db_path).map_err(database_error)?;
-    let tx = conn.transaction().map_err(database_error)?;
-    tx.execute(
-        "UPDATE emails SET label = 'spam' WHERE thread_key = ?1 AND account_id = ?2 AND label != 'draft'",
-        params![thread_id, account_id],
-    )
-    .map_err(database_error)?;
-    refresh_thread_summary(&tx, account_id, thread_id).map_err(database_error)?;
-    tx.commit().map_err(database_error)?;
-    Ok(())
-}
-
-pub fn move_thread_to_inbox_local(
-    app: &AppHandle,
-    thread_id: &str,
+fn apply_imap_flag_state_from_conn(
+    conn: &mut Connection,
     account_id: &str,
-) -> Result<(), String> {
-    let db_path = get_db_path(app);
-    let mut conn = Connection::open(db_path).map_err(database_error)?;
+    updates: &[ImapMessageState],
+) -> Result<usize, String> {
     let tx = conn.transaction().map_err(database_error)?;
-    tx.execute(
-        "UPDATE emails SET label = 'inbox' WHERE thread_key = ?1 AND account_id = ?2 AND label != 'draft'",
-        params![thread_id, account_id],
-    )
-    .map_err(database_error)?;
-    refresh_thread_summary(&tx, account_id, thread_id).map_err(database_error)?;
+    let mut changed_threads = std::collections::HashSet::new();
+    let mut changed_messages = 0usize;
+    {
+        let mut current = tx
+            .prepare(
+                "SELECT e.unread, e.thread_key,
+                        EXISTS (SELECT 1 FROM email_labels l
+                                WHERE l.account_id = e.account_id AND l.email_id = e.id
+                                  AND l.label_id = 'STARRED')
+                 FROM emails e WHERE e.account_id = ?1 AND e.id = ?2",
+            )
+            .map_err(database_error)?;
+        let mut set_unread = tx
+            .prepare("UPDATE emails SET unread = ?3 WHERE account_id = ?1 AND id = ?2")
+            .map_err(database_error)?;
+        let mut add_star = tx
+            .prepare(
+                "INSERT OR IGNORE INTO email_labels (account_id, email_id, label_id)
+                 VALUES (?1, ?2, 'STARRED')",
+            )
+            .map_err(database_error)?;
+        let mut drop_star = tx
+            .prepare(
+                "DELETE FROM email_labels
+                 WHERE account_id = ?1 AND email_id = ?2 AND label_id = 'STARRED'",
+            )
+            .map_err(database_error)?;
+        let mut cached_tags = tx
+            .prepare(
+                "SELECT label_id FROM email_labels
+                 WHERE account_id = ?1 AND email_id = ?2 AND label_id != 'STARRED'",
+            )
+            .map_err(database_error)?;
+        let mut add_tag = tx
+            .prepare(
+                "INSERT OR IGNORE INTO email_labels (account_id, email_id, label_id)
+                 VALUES (?1, ?2, ?3)",
+            )
+            .map_err(database_error)?;
+        let mut drop_tag = tx
+            .prepare(
+                "DELETE FROM email_labels
+                 WHERE account_id = ?1 AND email_id = ?2 AND label_id = ?3",
+            )
+            .map_err(database_error)?;
+        // A tag the server knows about but this account has no record of is a
+        // tag made somewhere else — another client, or this app before its
+        // cache was cleared. Recording it is what makes it appear in the
+        // sidebar instead of being dropped on the way in.
+        let mut ensure_tag = tx
+            .prepare(
+                "INSERT OR IGNORE INTO gmail_labels (account_id, id, name, background_color, text_color)
+                 VALUES (?1, ?2, ?2, NULL, NULL)",
+            )
+            .map_err(database_error)?;
+
+        for ImapMessageState {
+            email_id,
+            unread,
+            starred,
+            tags,
+        } in updates
+        {
+            let row: Option<(bool, String, bool)> = current
+                .query_row(params![account_id, email_id], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
+                .optional()
+                .map_err(database_error)?;
+            let Some((cached_unread, thread_key, cached_starred)) = row else {
+                continue;
+            };
+            if cached_unread != *unread || cached_starred != *starred {
+                changed_messages += 1;
+            }
+            if cached_unread != *unread {
+                set_unread
+                    .execute(params![account_id, email_id, *unread])
+                    .map_err(database_error)?;
+                changed_threads.insert(thread_key.clone());
+            }
+            if cached_starred != *starred {
+                if *starred {
+                    add_star
+                        .execute(params![account_id, email_id])
+                        .map_err(database_error)?;
+                } else {
+                    drop_star
+                        .execute(params![account_id, email_id])
+                        .map_err(database_error)?;
+                }
+                changed_threads.insert(thread_key.clone());
+            }
+            let Some(tags) = tags else {
+                continue;
+            };
+            let cached: std::collections::BTreeSet<String> = cached_tags
+                .query_map(params![account_id, email_id], |row| row.get(0))
+                .map_err(database_error)?
+                .filter_map(Result::ok)
+                .collect();
+            let reported: std::collections::BTreeSet<String> = tags.iter().cloned().collect();
+            if cached == reported {
+                continue;
+            }
+            for tag in reported.difference(&cached) {
+                ensure_tag
+                    .execute(params![account_id, tag])
+                    .map_err(database_error)?;
+                add_tag
+                    .execute(params![account_id, email_id, tag])
+                    .map_err(database_error)?;
+            }
+            for tag in cached.difference(&reported) {
+                drop_tag
+                    .execute(params![account_id, email_id, tag])
+                    .map_err(database_error)?;
+            }
+            changed_messages += 1;
+            changed_threads.insert(thread_key);
+        }
+    }
+    for thread_key in &changed_threads {
+        refresh_thread_summary(&tx, account_id, thread_key).map_err(database_error)?;
+    }
     tx.commit().map_err(database_error)?;
-    Ok(())
+    Ok(changed_messages)
 }
 
 pub fn mark_thread_as_unread_local(
@@ -3287,239 +3686,7 @@ fn inbox_unread_count_from_conn(conn: &Connection, account_id: Option<&str>) -> 
     Ok(count)
 }
 
-pub fn set_gmail_inbox_unread_stats(
-    app: &AppHandle,
-    account_id: &str,
-    account_generation: i64,
-    messages_unread: i64,
-    threads_unread: i64,
-) -> Result<(), String> {
-    let db_path = get_db_path(app);
-    let mut conn = Connection::open(db_path).map_err(database_error)?;
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(database_error)?;
-    ensure_account_generation(&tx, account_id, account_generation)
-        .map_err(|_| "Account is no longer available")?;
-    tx.execute(
-        "INSERT INTO sync_state (
-             account_id, gmail_inbox_messages_unread, gmail_inbox_threads_unread
-         ) VALUES (?1, ?2, ?3)
-         ON CONFLICT(account_id) DO UPDATE SET
-             gmail_inbox_messages_unread = excluded.gmail_inbox_messages_unread,
-             gmail_inbox_threads_unread = excluded.gmail_inbox_threads_unread",
-        params![account_id, messages_unread, threads_unread],
-    )
-    .map_err(database_error)?;
-    tx.commit().map_err(database_error)
-}
-
 // ── Sync state (per-account history ID) ────────────────────────────────────────
-
-pub fn get_history_id(app: &AppHandle, account_id: &str) -> Option<String> {
-    let db_path = get_db_path(app);
-    let conn = Connection::open(db_path).ok()?;
-    conn.query_row(
-        "SELECT history_id FROM sync_state WHERE account_id = ?1",
-        params![account_id],
-        |row| row.get::<_, Option<String>>(0),
-    )
-    .ok()
-    .flatten()
-}
-
-pub fn set_history_id(
-    app: &AppHandle,
-    account_id: &str,
-    account_generation: i64,
-    history_id: &str,
-) -> Result<(), String> {
-    let db_path = get_db_path(app);
-    let mut conn = Connection::open(db_path).map_err(database_error)?;
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(database_error)?;
-    ensure_account_generation(&tx, account_id, account_generation).map_err(database_error)?;
-    tx.execute(
-        "INSERT INTO sync_state (account_id, history_id) VALUES (?1, ?2)
-         ON CONFLICT(account_id) DO UPDATE SET history_id = excluded.history_id",
-        params![account_id, history_id],
-    )
-    .map_err(database_error)?;
-    tx.commit().map_err(database_error)?;
-    Ok(())
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ActiveFullSync {
-    pub generation: i64,
-    pub pending_history_id: String,
-}
-
-pub fn get_active_full_sync(
-    app: &AppHandle,
-    account_id: &str,
-) -> Result<Option<ActiveFullSync>, String> {
-    let db_path = get_db_path(app);
-    let conn = Connection::open(db_path).map_err(database_error)?;
-    conn.query_row(
-        "SELECT active_full_sync_generation, pending_full_history_id
-         FROM sync_state WHERE account_id = ?1 AND active_full_sync_generation IS NOT NULL",
-        params![account_id],
-        |row| {
-            Ok(ActiveFullSync {
-                generation: row.get(0)?,
-                pending_history_id: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
-            })
-        },
-    )
-    .optional()
-    .map_err(database_error)
-}
-
-pub fn next_full_sync_generation(app: &AppHandle, account_id: &str) -> Result<i64, String> {
-    let db_path = get_db_path(app);
-    let conn = Connection::open(db_path).map_err(database_error)?;
-    conn.query_row(
-        "SELECT COALESCE(last_full_sync_generation, 0) + 1 FROM sync_state WHERE account_id = ?1",
-        params![account_id],
-        |row| row.get(0),
-    )
-    .optional()
-    .map(|generation| generation.unwrap_or(1))
-    .map_err(database_error)
-}
-
-fn complete_full_sync_from_conn(
-    conn: &mut Connection,
-    account_id: &str,
-    account_generation: i64,
-    cursors: &[(String, Option<String>)],
-    history_id: &str,
-    sync_generation: i64,
-) -> Result<()> {
-    let tx = conn.transaction()?;
-    ensure_account_generation(&tx, account_id, account_generation)?;
-    {
-        let mut cursor_stmt = tx.prepare(
-            "INSERT INTO mailbox_cursors (account_id, label, next_page_token) VALUES (?1, ?2, ?3)
-             ON CONFLICT(account_id, label) DO UPDATE SET next_page_token = excluded.next_page_token",
-        )?;
-        for (label, next_page_token) in cursors {
-            cursor_stmt.execute(params![account_id, label, next_page_token])?;
-        }
-    }
-    tx.execute(
-        "INSERT INTO sync_state (
-             account_id, history_id, last_full_sync_generation,
-             active_full_sync_generation, pending_full_history_id
-         ) VALUES (?1, NULL, ?2, ?2, ?3)
-         ON CONFLICT(account_id) DO UPDATE SET
-             history_id = NULL,
-             last_full_sync_generation = excluded.last_full_sync_generation,
-             active_full_sync_generation = excluded.active_full_sync_generation,
-             pending_full_history_id = excluded.pending_full_history_id",
-        params![account_id, sync_generation, history_id],
-    )?;
-    tx.commit()
-}
-
-/// Publishes the initial mailbox cursors and a pending Gmail history checkpoint together.
-/// A failed transaction leaves both at their previous values so the same Gmail pages
-/// can be retried safely. The checkpoint becomes active only after the full backfill.
-pub fn complete_full_sync(
-    app: &AppHandle,
-    account_id: &str,
-    account_generation: i64,
-    cursors: &[(String, Option<String>)],
-    history_id: &str,
-    sync_generation: i64,
-) -> Result<(), String> {
-    let db_path = get_db_path(app);
-    let mut conn = Connection::open(db_path).map_err(database_error)?;
-    complete_full_sync_from_conn(
-        &mut conn,
-        account_id,
-        account_generation,
-        cursors,
-        history_id,
-        sync_generation,
-    )
-    .map_err(database_error)
-}
-
-fn finalize_full_sync_from_conn(
-    conn: &mut Connection,
-    account_id: &str,
-    account_generation: i64,
-    sync_generation: i64,
-) -> Result<usize> {
-    let tx = conn.transaction()?;
-    ensure_account_generation(&tx, account_id, account_generation)?;
-    let pending_history_id: String = tx
-        .query_row(
-            "SELECT pending_full_history_id FROM sync_state
-         WHERE account_id = ?1 AND active_full_sync_generation = ?2",
-            params![account_id, sync_generation],
-            |row| row.get::<_, Option<String>>(0),
-        )?
-        .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
-
-    tx.execute(
-        "DELETE FROM attachments
-         WHERE account_id = ?1
-           AND email_id IN (
-               SELECT id FROM emails
-               WHERE account_id = ?1 AND sync_generation != ?2
-           )",
-        params![account_id, sync_generation],
-    )?;
-    let deleted = tx.execute(
-        "DELETE FROM emails WHERE account_id = ?1 AND sync_generation != ?2",
-        params![account_id, sync_generation],
-    )?;
-    rebuild_account_thread_summaries(&tx, account_id)?;
-    tx.execute(
-        "UPDATE sync_state SET
-             history_id = ?3,
-             active_full_sync_generation = NULL,
-             pending_full_history_id = NULL
-         WHERE account_id = ?1 AND active_full_sync_generation = ?2",
-        params![account_id, sync_generation, pending_history_id],
-    )?;
-    tx.commit()?;
-    Ok(deleted)
-}
-
-/// Finishes a full local-cache rebuild. Only rows not seen during the completed
-/// generation are removed; Gmail data is never modified.
-pub fn finalize_full_sync(
-    app: &AppHandle,
-    account_id: &str,
-    account_generation: i64,
-    sync_generation: i64,
-) -> Result<usize, String> {
-    let db_path = get_db_path(app);
-    let mut conn = Connection::open(db_path).map_err(database_error)?;
-    finalize_full_sync_from_conn(&mut conn, account_id, account_generation, sync_generation)
-        .map_err(database_error)
-}
-
-pub fn get_mailbox_cursor_state(
-    app: &AppHandle,
-    account_id: &str,
-    label: &str,
-) -> Result<Option<Option<String>>, String> {
-    let db_path = get_db_path(app);
-    let conn = Connection::open(db_path).map_err(database_error)?;
-    conn.query_row(
-        "SELECT next_page_token FROM mailbox_cursors WHERE account_id = ?1 AND label = ?2",
-        params![account_id, label],
-        |row| row.get::<_, Option<String>>(0),
-    )
-    .optional()
-    .map_err(database_error)
-}
 
 pub fn has_pending_mailbox_pages(
     app: &AppHandle,
@@ -3594,59 +3761,6 @@ pub fn get_all_mailbox_sync_states(app: &AppHandle) -> Result<Vec<MailboxSyncSta
         .collect::<Result<Vec<_>, _>>()
         .map_err(database_error)?;
     Ok(states)
-}
-
-/// Saves a mailbox worker state only while the owning account generation is
-/// current. This prevents a removed or reset account from gaining new state.
-pub fn set_mailbox_sync_state(
-    app: &AppHandle,
-    account_id: &str,
-    account_generation: i64,
-    status: &str,
-    error: Option<&str>,
-    retry_after: Option<i64>,
-) -> Result<(), String> {
-    let db_path = get_db_path(app);
-    let mut conn = Connection::open(db_path).map_err(database_error)?;
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(database_error)?;
-    ensure_account_generation(&tx, account_id, account_generation).map_err(database_error)?;
-    tx.execute(
-        "INSERT INTO sync_state (
-             account_id, mailbox_sync_status, mailbox_sync_error, mailbox_sync_retry_after
-         ) VALUES (?1, ?2, ?3, ?4)
-         ON CONFLICT(account_id) DO UPDATE SET
-             mailbox_sync_status = excluded.mailbox_sync_status,
-             mailbox_sync_error = excluded.mailbox_sync_error,
-             mailbox_sync_retry_after = excluded.mailbox_sync_retry_after",
-        params![account_id, status, error, retry_after],
-    )
-    .map_err(database_error)?;
-    tx.commit().map_err(database_error)
-}
-
-pub fn set_mailbox_cursor(
-    app: &AppHandle,
-    account_id: &str,
-    account_generation: i64,
-    label: &str,
-    next_page_token: Option<&str>,
-) -> Result<(), String> {
-    let db_path = get_db_path(app);
-    let mut conn = Connection::open(db_path).map_err(database_error)?;
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(database_error)?;
-    ensure_account_generation(&tx, account_id, account_generation).map_err(database_error)?;
-    tx.execute(
-        "INSERT INTO mailbox_cursors (account_id, label, next_page_token) VALUES (?1, ?2, ?3)
-         ON CONFLICT(account_id, label) DO UPDATE SET next_page_token = excluded.next_page_token",
-        params![account_id, label, next_page_token],
-    )
-    .map_err(database_error)?;
-    tx.commit().map_err(database_error)?;
-    Ok(())
 }
 
 #[tauri::command]
@@ -3875,6 +3989,296 @@ mod tests {
         );
     }
 
+    fn seed_flag_state_database() -> Connection {
+        let conn = Connection::open_in_memory().expect("open in-memory database");
+        conn.execute_batch(
+            "CREATE TABLE emails (
+                id TEXT NOT NULL,
+                account_id TEXT NOT NULL,
+                thread_key TEXT NOT NULL,
+                unread INTEGER NOT NULL,
+                PRIMARY KEY (account_id, id)
+            );
+            CREATE TABLE email_labels (
+                account_id TEXT NOT NULL,
+                email_id TEXT NOT NULL,
+                label_id TEXT NOT NULL,
+                PRIMARY KEY (account_id, email_id, label_id)
+            );
+            CREATE TABLE gmail_labels (
+                account_id TEXT NOT NULL,
+                id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                background_color TEXT,
+                text_color TEXT,
+                PRIMARY KEY (account_id, id)
+            );
+            INSERT INTO emails (id, account_id, thread_key, unread) VALUES
+                ('imap:inbox:1', 'account-a', 'thread-1', 1),
+                ('imap:inbox:2', 'account-a', 'thread-2', 0),
+                ('imap:inbox:1', 'account-b', 'thread-9', 1);
+            INSERT INTO email_labels (account_id, email_id, label_id) VALUES
+                ('account-a', 'imap:inbox:2', 'STARRED');",
+        )
+        .expect("seed flag fixtures");
+        conn
+    }
+
+    fn read_flag_state(conn: &Connection, account_id: &str, email_id: &str) -> (bool, bool) {
+        conn.query_row(
+            "SELECT e.unread,
+                    EXISTS (SELECT 1 FROM email_labels l
+                            WHERE l.account_id = e.account_id AND l.email_id = e.id
+                              AND l.label_id = 'STARRED')
+             FROM emails e WHERE e.account_id = ?1 AND e.id = ?2",
+            params![account_id, email_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("read flag state")
+    }
+
+    #[test]
+    fn imap_flag_state_adopts_read_and_starred_changes_made_on_another_device() {
+        let mut conn = seed_flag_state_database();
+
+        apply_imap_flag_state_from_conn(
+            &mut conn,
+            "account-a",
+            &[
+                // Read elsewhere, and starred elsewhere.
+                ImapMessageState {
+                    email_id: "imap:inbox:1".to_string(),
+                    unread: false,
+                    starred: true,
+                    tags: None,
+                },
+                // Marked unread again, and unstarred.
+                ImapMessageState {
+                    email_id: "imap:inbox:2".to_string(),
+                    unread: true,
+                    starred: false,
+                    tags: None,
+                },
+            ],
+        )
+        .expect("apply flag state");
+
+        assert_eq!(
+            read_flag_state(&conn, "account-a", "imap:inbox:1"),
+            (false, true)
+        );
+        assert_eq!(
+            read_flag_state(&conn, "account-a", "imap:inbox:2"),
+            (true, false)
+        );
+    }
+
+    #[test]
+    fn imap_flag_state_never_reaches_another_account() {
+        let mut conn = seed_flag_state_database();
+
+        apply_imap_flag_state_from_conn(
+            &mut conn,
+            "account-a",
+            &[ImapMessageState {
+                email_id: "imap:inbox:1".to_string(),
+                unread: false,
+                starred: false,
+                tags: None,
+            }],
+        )
+        .expect("apply flag state");
+
+        assert_eq!(
+            read_flag_state(&conn, "account-b", "imap:inbox:1"),
+            (true, false)
+        );
+    }
+
+    #[test]
+    fn imap_flag_state_ignores_uids_that_are_not_cached() {
+        let mut conn = seed_flag_state_database();
+
+        apply_imap_flag_state_from_conn(
+            &mut conn,
+            "account-a",
+            &[ImapMessageState {
+                email_id: "imap:inbox:404".to_string(),
+                unread: false,
+                starred: true,
+                tags: None,
+            }],
+        )
+        .expect("apply flag state for an unknown message");
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM emails", [], |row| row.get(0))
+            .expect("count emails");
+        assert_eq!(count, 3);
+    }
+
+    fn read_tags(conn: &Connection, account_id: &str, email_id: &str) -> Vec<String> {
+        let mut statement = conn
+            .prepare(
+                "SELECT label_id FROM email_labels
+                 WHERE account_id = ?1 AND email_id = ?2 AND label_id != 'STARRED'
+                 ORDER BY label_id",
+            )
+            .expect("prepare tag read");
+        let tags = statement
+            .query_map(params![account_id, email_id], |row| row.get(0))
+            .expect("read tags")
+            .filter_map(Result::ok)
+            .collect();
+        tags
+    }
+
+    #[test]
+    fn tags_follow_what_the_server_reports_and_record_unknown_ones() {
+        let mut conn = seed_flag_state_database();
+        conn.execute_batch(
+            "INSERT INTO email_labels (account_id, email_id, label_id) VALUES
+                 ('account-a', 'imap:inbox:1', 'Gone');",
+        )
+        .expect("seed a tag the server no longer has");
+
+        apply_imap_flag_state_from_conn(
+            &mut conn,
+            "account-a",
+            &[ImapMessageState {
+                email_id: "imap:inbox:1".to_string(),
+                unread: true,
+                starred: false,
+                tags: Some(vec!["Work".to_string(), "Önemli".to_string()]),
+            }],
+        )
+        .expect("apply tag state");
+
+        assert_eq!(
+            read_tags(&conn, "account-a", "imap:inbox:1"),
+            vec!["Work".to_string(), "Önemli".to_string()]
+        );
+        // A tag seen for the first time becomes a label of this account, or the
+        // insert above would have been dropped by the label check.
+        let known: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM gmail_labels WHERE account_id = 'account-a'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count labels");
+        assert_eq!(known, 2);
+    }
+
+    #[test]
+    fn a_pass_that_could_not_read_tags_leaves_them_alone() {
+        let mut conn = seed_flag_state_database();
+        conn.execute_batch(
+            "INSERT INTO email_labels (account_id, email_id, label_id) VALUES
+                 ('account-a', 'imap:inbox:1', 'Work');",
+        )
+        .expect("seed a tag");
+
+        apply_imap_flag_state_from_conn(
+            &mut conn,
+            "account-a",
+            &[ImapMessageState {
+                email_id: "imap:inbox:1".to_string(),
+                unread: false,
+                starred: false,
+                tags: None,
+            }],
+        )
+        .expect("apply flag state without tags");
+
+        assert_eq!(
+            read_tags(&conn, "account-a", "imap:inbox:1"),
+            vec!["Work".to_string()]
+        );
+    }
+
+    #[test]
+    fn the_star_is_not_touched_by_a_tag_reconcile() {
+        let mut conn = seed_flag_state_database();
+
+        apply_imap_flag_state_from_conn(
+            &mut conn,
+            "account-a",
+            &[ImapMessageState {
+                email_id: "imap:inbox:2".to_string(),
+                unread: false,
+                starred: true,
+                tags: Some(Vec::new()),
+            }],
+        )
+        .expect("apply flag state");
+
+        assert_eq!(
+            read_flag_state(&conn, "account-a", "imap:inbox:2"),
+            (false, true)
+        );
+        assert!(read_tags(&conn, "account-a", "imap:inbox:2").is_empty());
+    }
+
+    #[test]
+    fn a_mailbox_checkpoint_round_trips_and_resets_with_its_uid_generation() {
+        let conn = Connection::open_in_memory().expect("open memory db");
+        conn.execute_batch(
+            "CREATE TABLE imap_mailboxes (
+                 account_id TEXT NOT NULL,
+                 role TEXT NOT NULL,
+                 mailbox TEXT NOT NULL,
+                 uid_validity INTEGER NOT NULL DEFAULT 0,
+                 uid_next INTEGER NOT NULL DEFAULT 0,
+                 exists_count INTEGER NOT NULL DEFAULT 0,
+                 highest_mod_seq INTEGER NOT NULL DEFAULT 0,
+                 reconciled_at INTEGER NOT NULL DEFAULT 0,
+                 PRIMARY KEY (account_id, role)
+             );
+             INSERT INTO imap_mailboxes (account_id, role, mailbox)
+             VALUES ('account-a', 'inbox', 'INBOX');",
+        )
+        .expect("seed mailbox");
+
+        // A mailbox nobody has synced yet reads as all zeroes, which is what
+        // forces the first full pass.
+        assert_eq!(
+            get_imap_mailbox_state_from_conn(&conn, "account-a", "inbox").expect("read state"),
+            ImapMailboxState::default()
+        );
+
+        let synced = ImapMailboxState {
+            uid_validity: 7,
+            uid_next: 100,
+            exists_count: 50,
+            highest_mod_seq: 90_060_128_194_045_007,
+            reconciled_at: 1_700_000_000,
+        };
+        set_imap_mailbox_state_from_conn(&conn, "account-a", "inbox", synced).expect("write state");
+        // The sequence is wider than a u32 and has to survive the round trip
+        // intact, or CHANGEDSINCE would ask about the wrong point in history.
+        assert_eq!(
+            get_imap_mailbox_state_from_conn(&conn, "account-a", "inbox").expect("read state"),
+            synced
+        );
+
+        // Reassigned UIDs: the pass that rebuilds the cache writes the new
+        // generation's numbers, and the old sequence must not survive it.
+        let rebuilt = ImapMailboxState {
+            uid_validity: 9,
+            uid_next: 3,
+            exists_count: 2,
+            highest_mod_seq: 0,
+            reconciled_at: 1_700_000_100,
+        };
+        set_imap_mailbox_state_from_conn(&conn, "account-a", "inbox", rebuilt)
+            .expect("write state");
+        assert_eq!(
+            get_imap_mailbox_state_from_conn(&conn, "account-a", "inbox").expect("read state"),
+            rebuilt
+        );
+    }
+
     #[test]
     fn delete_emails_by_ids_scopes_every_id_to_the_requested_account() {
         let mut conn = Connection::open_in_memory().expect("open in-memory database");
@@ -3964,119 +4368,6 @@ mod tests {
             .collect::<rusqlite::Result<Vec<_>>>()
             .expect("read remaining attachments");
         assert_eq!(remaining, vec!["valid".to_string()]);
-    }
-
-    #[test]
-    fn full_sync_publish_rolls_back_cursors_when_history_checkpoint_cannot_be_saved() {
-        let mut conn = Connection::open_in_memory().expect("open in-memory database");
-        conn.execute_batch(
-            "CREATE TABLE mailbox_cursors (
-                account_id TEXT NOT NULL,
-                label TEXT NOT NULL,
-                next_page_token TEXT,
-                PRIMARY KEY (account_id, label)
-            );",
-        )
-        .expect("create mailbox cursors");
-
-        let cursors = vec![("inbox".to_string(), Some("next-page".to_string()))];
-        assert!(
-            complete_full_sync_from_conn(&mut conn, "account-a", 1, &cursors, "history-1", 1)
-                .is_err()
-        );
-
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM mailbox_cursors", [], |row| row.get(0))
-            .expect("count cursors after rollback");
-        assert_eq!(count, 0);
-    }
-
-    #[test]
-    fn finalize_full_sync_removes_only_stale_local_rows_after_a_complete_generation() {
-        let mut conn = Connection::open_in_memory().expect("open in-memory database");
-        conn.execute_batch(
-            "CREATE TABLE accounts (
-                id TEXT PRIMARY KEY,
-                cache_generation INTEGER NOT NULL
-            );
-            INSERT INTO accounts (id, cache_generation) VALUES ('account-a', 1);
-            CREATE TABLE sync_state (
-                account_id TEXT PRIMARY KEY,
-                history_id TEXT,
-                last_full_sync_generation INTEGER NOT NULL DEFAULT 0,
-                active_full_sync_generation INTEGER,
-                pending_full_history_id TEXT
-            );
-            CREATE TABLE emails (
-                id TEXT NOT NULL,
-                account_id TEXT NOT NULL,
-                sync_generation INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (account_id, id)
-            );
-            CREATE TABLE attachments (
-                id TEXT NOT NULL,
-                email_id TEXT NOT NULL,
-                account_id TEXT NOT NULL,
-                PRIMARY KEY (account_id, id)
-            );
-            INSERT INTO sync_state (
-                account_id, history_id, last_full_sync_generation,
-                active_full_sync_generation, pending_full_history_id
-            ) VALUES ('account-a', NULL, 7, 7, 'history-7');
-            INSERT INTO emails (id, account_id, sync_generation) VALUES
-                ('current', 'account-a', 7),
-                ('stale', 'account-a', 6),
-                ('other-account', 'account-b', 2);
-            INSERT INTO attachments (id, email_id, account_id) VALUES
-                ('current-att', 'current', 'account-a'),
-                ('stale-att', 'stale', 'account-a'),
-                ('other-att', 'other-account', 'account-b');",
-        )
-        .expect("seed full-sync state");
-
-        let deleted =
-            finalize_full_sync_from_conn(&mut conn, "account-a", 1, 7).expect("finalize full sync");
-        assert_eq!(deleted, 1);
-
-        let remaining_messages: Vec<(String, String)> = conn
-            .prepare("SELECT account_id, id FROM emails ORDER BY account_id, id")
-            .expect("prepare messages")
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-            .expect("query messages")
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .expect("read messages");
-        assert_eq!(
-            remaining_messages,
-            vec![
-                ("account-a".to_string(), "current".to_string()),
-                ("account-b".to_string(), "other-account".to_string()),
-            ]
-        );
-
-        let remaining_attachments: Vec<(String, String)> = conn
-            .prepare("SELECT account_id, id FROM attachments ORDER BY account_id, id")
-            .expect("prepare attachments")
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-            .expect("query attachments")
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .expect("read attachments");
-        assert_eq!(
-            remaining_attachments,
-            vec![
-                ("account-a".to_string(), "current-att".to_string()),
-                ("account-b".to_string(), "other-att".to_string()),
-            ]
-        );
-
-        let state: (Option<String>, Option<i64>, Option<String>) = conn
-            .query_row(
-                "SELECT history_id, active_full_sync_generation, pending_full_history_id
-                 FROM sync_state WHERE account_id = 'account-a'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .expect("read finalized state");
-        assert_eq!(state, (Some("history-7".to_string()), None, None));
     }
 
     #[test]

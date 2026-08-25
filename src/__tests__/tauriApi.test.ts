@@ -42,12 +42,18 @@ describe("typed Tauri boundary", () => {
     ]);
   });
 
-  it("waits for IMAP mailbox changes without exposing credentials", async () => {
-    await tauriApi.waitForImapChange("account-a");
+  it("drives the IMAP watcher by account and mailbox without exposing credentials", async () => {
+    await tauriApi.startImapWatch("account-a");
+    await tauriApi.stopImapWatch("account-a");
+    await tauriApi.startImapWatch("account-a", "custom:Work");
+    await tauriApi.stopImapWatch("account-a", "custom:Work");
 
-    expect(invokeMock).toHaveBeenCalledWith("wait_for_imap_change", {
-      accountId: "account-a",
-    });
+    expect(invokeMock.mock.calls).toEqual([
+      ["start_imap_watch", { accountId: "account-a", mailboxRole: "inbox" }],
+      ["stop_imap_watch", { accountId: "account-a", mailboxRole: "inbox" }],
+      ["start_imap_watch", { accountId: "account-a", mailboxRole: "custom:Work" }],
+      ["stop_imap_watch", { accountId: "account-a", mailboxRole: "custom:Work" }],
+    ]);
   });
 
   it("preserves all-account and cursor paging parameters", async () => {
@@ -119,19 +125,7 @@ describe("typed Tauri boundary", () => {
     });
   });
 
-  it("verifies an uncertain send by account and generated message ID", async () => {
-    await tauriApi.verifySentMessage(
-      "account-a",
-      "<fursoy-0123456789abcdef@mail.invalid>",
-    );
-
-    expect(invokeMock).toHaveBeenCalledWith("verify_sent_message", {
-      accountId: "account-a",
-      messageId: "<fursoy-0123456789abcdef@mail.invalid>",
-    });
-  });
-
-  it("reports the selected Gmail conversation as spam", async () => {
+  it("reports the selected conversation as spam", async () => {
     await tauriApi.reportSpam("account-a", "thread-42");
 
     expect(invokeMock).toHaveBeenCalledWith("report_spam", {
