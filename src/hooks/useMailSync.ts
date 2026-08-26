@@ -2,9 +2,7 @@ import { useCallback, useEffect, useRef, useState, useTransition, type MutableRe
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { AppLocale, AppLanguage } from "../i18n";
-import {
-  countMissedMail, emailCacheKey, latestInboxDates, updateNotificationBaseline,
-} from "../mailSyncState";
+import { emailCacheKey, latestInboxDates, updateNotificationBaseline } from "../mailSyncState";
 import { syncIntervalDelayMs } from "../syncInterval";
 import type { Account, AppControls, EmailSummary, OtpMode } from "../types";
 import { tauriApi, type ImapChangeEvent } from "../tauriApi";
@@ -227,10 +225,9 @@ export function useMailSync(options: UseMailSyncOptions) {
       }
       const unread = Math.max(0, count + pendingDelta);
       startDataTransition(() => setInboxUnread(unread));
-      // Once the window is hidden the tray is all that is left on screen, so it
-      // carries whether anything is waiting and how much.
+      // Once the window is hidden the tray is all that is left on screen, so
+      // its tooltip carries how much is waiting.
       void tauriApi.setUnreadIndicator(
-        unread,
         unread > 0
           ? locale.messages.unreadWaiting.replace("{count}", String(unread))
           : locale.app.name,
@@ -376,10 +373,20 @@ export function useMailSync(options: UseMailSyncOptions) {
       successfullySyncedAccountIds: changedAccountIds,
       suppressNotifications,
     });
+    // What arrived while the application was closed, counted in the database
+    // rather than in the page above it: a week away can leave more waiting than
+    // the list ever reads.
     const lastSeen = readLastNotifiedDates();
-    const missed = suppressNotifications
-      ? 0
-      : countMissedMail(freshInbox, firstRoundAccountIds, lastSeen);
+    let missed = 0;
+    if (!suppressNotifications) {
+      for (const accountId of firstRoundAccountIds) {
+        const mark = lastSeen[accountId];
+        // No mark is a first run: the user was never told anything, so nothing
+        // was missed.
+        if (mark === undefined) continue;
+        missed += await tauriApi.countInboxUnreadSince(accountId, mark).catch(() => 0);
+      }
+    }
     writeLastNotifiedDates({ ...lastSeen, ...latestInboxDates(freshInbox) });
     await notifyNewEmails(newUnreadEmails, missed);
     // A custom folder and a label tab each have their own list, and the

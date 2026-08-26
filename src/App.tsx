@@ -187,6 +187,7 @@ function App() {
   const [mailThreadGroups, setMailThreadGroups] = useState<ThreadGroup[]>([]);
   const [gmailLabelsByAccount, setGmailLabelsByAccount] = useState<Record<string, GmailLabel[]>>({});
   const [customMailboxesByAccount, setCustomMailboxesByAccount] = useState<Record<string, CustomMailbox[]>>({});
+  const [tagSupportByAccount, setTagSupportByAccount] = useState<Record<string, boolean>>({});
   const {
     accounts, accountsLoaded, accountTokens, activeAccountId,
     tokenExpired, expiredAccountIds,
@@ -768,6 +769,20 @@ function App() {
     return () => { cancelled = true; };
   }, [accounts, isUserSyncing, isBackgroundSyncing]);
 
+  // Tags are IMAP keywords, so they work wherever the server can hold one —
+  // which is most servers, but not all. The list is hidden only where the
+  // server itself says it cannot, never by provider name.
+  useEffect(() => {
+    let cancelled = false;
+    void Promise.all(accounts.map(async account => {
+      const supported = await tauriApi.supportsMailTags(account.id).catch(() => true);
+      return [account.id, supported] as const;
+    })).then(entries => {
+      if (!cancelled) setTagSupportByAccount(Object.fromEntries(entries));
+    });
+    return () => { cancelled = true; };
+  }, [accounts, isUserSyncing, isBackgroundSyncing]);
+
   useEffect(() => {
     let cancelled = false;
     void Promise.all(accounts.map(async account => {
@@ -1167,6 +1182,48 @@ function App() {
     void refreshUnreadCount();
   }
 
+  const refreshCustomMailboxes = async (accountId: string) => {
+    const mailboxes = await tauriApi.getCustomImapMailboxes(accountId).catch(() => []);
+    setCustomMailboxesByAccount(previous => ({ ...previous, [accountId]: mailboxes }));
+  };
+
+  const handleCreateFolder = async (name: string): Promise<boolean> => {
+    const accountId = activeAccountIdRef.current;
+    if (!accountId) return false;
+    try {
+      await tauriApi.createImapFolder(accountId, name);
+      await refreshCustomMailboxes(accountId);
+      showToast(tr.messages.folderCreated, "success");
+      return true;
+    } catch (error) {
+      console.error("Create folder failed:", error);
+      showToast(`${tr.messages.folderFailed}: ${localizedLabelError(error)}`, "error");
+      return false;
+    }
+  };
+
+  const handleRenameFolder = async (mailboxRole: string, name: string): Promise<boolean> => {
+    const accountId = activeAccountIdRef.current;
+    if (!accountId) return false;
+    try {
+      await tauriApi.renameImapFolder(accountId, mailboxRole, name);
+      await refreshCustomMailboxes(accountId);
+      // The folder is cached under its own name, so the renamed one is a new
+      // tab: the old one no longer exists to show.
+      if (activeTabRef.current === mailboxRole) {
+        activeTabRef.current = "inbox";
+        setActiveTab("inbox");
+        await loadEmails("inbox");
+      }
+      showToast(tr.messages.folderRenamed, "success");
+      return true;
+    } catch (error) {
+      console.error("Rename folder failed:", error);
+      showToast(`${tr.messages.folderFailed}: ${localizedLabelError(error)}`, "error");
+      return false;
+    }
+  };
+
   const localizedLabelError = (error: unknown): string => {
     const key = String(error).replace(/^Error:\s*/i, "").trim();
     return (tr.mailAccount.errors as Record<string, string>)[key] ?? key;
@@ -1448,6 +1505,12 @@ function App() {
   const activeMailLabels = activeMail ? (gmailLabelsByAccount[activeMail.account_id] ?? []) : [];
   const activeMailLabelIds = activeThreadGroup?.labelIds ?? [];
   const sidebarGmailLabels = activeAccountId ? (gmailLabelsByAccount[activeAccountId] ?? []) : [];
+  // An account whose server cannot hold a keyword has nowhere to put a tag, so
+  // the list is not offered for it. With every account shown at once, one that
+  // can is enough for the list to mean something.
+  const supportsLabels = activeAccountId
+    ? (tagSupportByAccount[activeAccountId] ?? true)
+    : accounts.length === 0 || accounts.some(account => tagSupportByAccount[account.id] ?? true);
   // With every account shown at once, the folders of all of them are listed:
   // a user folder is browsed by its own label, which reads across accounts the
   // same way the inbox does. Two accounts with the same folder name share one
@@ -1797,6 +1860,9 @@ function App() {
           expiredAccountIds={expiredAccountIds}
           customMailboxes={sidebarCustomMailboxes}
           gmailLabels={sidebarGmailLabels}
+          showLabels={supportsLabels}
+          onCreateFolder={handleCreateFolder}
+          onRenameFolder={handleRenameFolder}
           onRenameGmailLabel={handleRenameGmailLabel}
           onMoveGmailLabel={handleMoveGmailLabel}
           onSetGmailLabelColor={handleSetGmailLabelColor}
@@ -1937,6 +2003,7 @@ function App() {
               activeAccountId={activeAccountId}
               gmailLabelsByAccount={gmailLabelsByAccount}
               customMailboxesByAccount={customMailboxesByAccount}
+              tagSupportByAccount={tagSupportByAccount}
               onToggleThreadLabel={handleSetThreadGmailLabel}
               onCreateGmailLabel={handleCreateGmailLabel}
             />
@@ -1982,6 +2049,7 @@ function App() {
                 onMoveToInbox={handleMoveToInbox}
                 customMailboxes={customMailboxesByAccount[activeMail.account_id] ?? []}
                 onMoveToMailbox={handleMoveToMailbox}
+                supportsLabels={tagSupportByAccount[activeMail.account_id] ?? true}
                 onMarkAsUnread={handleMarkAsUnread}
                 onForward={(mail) => { void handleForward(mail); }}
                 onOpenUrl={openExternalMailUrl}

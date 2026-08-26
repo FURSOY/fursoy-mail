@@ -55,6 +55,7 @@ interface EmailListProps {
   activeAccountId?: string | null;
   gmailLabelsByAccount: Record<string, GmailLabel[]>;
   customMailboxesByAccount: Record<string, CustomMailbox[]>;
+  tagSupportByAccount: Record<string, boolean>;
   onToggleThreadLabel: (mail: EmailSummary, labelId: string, applied: boolean) => Promise<void>;
   onCreateGmailLabel: (accountId: string, name: string) => Promise<GmailLabel | null>;
 }
@@ -116,7 +117,7 @@ export function EmailList({
   mailViewPreference, onViewPreferenceChange,
   onRefresh, onLoadMore, hasMoreEmails, isLoadingMoreEmails, isMailListLoading, mailAppendVersion, notificationFocusVersion, isMailboxBackfilling, mailboxDownloadPending, mailboxDownloadState, accessToken,
   accounts, activeAccountId, gmailLabelsByAccount, customMailboxesByAccount,
-  onToggleThreadLabel, onCreateGmailLabel,
+  tagSupportByAccount, onToggleThreadLabel, onCreateGmailLabel,
 }: EmailListProps) {
   const tr = useLocale();
   const activeGmailLabelId = activeTab.startsWith("gmail:") ? activeTab.slice(6) : null;
@@ -516,7 +517,7 @@ export function EmailList({
             {tr.mail.selectedCount.replace("{count}", String(selectedMailKeys.size))}
           </span>
           <div className="flex shrink-0 items-center gap-0.5">
-            {selectionAccountId && (
+            {selectionAccountId && (tagSupportByAccount[selectionAccountId] ?? true) && (
               <LabelPicker
                 labels={gmailLabelsByAccount[selectionAccountId] ?? []}
                 labelIds={sharedLabelIds}
@@ -660,6 +661,7 @@ export function EmailList({
                     <Star className={`h-3.5 w-3.5 ${isStarred ? "fill-current" : ""}`} />
                   </button>
                 </ToolbarTip>
+                {(tagSupportByAccount[mail.account_id] ?? true) && (
                 <ToolbarTip label={tr.labels.manage}>
                   <button
                     type="button"
@@ -684,6 +686,7 @@ export function EmailList({
                     <Tag className="h-3.5 w-3.5" />
                   </button>
                 </ToolbarTip>
+                )}
               </div>
               <button
                 type="button"

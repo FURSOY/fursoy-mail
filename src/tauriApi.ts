@@ -122,6 +122,12 @@ export const tauriApi = {
   stopImapWatch: (accountId: string, mailboxRole = "inbox") =>
     invoke<void>("stop_imap_watch", { accountId, mailboxRole }),
   wakeImapWatchers: () => invoke<void>("wake_imap_watchers"),
+  supportsMailTags: (accountId: string) =>
+    invoke<boolean>("supports_mail_tags", { accountId }),
+  createImapFolder: (accountId: string, name: string) =>
+    invoke<void>("create_imap_folder", { accountId, name }),
+  renameImapFolder: (accountId: string, mailboxRole: string, name: string) =>
+    invoke<void>("rename_imap_folder", { accountId, mailboxRole, name }),
   getAccounts: () => invoke<Account[]>("get_accounts"),
   getAccountAuth: (accountId: string) =>
     invoke<AuthInfo | null>("get_account_auth", { accountId }),
@@ -131,6 +137,8 @@ export const tauriApi = {
     invoke<void>("remove_account", { accountId }),
   reorderAccounts: (orderedIds: string[]) =>
     invoke<void>("reorder_accounts", { orderedIds }),
+  countInboxUnreadSince: (accountId: string, since: number) =>
+    invoke<number>("count_inbox_unread_since", { accountId, since }),
   getInboxEmailKeys: (accountId: string | null, limit?: number) =>
     invoke<Array<{ accountId: string; id: string }>>("get_inbox_email_keys", { accountId, limit }),
   getEmailsByLabel: (input: EmailPageInput) =>
@@ -261,8 +269,8 @@ export const tauriApi = {
   setAppLanguage: (language: AppControls["appLanguage"]) =>
     invoke<AppControls>("set_app_language", { language }),
   isSystemFullscreen: () => invoke<boolean>("is_system_fullscreen"),
-  setUnreadIndicator: (count: number, tooltip: string) =>
-    invoke<void>("set_unread_indicator", { count, tooltip }),
+  setUnreadIndicator: (tooltip: string) =>
+    invoke<void>("set_unread_indicator", { tooltip }),
   showCustomNotification: (notification: CustomNotificationInput) =>
     invoke<void>("show_custom_notification", { ...notification }),
 };

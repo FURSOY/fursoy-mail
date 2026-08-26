@@ -179,62 +179,24 @@ pub const TRAY_ID: &str = "main";
 /// The longest tooltip Windows will show on a tray icon.
 const MAX_TOOLTIP_CHARS: usize = 120;
 
-/// Marks the tray icon while mail is waiting, and puts the number in its
-/// tooltip. A tray icon is 16 to 32 pixels across, where a drawn count would be
-/// a smudge — the dot says there is something, the tooltip says how much.
+/// Puts the unread count in the tray icon's tooltip. The icon itself is left
+/// alone: a badge on it only ever said "there is unread mail", which for a
+/// mailbox that is never at zero is a mark that never goes out — and at tray
+/// size it is a blob over the icon rather than a number worth reading.
 #[tauri::command]
 pub fn set_unread_indicator(
     window: tauri::WebviewWindow,
     app: AppHandle,
-    count: u32,
     tooltip: String,
 ) -> Result<(), String> {
     crate::require_command_window(&window, &["main"])?;
     let Some(tray) = app.tray_by_id(TRAY_ID) else {
         return Ok(());
     };
-    tray.set_tooltip(Some(tooltip.chars().take(MAX_TOOLTIP_CHARS).collect::<String>()))
-        .map_err(|error| error.to_string())?;
-    let Some(base) = app.default_window_icon().cloned() else {
-        return Ok(());
-    };
-    let icon = if count == 0 {
-        base
-    } else {
-        with_unread_dot(&base)
-    };
-    tray.set_icon(Some(icon)).map_err(|error| error.to_string())
-}
-
-/// The same icon with a dot in its lower-right corner: a white ring so it stays
-/// visible on a light taskbar, filled with the accent red.
-fn with_unread_dot(base: &tauri::image::Image<'_>) -> tauri::image::Image<'static> {
-    let (width, height) = (base.width(), base.height());
-    let mut rgba = base.rgba().to_vec();
-    let radius = (width.min(height) as f32 * 0.32).max(3.0);
-    let centre_x = width as f32 - radius - 0.5;
-    let centre_y = height as f32 - radius - 0.5;
-    for y in 0..height {
-        for x in 0..width {
-            let offset_x = x as f32 + 0.5 - centre_x;
-            let offset_y = y as f32 + 0.5 - centre_y;
-            let distance = (offset_x * offset_x + offset_y * offset_y).sqrt();
-            if distance > radius {
-                continue;
-            }
-            let index = ((y * width + x) * 4) as usize;
-            let Some(pixel) = rgba.get_mut(index..index + 4) else {
-                continue;
-            };
-            let ring = distance > radius - (radius * 0.28).max(1.0);
-            pixel.copy_from_slice(if ring {
-                &[255, 255, 255, 255]
-            } else {
-                &[239, 68, 68, 255]
-            });
-        }
-    }
-    tauri::image::Image::new_owned(rgba, width, height)
+    tray.set_tooltip(Some(
+        tooltip.chars().take(MAX_TOOLTIP_CHARS).collect::<String>(),
+    ))
+    .map_err(|error| error.to_string())
 }
 
 const NOTIF_W: f64 = 340.0;

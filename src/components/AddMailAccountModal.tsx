@@ -60,6 +60,8 @@ export function AddMailAccountModal({ open, onClose, onAdd, onOAuth }: AddMailAc
   const [submitting, setSubmitting] = useState(false);
   const [oauthPending, setOAuthPending] = useState(false);
   const [error, setError] = useState("");
+  const attemptRef = useRef(0);
+  const pendingOAuthRef = useRef<{ email: string; provider: DiscoveredMailProvider } | null>(null);
   const canSubmitManual = useMemo(() => Boolean(
     form.email.trim() && form.username.trim() && form.password && form.imapHost.trim() && form.smtpHost.trim()
   ), [form]);
@@ -78,10 +80,14 @@ export function AddMailAccountModal({ open, onClose, onAdd, onOAuth }: AddMailAc
   if (!open) return null;
 
   const localizedError = (cause: unknown) => {
-    const raw = String(cause).replace(/^Error:\s*/i, "");
+    const raw = String(cause).replace(/^Error:\s*/i, "").trim();
     const key = raw.match(/(mail_(?:account|oauth)_[a-z_]+)/)?.[1] ?? "unknown";
     const errors = tr.mailAccount.errors as Record<string, string>;
-    return errors[key] ?? errors.unknown;
+    const known = errors[key];
+    if (known) return known;
+    // A reason with no wording of its own still has to reach the user: the
+    // generic sentence alone says nothing about what to change.
+    return raw ? `${errors.unknown} (${raw.slice(0, 160)})` : errors.unknown;
   };
   const requestClose = () => {
     if (oauthPending) void tauriApi.cancelMailOAuth();
@@ -99,6 +105,38 @@ export function AddMailAccountModal({ open, onClose, onAdd, onOAuth }: AddMailAc
     setError("");
     setStep("manual");
   };
+  /// The sign-in happens in the browser, where this app cannot see whether the
+  /// user finished, closed the tab, or wandered off. So the wait is owned by an
+  /// attempt number: a retry cancels the one still waiting and takes over, and
+  /// the abandoned attempt is not allowed to write over the new one's state.
+  const runOAuth = async (targetEmail: string, targetProvider: DiscoveredMailProvider) => {
+    const attempt = ++attemptRef.current;
+    pendingOAuthRef.current = { email: targetEmail, provider: targetProvider };
+    setSubmitting(true);
+    setOAuthPending(true);
+    setError("");
+    try {
+      await onOAuth(targetEmail, targetProvider);
+      if (attemptRef.current !== attempt) return;
+      onClose();
+    } catch (cause) {
+      if (attemptRef.current !== attempt) return;
+      if (!/oauth_cancelled/i.test(String(cause))) setError(localizedError(cause));
+    } finally {
+      if (attemptRef.current === attempt) {
+        setOAuthPending(false);
+        setSubmitting(false);
+      }
+    }
+  };
+
+  const retryOAuth = async () => {
+    const target = pendingOAuthRef.current;
+    if (!target) return;
+    await tauriApi.cancelMailOAuth().catch(() => {});
+    void runOAuth(target.email, target.provider);
+  };
+
   const discover = async (event: React.FormEvent) => {
     event.preventDefault();
     if (!email.trim() || submitting) return;
@@ -108,16 +146,13 @@ export function AddMailAccountModal({ open, onClose, onAdd, onOAuth }: AddMailAc
       const discovery = await tauriApi.discoverMailProvider(email);
       setEmail(discovery.email);
       if (discovery.authType === "oauth") {
-        setOAuthPending(true);
-        await onOAuth(discovery.email, discovery.provider);
-        onClose();
-      } else {
-        openManual(discovery.email, discovery.provider);
+        await runOAuth(discovery.email, discovery.provider);
+        return;
       }
+      openManual(discovery.email, discovery.provider);
     } catch (cause) {
-      if (!/oauth_cancelled/i.test(String(cause))) setError(localizedError(cause));
+      setError(localizedError(cause));
     } finally {
-      setOAuthPending(false);
       setSubmitting(false);
     }
   };
@@ -140,18 +175,7 @@ export function AddMailAccountModal({ open, onClose, onAdd, onOAuth }: AddMailAc
   };
   const startOAuthFromManual = async (oauthProvider: "google" | "microsoft") => {
     if (!form.email.trim() || submitting) return;
-    setSubmitting(true);
-    setOAuthPending(true);
-    setError("");
-    try {
-      await onOAuth(form.email.trim(), oauthProvider);
-      onClose();
-    } catch (cause) {
-      if (!/oauth_cancelled/i.test(String(cause))) setError(localizedError(cause));
-    } finally {
-      setOAuthPending(false);
-      setSubmitting(false);
-    }
+    await runOAuth(form.email.trim(), oauthProvider);
   };
 
   return (
@@ -175,6 +199,12 @@ export function AddMailAccountModal({ open, onClose, onAdd, onOAuth }: AddMailAc
             <div className="flex items-start gap-2 rounded-lg border border-white/5 bg-white/[0.025] px-3 py-2.5 text-[11px] text-zinc-500"><LockKeyhole className="mt-0.5 h-3.5 w-3.5 shrink-0" /><span>{tr.mailAccount.oauthPrivacy}</span></div>
             {error && <div role="alert" className="rounded-lg border border-red-400/20 bg-red-400/10 px-3 py-2 text-xs text-red-300">{error}</div>}
             <button type="submit" disabled={!email.trim() || submitting} className={`${ui.buttonPrimary} w-full`}>{oauthPending ? tr.mailAccount.waitingForBrowser : submitting ? tr.mailAccount.detecting : tr.mailAccount.continue}</button>
+            {oauthPending && (
+              <div className="flex items-center justify-between gap-3 rounded-lg border border-white/5 bg-white/[0.025] px-3 py-2.5 text-[11px] text-zinc-500">
+                <span>{tr.mailAccount.oauthWaitingHint}</span>
+                <button type="button" onClick={() => void retryOAuth()} className="shrink-0 font-medium text-[var(--app-accent)] hover:underline">{tr.mailAccount.oauthRetry}</button>
+              </div>
+            )}
             <button type="button" onClick={() => openManual()} disabled={submitting} className="w-full text-center text-xs text-zinc-500 transition-colors hover:text-zinc-300">{tr.mailAccount.manualLink}</button>
           </form>
         ) : (

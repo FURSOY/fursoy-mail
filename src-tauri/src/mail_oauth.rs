@@ -12,7 +12,6 @@ const REDIRECT_URI: &str = "http://127.0.0.1:8123/callback";
 const MAX_CALLBACK_REQUEST_LINE: usize = 8 * 1024;
 const CALLBACK_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const GOOGLE_SCOPES: &str = "openid email profile https://mail.google.com/";
-const DEFAULT_MICROSOFT_CLIENT_ID: &str = "ca484d0d-2602-49d9-94ac-b14337cfdcc5";
 const MICROSOFT_SCOPES: &str = "openid email profile offline_access https://outlook.office.com/IMAP.AccessAsUser.All https://outlook.office.com/SMTP.Send";
 
 #[derive(Default)]
@@ -163,9 +162,14 @@ fn optional_credential(name: &str, embedded: Option<&str>) -> Option<String> {
         .filter(|value| !value.trim().is_empty())
 }
 
-fn microsoft_client_id() -> String {
-    optional_credential("MICROSOFT_CLIENT_ID", option_env!("MICROSOFT_CLIENT_ID"))
-        .unwrap_or_else(|| DEFAULT_MICROSOFT_CLIENT_ID.to_string())
+/// Microsoft sign-in needs this build's own application registration, the same
+/// way Google does. There used to be a hard-coded fallback here, which could
+/// only ever fail: an application id belonging to somebody else does not list
+/// this app's redirect address, so Microsoft refuses the request in the browser
+/// and the sign-in waits three minutes for a reply that never comes. Saying so
+/// straight away is the whole improvement.
+fn microsoft_client_id() -> Result<String, String> {
+    credential("MICROSOFT_CLIENT_ID", option_env!("MICROSOFT_CLIENT_ID"))
 }
 
 /// `force_consent` decides whether Google is asked for the consent screen. It
@@ -188,7 +192,7 @@ fn build_authorization_url(
         ),
         DiscoveredProvider::Microsoft => (
             "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
-            microsoft_client_id(),
+            microsoft_client_id()?,
             MICROSOFT_SCOPES,
         ),
         _ => return Err("mail_oauth_provider_not_supported".to_string()),
@@ -405,7 +409,7 @@ async fn exchange_code(
         ),
         DiscoveredProvider::Microsoft => (
             "https://login.microsoftonline.com/common/oauth2/v2.0/token",
-            microsoft_client_id(),
+            microsoft_client_id()?,
         ),
         _ => return Err("mail_oauth_provider_not_supported".to_string()),
     };
@@ -460,7 +464,7 @@ pub(crate) async fn refresh_mail_oauth_token(
         ),
         DiscoveredProvider::Microsoft => (
             "https://login.microsoftonline.com/common/oauth2/v2.0/token",
-            microsoft_client_id(),
+            microsoft_client_id()?,
             MICROSOFT_SCOPES,
         ),
         _ => return Err("mail_oauth_provider_not_supported".to_string()),
@@ -637,6 +641,13 @@ fn account_input(
     }
 }
 
+/// Says which step of a sign-in gave up. Only this app's own error codes and
+/// the step's name are written — never a token, a code, or a password.
+fn oauth_step_failed(step: &str, error: String) -> String {
+    eprintln!("[OAUTH] {step} failed: {error}");
+    error
+}
+
 #[tauri::command]
 pub async fn start_mail_oauth(
     window: tauri::WebviewWindow,
@@ -667,15 +678,35 @@ pub async fn start_mail_oauth(
         &challenge,
         !has_refresh_token,
     )?;
-    let code = wait_for_callback(&app, state, authorization_url).await?;
-    let token = exchange_code(provider, &code, &verifier).await?;
-    let (authorized_email, picture) = authorized_identity(provider, &token, &nonce).await?;
+    // A sign-in that never comes back looks exactly like one that was never
+    // started, so both ends of the wait say so.
+    eprintln!("[OAUTH] {provider:?}: waiting for the browser to come back");
+    let code = wait_for_callback(&app, state, authorization_url)
+        .await
+        .map_err(|error| oauth_step_failed("callback", error))?;
+    eprintln!("[OAUTH] {provider:?}: browser returned, exchanging the code");
+    let token = exchange_code(provider, &code, &verifier)
+        .await
+        .map_err(|error| oauth_step_failed("token exchange", error))?;
+    let (authorized_email, picture) = authorized_identity(provider, &token, &nonce)
+        .await
+        .map_err(|error| oauth_step_failed("identity", error))?;
     if authorized_email != email {
+        // The address the provider signed in is the one the mailbox belongs to,
+        // and it is not a secret the user does not already know.
+        eprintln!("[OAUTH] signed in as {authorized_email}, but {email} was asked for");
         return Err("mail_oauth_email_mismatch".to_string());
     }
 
     let input = account_input(provider, &email)?;
-    crate::mail_account::test_oauth_mail_account(input.clone(), token.access_token.clone()).await?;
+    eprintln!(
+        "[OAUTH] {provider:?}: signing in to {} and {}",
+        input.imap_host, input.smtp_host
+    );
+    crate::mail_account::test_oauth_mail_account(input.clone(), token.access_token.clone())
+        .await
+        .map_err(|error| oauth_step_failed("mailbox sign-in", error))?;
+    eprintln!("[OAUTH] {provider:?}: signed in");
     let previous_tokens = crate::db::load_tokens(&email);
     let previous_password = crate::mail_account::load_stored_password(&email);
     let refresh_token = token

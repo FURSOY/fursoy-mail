@@ -440,6 +440,7 @@ interface EmailReaderProps {
   onCreateGmailLabel: (name: string) => Promise<GmailLabel | null>;
   customMailboxes: CustomMailbox[];
   onMoveToMailbox: (mail: EmailSummary, mailbox: CustomMailbox) => Promise<void>;
+  supportsLabels: boolean;
 }
 
 // ── Main component ─────────────────────────────────────────────────────────────
@@ -458,7 +459,7 @@ export function EmailReader({
   onOpenUrl, mailScrollRef, relayoutKey, threadEmails, hasMoreThreadEmails, isLoadingOlderThread,
   threadMemoryLimitReached, onLoadOlderThread, accessToken, showToast,
   searchQuery, gmailLabels, gmailLabelIds, onToggleGmailLabel, onCreateGmailLabel,
-  customMailboxes, onMoveToMailbox,
+  customMailboxes, onMoveToMailbox, supportsLabels,
 }: EmailReaderProps) {
   const tr = useLocale();
   const replyEditableRef = useRef<HTMLDivElement>(null);
@@ -1143,12 +1144,14 @@ export function EmailReader({
               <Eye className="w-4 h-4" />
             </button>
           </ToolbarTip>
-          <LabelPicker
-            labels={gmailLabels}
-            labelIds={gmailLabelIds}
-            onToggle={onToggleGmailLabel}
-            onCreate={onCreateGmailLabel}
-          />
+          {supportsLabels && (
+            <LabelPicker
+              labels={gmailLabels}
+              labelIds={gmailLabelIds}
+              onToggle={onToggleGmailLabel}
+              onCreate={onCreateGmailLabel}
+            />
+          )}
           {customMailboxes.length > 0 && (
             <FolderPicker
               mailboxes={customMailboxes}

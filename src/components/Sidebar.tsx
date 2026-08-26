@@ -34,6 +34,9 @@ interface SidebarProps {
   onLogoutAccount: (accountId: string) => void;
   expiredAccountIds: Set<string>;
   customMailboxes: CustomMailbox[];
+  showLabels: boolean;
+  onCreateFolder: (name: string) => Promise<boolean>;
+  onRenameFolder: (mailboxRole: string, name: string) => Promise<boolean>;
   gmailLabels: GmailLabel[];
   onRenameGmailLabel: (label: GmailLabel, name: string) => Promise<boolean>;
   onMoveGmailLabel: (label: GmailLabel, name: string) => Promise<boolean>;
@@ -45,11 +48,14 @@ export function Sidebar({
   activeTab, goToTab, mobileMenuOpen, setMobileMenuOpen,
   authStatus, isUserSyncing, unreadCount, onLogin, usesOverlaySidebar,
   accounts, activeAccountId, onSwitchAccount, onAddAccount, onLogoutAccount,
-  expiredAccountIds, customMailboxes, gmailLabels, onRenameGmailLabel, onMoveGmailLabel, onSetGmailLabelColor, onDeleteGmailLabel,
+  expiredAccountIds, customMailboxes, gmailLabels, showLabels, onCreateFolder, onRenameFolder, onRenameGmailLabel, onMoveGmailLabel, onSetGmailLabelColor, onDeleteGmailLabel,
 }: SidebarProps) {
   const tr = useLocale();
   const [hoveredAccount, setHoveredAccount] = useState<string | null>(null);
   const [labelsOpen, setLabelsOpen] = useState(true);
+  const [foldersOpen, setFoldersOpen] = useState(true);
+  const [folderDialog, setFolderDialog] = useState<{ role: string | null; name: string } | null>(null);
+  const [folderBusy, setFolderBusy] = useState(false);
   const [collapsedLabelIds, setCollapsedLabelIds] = useState<Set<string>>(() => new Set());
   const [labelMenu, setLabelMenu] = useState<{
     label: GmailLabel;
@@ -143,6 +149,40 @@ export function Sidebar({
       {badge}
     </button>
   );
+
+  const folderNavItem = (mailbox: CustomMailbox) => {
+    const tab = mailbox.role as TabName;
+    const isActive = activeTab === tab;
+    return (
+      <div key={mailbox.role} className="group/folder-row relative min-w-0">
+        <button
+          type="button"
+          onClick={() => goToTab(tab)}
+          aria-current={isActive ? "page" : undefined}
+          title={mailbox.name}
+          className={`flex w-full min-w-0 items-center gap-3 overflow-hidden rounded-lg px-3 py-2 pr-9 text-sm font-medium transition-all duration-200 ${
+            isActive
+              ? "bg-[var(--app-accent-soft)] text-zinc-100 shadow-[inset_2px_0_0_var(--app-accent)]"
+              : "text-zinc-400 hover:bg-white/5 hover:text-zinc-200"
+          }`}
+        >
+          <Folder className="h-4 w-4 shrink-0" />
+          <span className="min-w-0 flex-1 truncate text-left">{mailbox.name}</span>
+        </button>
+        <button
+          type="button"
+          aria-label={`${tr.nav.renameFolder}: ${mailbox.name}`}
+          onClick={event => {
+            event.stopPropagation();
+            setFolderDialog({ role: mailbox.role, name: mailbox.name });
+          }}
+          className="absolute right-1.5 top-1/2 flex h-6 w-6 -translate-y-1/2 items-center justify-center rounded-md text-zinc-600 opacity-0 transition-opacity hover:bg-white/5 hover:text-zinc-200 group-hover/folder-row:opacity-100 group-focus-within/folder-row:opacity-100"
+        >
+          <Pencil className="h-3 w-3" />
+        </button>
+      </div>
+    );
+  };
 
   const labelNavItem = ({ label, displayName, depth, hasChildren }: LabelHierarchyRow) => {
     const tab: TabName = `gmail:${label.id}`;
@@ -334,41 +374,68 @@ export function Sidebar({
           {customMailboxes.length > 0 && (
             <>
               <div className="my-2 border-t border-white/5" />
-              <div className="px-3 pb-1 pt-1 text-[10px] font-semibold uppercase tracking-wide text-zinc-600">
-                {tr.nav.folders}
+              <div className="flex min-w-0 items-center">
+                <button
+                  type="button"
+                  onClick={() => setFoldersOpen(open => !open)}
+                  aria-expanded={foldersOpen}
+                  aria-label={foldersOpen ? tr.nav.collapseFolders : tr.nav.expandFolders}
+                  className="flex min-w-0 flex-1 items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium text-zinc-400 transition-colors hover:bg-white/5 hover:text-zinc-200"
+                >
+                  <Folder className="h-4 w-4 shrink-0" />
+                  <span className="min-w-0 flex-1 truncate text-left">{tr.nav.folders}</span>
+                  <ChevronDown className={`h-3.5 w-3.5 shrink-0 text-zinc-600 transition-transform ${foldersOpen ? "rotate-0" : "-rotate-90"}`} />
+                </button>
+                {activeAccountId !== null && (
+                  <button
+                    type="button"
+                    aria-label={tr.nav.newFolder}
+                    title={tr.nav.newFolder}
+                    onClick={() => setFolderDialog({ role: null, name: "" })}
+                    className="ml-1 flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-zinc-600 transition-colors hover:bg-white/5 hover:text-zinc-200"
+                  >
+                    <Plus className="h-3.5 w-3.5" />
+                  </button>
+                )}
               </div>
-              {customMailboxes.map(mailbox =>
-                navItem(mailbox.role as TabName, <Folder className="w-4 h-4" />, mailbox.name)
+              {foldersOpen && (
+                <div className="label-scrollbar -mr-2 max-h-[188px] space-y-0.5 overflow-y-auto pr-2">
+                  {customMailboxes.map(folderNavItem)}
+                </div>
               )}
             </>
           )}
 
-          <div className="my-2 border-t border-white/5" />
+          {showLabels && (
+            <>
+            <div className="my-2 border-t border-white/5" />
 
-          <button
-            type="button"
-            onClick={() => setLabelsOpen(open => !open)}
-            aria-expanded={labelsOpen}
-            aria-label={labelsOpen ? tr.labels.collapse : tr.labels.expand}
-            className="flex w-full min-w-0 items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium text-zinc-400 transition-colors hover:bg-white/5 hover:text-zinc-200"
-          >
-            <Tags className="h-4 w-4 shrink-0" />
-            <span className="min-w-0 flex-1 truncate text-left">{tr.labels.title}</span>
-            <ChevronDown className={`h-3.5 w-3.5 shrink-0 text-zinc-600 transition-transform ${labelsOpen ? "rotate-0" : "-rotate-90"}`} />
-          </button>
-          {/* The nav is inset by its own padding: a scroll box that stops at the
-              content edge leaves the bar floating short of the sidebar, so the
-              box is pulled out and the padding put back inside it. */}
-          {labelsOpen && (
-            <div className="label-scrollbar -mr-2 max-h-[188px] space-y-0.5 overflow-y-auto pr-2">
-              {activeAccountId === null ? (
-                <div className="px-3 pb-2 text-[10px] leading-4 text-zinc-600">{tr.labels.chooseAccount}</div>
-              ) : labelRows.length > 0 ? (
-                labelRows.map(labelNavItem)
-              ) : (
-                <div className="px-3 pb-2 text-[10px] text-zinc-600">{tr.labels.none}</div>
-              )}
-            </div>
+            <button
+              type="button"
+              onClick={() => setLabelsOpen(open => !open)}
+              aria-expanded={labelsOpen}
+              aria-label={labelsOpen ? tr.labels.collapse : tr.labels.expand}
+              className="flex w-full min-w-0 items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium text-zinc-400 transition-colors hover:bg-white/5 hover:text-zinc-200"
+            >
+              <Tags className="h-4 w-4 shrink-0" />
+              <span className="min-w-0 flex-1 truncate text-left">{tr.labels.title}</span>
+              <ChevronDown className={`h-3.5 w-3.5 shrink-0 text-zinc-600 transition-transform ${labelsOpen ? "rotate-0" : "-rotate-90"}`} />
+            </button>
+            {/* The nav is inset by its own padding: a scroll box that stops at the
+                content edge leaves the bar floating short of the sidebar, so the
+                box is pulled out and the padding put back inside it. */}
+            {labelsOpen && (
+              <div className="label-scrollbar -mr-2 max-h-[188px] space-y-0.5 overflow-y-auto pr-2">
+                {activeAccountId === null ? (
+                  <div className="px-3 pb-2 text-[10px] leading-4 text-zinc-600">{tr.labels.chooseAccount}</div>
+                ) : labelRows.length > 0 ? (
+                  labelRows.map(labelNavItem)
+                ) : (
+                  <div className="px-3 pb-2 text-[10px] text-zinc-600">{tr.labels.none}</div>
+                )}
+              </div>
+            )}
+            </>
           )}
 
           <div className="my-2 border-t border-white/5" />
@@ -567,6 +634,50 @@ export function Sidebar({
               </button>
             </>
           )}
+        </div>,
+        document.body,
+      )}
+      {folderDialog && createPortal(
+        <div
+          className="fixed inset-0 z-[240] flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm"
+          onClick={() => { if (!folderBusy) setFolderDialog(null); }}
+        >
+          <form
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="folder-dialog-title"
+            className={`w-full max-w-sm p-5 ${ui.modal}`}
+            onClick={event => event.stopPropagation()}
+            onKeyDown={event => { if (event.key === "Escape" && !folderBusy) setFolderDialog(null); }}
+            onSubmit={async event => {
+              event.preventDefault();
+              const name = folderDialog.name.trim();
+              if (!name || folderBusy) return;
+              setFolderBusy(true);
+              const success = folderDialog.role
+                ? await onRenameFolder(folderDialog.role, name)
+                : await onCreateFolder(name);
+              setFolderBusy(false);
+              if (success) setFolderDialog(null);
+            }}
+          >
+            <h2 id="folder-dialog-title" className="text-sm font-semibold text-zinc-100">
+              {folderDialog.role ? tr.nav.renameFolder : tr.nav.newFolder}
+            </h2>
+            <input
+              autoFocus
+              maxLength={120}
+              value={folderDialog.name}
+              onChange={event => setFolderDialog(current => current && { ...current, name: event.target.value })}
+              aria-label={tr.nav.folderName}
+              placeholder={tr.nav.folderName}
+              className={`mt-4 ${ui.input}`}
+            />
+            <div className="mt-5 flex items-center justify-end gap-3">
+              <button type="button" disabled={folderBusy} onClick={() => setFolderDialog(null)} className={ui.buttonSecondary}>{tr.common.cancel}</button>
+              <button type="submit" disabled={folderBusy || !folderDialog.name.trim()} className={ui.buttonPrimary}>{tr.common.apply}</button>
+            </div>
+          </form>
         </div>,
         document.body,
       )}

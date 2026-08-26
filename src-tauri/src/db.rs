@@ -29,19 +29,102 @@ fn account_key(email: &str) -> String {
     format!("oauth-{}", email)
 }
 
+fn account_part_key(email: &str, index: usize) -> String {
+    format!("oauth-{}-part-{index}", email)
+}
+
+/// Windows stores one credential in at most 2560 bytes, and it stores them as
+/// UTF-16, so the real ceiling is 1280 characters. Google's tokens fit with
+/// room to spare; a single Microsoft access token can be twice the whole
+/// budget, which is why saving a Microsoft session failed *after* the mailbox
+/// had already signed in — the sign-in worked and the account was never
+/// created. Anything too long is written as numbered parts, each under the
+/// limit, and the main entry then holds only their count.
+const MAX_CREDENTIAL_CHARS: usize = 1000;
+/// The most parts one session may be split into. Ten times the limit is far
+/// more than any provider issues, and it bounds what a delete has to sweep.
+const MAX_CREDENTIAL_PARTS: usize = 10;
+
+#[derive(Serialize, Deserialize)]
+struct StoredTokenParts {
+    parts: usize,
+}
+
+fn split_credential(data: &str, limit: usize) -> Vec<String> {
+    data.chars()
+        .collect::<Vec<char>>()
+        .chunks(limit)
+        .map(|chunk| chunk.iter().collect())
+        .collect()
+}
+
+fn write_credential(key: &str, value: &str) -> Result<(), String> {
+    Entry::new(KEYRING_SERVICE, key)
+        .and_then(|entry| entry.set_password(value))
+        .map_err(|error| format!("Token could not be saved: {error}"))
+}
+
+fn read_credential(key: &str) -> Option<String> {
+    Entry::new(KEYRING_SERVICE, key).ok()?.get_password().ok()
+}
+
+fn delete_credential(key: &str) -> Result<(), String> {
+    let entry = Entry::new(KEYRING_SERVICE, key)
+        .map_err(|error| format!("Session credential could not be opened: {error}"))?;
+    match entry.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(error) => Err(format!("Session credential could not be removed: {error}")),
+    }
+}
+
 pub fn save_tokens(email: &str, tokens: &StoredTokens) -> Result<(), String> {
     let data =
         serde_json::to_string(tokens).map_err(|e| format!("Token could not be serialized: {e}"))?;
-    Entry::new(KEYRING_SERVICE, &account_key(email))
-        .and_then(|e| e.set_password(&data))
-        .map_err(|e| format!("Token could not be saved: {e}"))
+    if data.chars().count() <= MAX_CREDENTIAL_CHARS {
+        write_credential(&account_key(email), &data)?;
+        clear_token_parts(email, 0);
+        return Ok(());
+    }
+    let parts = split_credential(&data, MAX_CREDENTIAL_CHARS);
+    if parts.len() > MAX_CREDENTIAL_PARTS {
+        return Err("Token could not be saved: it is longer than this app stores.".to_string());
+    }
+    // The parts go in before the entry that points at them, so an interrupted
+    // save never leaves a count referring to something that was never written.
+    for (index, part) in parts.iter().enumerate() {
+        write_credential(&account_part_key(email, index), part)?;
+    }
+    let header = serde_json::to_string(&StoredTokenParts { parts: parts.len() })
+        .map_err(|e| format!("Token could not be serialized: {e}"))?;
+    write_credential(&account_key(email), &header)?;
+    clear_token_parts(email, parts.len());
+    Ok(())
+}
+
+/// Removes the parts of an older, longer session that the current one no longer
+/// uses. A leftover part is never read — the count decides that — so failing to
+/// remove one is not worth failing a save that already succeeded.
+fn clear_token_parts(email: &str, keep: usize) {
+    for index in keep..MAX_CREDENTIAL_PARTS {
+        let _ = delete_credential(&account_part_key(email, index));
+    }
 }
 
 pub fn load_tokens(email: &str) -> Option<StoredTokens> {
-    let json = Entry::new(KEYRING_SERVICE, &account_key(email))
-        .ok()?
-        .get_password()
-        .ok()?;
+    let stored = read_credential(&account_key(email))?;
+    let json = match serde_json::from_str::<StoredTokens>(&stored) {
+        Ok(tokens) => {
+            return (!tokens.access_token.is_empty()).then_some(tokens);
+        }
+        Err(_) => {
+            let header: StoredTokenParts = serde_json::from_str(&stored).ok()?;
+            let mut data = String::new();
+            for index in 0..header.parts.min(MAX_CREDENTIAL_PARTS) {
+                data.push_str(&read_credential(&account_part_key(email, index))?);
+            }
+            data
+        }
+    };
     let tokens: StoredTokens = serde_json::from_str(&json).ok()?;
     if tokens.access_token.is_empty() {
         return None;
@@ -68,12 +151,8 @@ pub fn mark_oauth_session_revoked(email: &str) -> Result<(), String> {
 }
 
 pub fn delete_tokens(email: &str) -> Result<(), String> {
-    let entry = Entry::new(KEYRING_SERVICE, &account_key(email))
-        .map_err(|e| format!("Session credential could not be opened: {e}"))?;
-    match entry.delete_credential() {
-        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-        Err(error) => Err(format!("Session credential could not be removed: {error}")),
-    }
+    clear_token_parts(email, 0);
+    delete_credential(&account_key(email))
 }
 
 /// How early a stored access token is treated as gone. It has to cover the
@@ -3788,6 +3867,28 @@ pub fn get_inbox_unread_count(
     inbox_unread_count_from_conn(&conn, account_id.as_deref()).map_err(database_error)
 }
 
+/// How many unread messages the inbox holds that arrived after a mark. The
+/// catch-up summary needs the real number: an application that was closed for a
+/// week can have more waiting than a page of the list ever reads.
+#[tauri::command]
+pub fn count_inbox_unread_since(
+    window: tauri::WebviewWindow,
+    app: tauri::AppHandle,
+    account_id: String,
+    since: i64,
+) -> Result<i64, String> {
+    crate::require_command_window(&window, &["main"])?;
+    let db_path = get_db_path(&app);
+    let conn = Connection::open(db_path).map_err(database_error)?;
+    conn.query_row(
+        "SELECT COUNT(*) FROM emails
+         WHERE account_id = ?1 AND label = 'inbox' AND unread = 1 AND date > ?2",
+        params![account_id, since],
+        |row| row.get(0),
+    )
+    .map_err(database_error)
+}
+
 fn inbox_unread_count_from_conn(conn: &Connection, account_id: Option<&str>) -> Result<i64> {
     let count: i64 = match account_id {
         Some(id) => conn.query_row(
@@ -4030,6 +4131,44 @@ pub fn delete_emails_by_ids(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_session_too_long_for_one_credential_is_split_and_rejoined() {
+        // Windows stores a credential in 2560 bytes, and as UTF-16 that is
+        // 1280 characters: a Microsoft access token alone can be longer.
+        let tokens = StoredTokens {
+            access_token: "a".repeat(2200),
+            refresh_token: "r".repeat(1400),
+            expires_at: Some(1_700_000_000),
+        };
+        let data = serde_json::to_string(&tokens).expect("serialize");
+        let parts = split_credential(&data, MAX_CREDENTIAL_CHARS);
+
+        assert!(parts.len() > 1, "this session has to be split");
+        assert!(parts
+            .iter()
+            .all(|part| part.chars().count() <= MAX_CREDENTIAL_CHARS));
+        assert_eq!(parts.concat(), data);
+
+        let rejoined: StoredTokens = serde_json::from_str(&parts.concat()).expect("rejoin");
+        assert_eq!(rejoined.access_token, tokens.access_token);
+        assert_eq!(rejoined.refresh_token, tokens.refresh_token);
+        assert_eq!(rejoined.expires_at, tokens.expires_at);
+    }
+
+    #[test]
+    fn a_session_that_fits_is_left_whole() {
+        let data = serde_json::to_string(&StoredTokens {
+            access_token: "access".to_string(),
+            refresh_token: "refresh".to_string(),
+            expires_at: None,
+        })
+        .expect("serialize");
+        assert_eq!(
+            split_credential(&data, MAX_CREDENTIAL_CHARS),
+            vec![data.clone()]
+        );
+    }
 
     #[test]
     fn stored_tokens_accept_legacy_keyring_json_without_expiry() {

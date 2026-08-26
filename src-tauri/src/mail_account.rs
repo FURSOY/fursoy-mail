@@ -3069,6 +3069,27 @@ fn cached_tag_capability(account_id: &str) -> Option<bool> {
     (checked.elapsed() < TAG_CAPABILITY_TTL).then_some(*supported)
 }
 
+/// Whether this account's server can hold a tag at all, as far as the last
+/// sync learned. It never asks the server: every inbox pass already records
+/// the answer, and an answer worth a connection is not worth having here.
+/// Unknown counts as yes, so the label list shows until something proves
+/// otherwise rather than disappearing while an account is still starting up.
+#[tauri::command]
+pub fn supports_mail_tags(
+    window: tauri::WebviewWindow,
+    app: AppHandle,
+    account_id: String,
+) -> Result<bool, String> {
+    crate::require_command_window(&window, &["main"])?;
+    let Ok(settings) = crate::db::get_imap_account_settings(&app, &account_id) else {
+        return Ok(true);
+    };
+    if settings.imap_host.eq_ignore_ascii_case("imap.gmail.com") {
+        return Ok(true);
+    }
+    Ok(cached_tag_capability(&account_id).unwrap_or(true))
+}
+
 /// Remembers what a SELECT reported. Every sync pass over the inbox already
 /// learns this for free, so the answer is usually there before anything asks.
 fn remember_tag_capability(account_id: &str, supported: bool) {
@@ -3534,6 +3555,144 @@ fn mailbox_for_label(app: &AppHandle, account_id: &str, label: &str) -> Result<S
     mailbox_role_for_label(label, &mappings)
         .and_then(|role| mappings.get(&role).cloned())
         .ok_or_else(|| "mail_account_label_not_supported".to_string())
+}
+
+/// A folder name the user typed, ready for the wire. IMAP has no place for a
+/// control character or the hierarchy delimiter in a single level's name, and a
+/// name that survives neither the trip nor the eye is worth refusing outright.
+fn normalize_folder_name(name: &str) -> Result<String, String> {
+    let name = name.trim();
+    if name.is_empty()
+        || name.chars().count() > 120
+        || name.chars().any(|character| character.is_control())
+        || name.contains(['/', '\\', '"', '%', '*'])
+    {
+        return Err("mail_account_folder_name_invalid".to_string());
+    }
+    Ok(name.to_string())
+}
+
+/// Opens a session for a folder command and hands back the mailbox map, since
+/// every one of them needs both.
+async fn folder_session(
+    app: &AppHandle,
+    account_id: &str,
+) -> Result<(ImapAccountInput, Option<String>, Vec<(String, String)>), String> {
+    let input = stored_account_input(app, account_id)?;
+    if input.imap_host.eq_ignore_ascii_case("imap.gmail.com") {
+        // Gmail has no folders of its own: what looks like one is a label, and
+        // creating a mailbox there would make a label by the back door.
+        return Err("mail_account_folder_not_supported".to_string());
+    }
+    let access_token = account_oauth_token(app, account_id).await?;
+    let mailboxes = crate::db::get_imap_mailboxes(app, account_id)?;
+    Ok((input, access_token, mailboxes))
+}
+
+#[tauri::command]
+pub async fn create_imap_folder(
+    window: tauri::WebviewWindow,
+    app: AppHandle,
+    account_id: String,
+    name: String,
+) -> Result<(), String> {
+    crate::require_command_window(&window, &["main"])?;
+    let name = normalize_folder_name(&name)?;
+    let (input, access_token, mailboxes) = folder_session(&app, &account_id).await?;
+    let wire_name = crate::mutf7::encode(&name);
+    if mailboxes
+        .iter()
+        .any(|(_, mailbox)| mailbox.eq_ignore_ascii_case(&wire_name))
+    {
+        return Err("mail_account_folder_name_taken".to_string());
+    }
+    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+        let mut session = connect_sync_imap(&input, access_token.as_deref())?;
+        session
+            .create(&wire_name)
+            .map_err(|_| "mail_account_folder_failed".to_string())?;
+        // A folder nobody subscribed to is hidden from clients that list only
+        // subscriptions; this app lists everything, but the server's other
+        // clients should see it too.
+        session.subscribe(&wire_name).ok();
+        session.logout().ok();
+        Ok(())
+    })
+    .await
+    .map_err(|_| "mail_account_test_interrupted".to_string())??;
+    refresh_mailbox_layout(&app, &account_id).await
+}
+
+#[tauri::command]
+pub async fn rename_imap_folder(
+    window: tauri::WebviewWindow,
+    app: AppHandle,
+    account_id: String,
+    mailbox_role: String,
+    name: String,
+) -> Result<(), String> {
+    crate::require_command_window(&window, &["main"])?;
+    if !mailbox_role.starts_with("custom:") {
+        // The fixed roles are the server's own special mailboxes; renaming one
+        // would move the ground this app's own folders stand on.
+        return Err("mail_account_folder_not_supported".to_string());
+    }
+    let name = normalize_folder_name(&name)?;
+    let (input, access_token, mailboxes) = folder_session(&app, &account_id).await?;
+    let current = mailboxes
+        .iter()
+        .find_map(|(role, mailbox)| (role == &mailbox_role).then(|| mailbox.clone()))
+        .ok_or_else(|| "mail_account_folder_missing".to_string())?;
+    // A renamed child keeps its parents: only the last level is what the user
+    // named, and the delimiter is whatever the server put between them.
+    let delimiter = current
+        .rfind(['/', '.'])
+        .map(|index| current[..=index].to_string())
+        .unwrap_or_default();
+    let wire_name = format!("{delimiter}{}", crate::mutf7::encode(&name));
+    if wire_name == current {
+        return Ok(());
+    }
+    if mailboxes
+        .iter()
+        .any(|(_, mailbox)| mailbox.eq_ignore_ascii_case(&wire_name))
+    {
+        return Err("mail_account_folder_name_taken".to_string());
+    }
+    let renamed = current.clone();
+    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+        let mut session = connect_sync_imap(&input, access_token.as_deref())?;
+        session
+            .rename(&renamed, &wire_name)
+            .map_err(|_| "mail_account_folder_failed".to_string())?;
+        session.subscribe(&wire_name).ok();
+        session.logout().ok();
+        Ok(())
+    })
+    .await
+    .map_err(|_| "mail_account_test_interrupted".to_string())??;
+    refresh_mailbox_layout(&app, &account_id).await
+}
+
+/// Reads the layout back after a folder command, so the sidebar shows what the
+/// server now has without waiting for the layout timer. A renamed folder is a
+/// new role, so what was cached under the old one is dropped and syncs again.
+async fn refresh_mailbox_layout(app: &AppHandle, account_id: &str) -> Result<(), String> {
+    let input = stored_account_input(app, account_id)?;
+    let access_token = account_oauth_token(app, account_id).await?;
+    let gmail_account = input.imap_host.eq_ignore_ascii_case("imap.gmail.com");
+    let app_handle = app.clone();
+    let account = account_id.to_string();
+    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+        let mut session = connect_sync_imap(&input, access_token.as_deref())?;
+        let result = adopt_mailbox_layout(&app_handle, &account, &mut session, gmail_account);
+        session.logout().ok();
+        result.map(|_| ())
+    })
+    .await
+    .map_err(|_| "mail_account_test_interrupted".to_string())??;
+    mark_mailbox_layout_fresh(account_id);
+    Ok(())
 }
 
 #[tauri::command]
