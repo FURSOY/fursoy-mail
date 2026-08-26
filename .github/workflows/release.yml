@@ -55,10 +55,11 @@ jobs:
         env:
           GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
           GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          MICROSOFT_CLIENT_ID: ${{ secrets.MICROSOFT_CLIENT_ID }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         shell: pwsh
         run: |
-          foreach ($name in @("GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "TAURI_SIGNING_PRIVATE_KEY")) {
+          foreach ($name in @("GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "MICROSOFT_CLIENT_ID", "TAURI_SIGNING_PRIVATE_KEY")) {
             if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
               throw "Missing GitHub Actions secret: $name"
             }
@@ -70,6 +71,7 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
           GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          MICROSOFT_CLIENT_ID: ${{ secrets.MICROSOFT_CLIENT_ID }}
         run: npm run dist:windows
 
       - name: Generate latest.json
