@@ -254,19 +254,27 @@ export function useMailSync(options: UseMailSyncOptions) {
     }).catch(error => console.error("Summary notification failed:", error));
   }, [accountsRef, locale]);
 
-  const notifyNewEmails = useCallback(async (newEmails: EmailSummary[], missedCount = 0) => {
+  /// `beyondPage` is mail this round knows of but does not hold: what the list
+  /// it read could not reach. Everything it does hold is announced the same
+  /// way, one card per message up to five, whether it arrived a second ago or
+  /// while the application was closed — a message becomes a number only when
+  /// there is no room left to show it.
+  const notifyNewEmails = useCallback(async (newEmails: EmailSummary[], beyondPage = 0) => {
     const controls = appControlsRef.current;
     if (controls.notificationMode === "off") return;
     if (isInQuietHours(controls)) {
       // Quiet hours silence the announcement, not the arrival: what came in is
       // counted so it can be summed up once the quiet ends.
-      quietHoursHeldRef.current += newEmails.length + missedCount;
+      quietHoursHeldRef.current += newEmails.length + beyondPage;
       return;
     }
-    const held = quietHoursHeldRef.current + missedCount;
+    const held = quietHoursHeldRef.current;
     quietHoursHeldRef.current = 0;
     await notifySummary(held, "missed");
-    if (newEmails.length === 0) return;
+    if (newEmails.length === 0) {
+      await notifySummary(beyondPage, "more");
+      return;
+    }
     try {
       for (const email of newEmails.slice(0, 5)) {
         const senderName = email.sender.split("<")[0].replace(/"/g, "").trim() || email.sender;
@@ -308,7 +316,7 @@ export function useMailSync(options: UseMailSyncOptions) {
       console.error("Notification error:", error);
     }
     // A burst longer than the wall of popups anybody wants: the rest is a count.
-    await notifySummary(newEmails.length - 5, "more");
+    await notifySummary(Math.max(0, newEmails.length - 5) + beyondPage, "more");
   }, [accountsRef, appControlsRef, appLanguage, locale, notifySummary, otpMode, recentNotificationsRef]);
 
   const clearPeriodicSync = useCallback(() => {
@@ -373,22 +381,31 @@ export function useMailSync(options: UseMailSyncOptions) {
       successfullySyncedAccountIds: changedAccountIds,
       suppressNotifications,
     });
-    // What arrived while the application was closed, counted in the database
-    // rather than in the page above it: a week away can leave more waiting than
-    // the list ever reads.
+    // Mail that arrived while the application was closed. The first round of a
+    // run establishes the baseline, so none of it reaches `newUnreadEmails` —
+    // but it is still mail the user has not been told about, and it deserves
+    // the same card as anything else. The ones the page holds are announced;
+    // the database says how many more there are behind them.
     const lastSeen = readLastNotifiedDates();
-    let missed = 0;
+    let missedEmails: EmailSummary[] = [];
+    let missedTotal = 0;
     if (!suppressNotifications) {
       for (const accountId of firstRoundAccountIds) {
         const mark = lastSeen[accountId];
         // No mark is a first run: the user was never told anything, so nothing
         // was missed.
         if (mark === undefined) continue;
-        missed += await tauriApi.countInboxUnreadSince(accountId, mark).catch(() => 0);
+        missedTotal += await tauriApi.countInboxUnreadSince(accountId, mark).catch(() => 0);
+        missedEmails = missedEmails.concat(
+          freshInbox.filter(email =>
+            email.account_id === accountId && email.unread && email.date > mark),
+        );
       }
     }
     writeLastNotifiedDates({ ...lastSeen, ...latestInboxDates(freshInbox) });
-    await notifyNewEmails(newUnreadEmails, missed);
+    const announced = [...newUnreadEmails, ...missedEmails.filter(email =>
+      !newUnreadEmails.some(known => known.id === email.id && known.account_id === email.account_id))];
+    await notifyNewEmails(announced, Math.max(0, missedTotal - missedEmails.length));
     // A custom folder and a label tab each have their own list, and the
     // watcher that just wrote to the cache is often watching exactly one of
     // them. Refreshing only the fixed tabs is what left those lists stale

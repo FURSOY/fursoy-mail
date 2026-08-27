@@ -199,6 +199,21 @@ pub fn set_unread_indicator(
     .map_err(|error| error.to_string())
 }
 
+/// Opt-in tracing for the notification path, off unless `FURSOY_NOTIFY_LOG` is
+/// set to something other than `0`. What may go through here is the shape of a
+/// notification and the decision made about it: never its text.
+fn notify_log(message: impl FnOnce() -> String) {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let enabled = *ENABLED.get_or_init(|| {
+        std::env::var("FURSOY_NOTIFY_LOG")
+            .map(|value| !value.is_empty() && value != "0")
+            .unwrap_or(false)
+    });
+    if enabled {
+        eprintln!("[NOTIFY] {}", message());
+    }
+}
+
 const NOTIF_W: f64 = 340.0;
 const MARGIN: f64 = 16.0;
 const TASKBAR_H: f64 = 48.0;
@@ -222,6 +237,16 @@ pub async fn show_custom_notification(
     dismiss_all_label: Option<String>,
 ) -> Result<(), String> {
     crate::require_command_window(&window, &["main"])?;
+    // Which notifications were asked for, and which of them this decides not to
+    // show. Only the shape is written — never a subject, a sender, or a body.
+    notify_log(|| {
+        format!(
+            "requested kind={} mail_id={} code={}",
+            kind.as_deref().unwrap_or("-"),
+            email_id.is_some(),
+            code.as_ref().is_some_and(|value| !value.is_empty()),
+        )
+    });
     if kind.as_deref() == Some("mail") {
         let email_id = email_id
             .as_deref()
@@ -238,6 +263,7 @@ pub async fn show_custom_notification(
         kind.as_deref(),
         code.as_ref().is_some_and(|value| !value.is_empty()),
     ) {
+        notify_log(|| format!("dropped by notification mode {}", controls.notification_mode));
         return Ok(());
     }
 
@@ -257,6 +283,7 @@ pub async fn show_custom_notification(
         dismiss_all_label,
     };
     if is_fullscreen() {
+        notify_log(|| "held until the fullscreen application ends".to_string());
         defer_until_fullscreen_ends(&app, payload);
         return Ok(());
     }
