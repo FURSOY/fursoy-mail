@@ -307,6 +307,12 @@ fn mime_body_base64(body: &str) -> String {
 
 /// Builds a RFC 2822 raw email. Without attachments: simple text/html.
 /// With attachments: multipart/mixed with HTML part + attachment parts.
+///
+/// Always stamps its own `Date`: RFC 5322 requires one, and a message an
+/// IMAP server is asked to APPEND is not run through a submission agent
+/// that would add one on the way, unlike SMTP delivery. Without it a draft
+/// opened in any other client shows no date at all, sorts as 1970, and
+/// some receiving servers score a `Date`-less message as spam outright.
 pub(crate) fn build_raw_mime(
     headers: &[(&str, String)],
     body: &str,
@@ -316,6 +322,7 @@ pub(crate) fn build_raw_mime(
         return Err("Too many attachments".to_string());
     }
     let mut lines = String::from("MIME-Version: 1.0\r\n");
+    lines.push_str(&format!("Date: {}\r\n", rfc5322_date_now()));
     for (name, value) in headers {
         validate_header_value(name, value, MAX_RECIPIENT_HEADER_BYTES)?;
         lines.push_str(&format!("{}: {}\r\n", name, value));
@@ -403,6 +410,56 @@ pub(crate) fn build_raw_mime(
 pub struct SendOutcome {
     status: &'static str,
     message_id: String,
+}
+
+/// The current time as an RFC 5322 `Date` header value, in UTC. Hand-rolled
+/// rather than pulled in as a dependency: civil-from-days is a well-known,
+/// small algorithm (Howard Hinnant's), and this only ever needs whole
+/// seconds.
+fn rfc5322_date_now() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let total_seconds = now.as_secs() as i64;
+    let days = total_seconds.div_euclid(86_400);
+    let seconds_of_day = total_seconds.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    let weekday = weekday_name(days);
+    let month_name = MONTH_NAMES[(month - 1) as usize];
+    format!(
+        "{weekday}, {day:02} {month_name} {year:04} {:02}:{:02}:{:02} +0000",
+        seconds_of_day / 3600,
+        (seconds_of_day % 3600) / 60,
+        seconds_of_day % 60,
+    )
+}
+
+const MONTH_NAMES: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+const WEEKDAY_NAMES: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+
+/// 1970-01-01 was a Thursday; `WEEKDAY_NAMES` starts there so the day count
+/// (negative for dates before the epoch) indexes into it directly.
+fn weekday_name(days_since_epoch: i64) -> &'static str {
+    WEEKDAY_NAMES[days_since_epoch.rem_euclid(7) as usize]
+}
+
+/// Howard Hinnant's `civil_from_days`: converts a day count since 1970-01-01
+/// into a proleptic-Gregorian (year, month, day), correct for every date
+/// this header will ever need to name.
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let year = if month <= 2 { y + 1 } else { y };
+    (year, month, day)
 }
 
 fn generate_outbound_message_id() -> String {
@@ -566,7 +623,11 @@ pub async fn save_draft(
     validate_draft_recipient_header("Bcc", &bcc)?;
     validate_header_value("Subject", &subject, MAX_SUBJECT_BYTES)?;
     let verification_message_id = generate_outbound_message_id();
-    let mut headers = vec![("To", to)];
+    // Every other outbound path sets this; a draft that goes out from here
+    // without it is not RFC 5322 mail. A server is free to reject a From-less
+    // message outright, and any other IMAP client opening this Drafts folder
+    // shows the message with no sender at all.
+    let mut headers = vec![("From", account_id.clone()), ("To", to)];
     if !cc.trim().is_empty() {
         headers.push(("Cc", cc));
     }
@@ -863,11 +924,51 @@ pub async fn fetch_attachment_data(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_raw_mime, build_reply_references, generate_outbound_message_id,
-        safe_attachment_filename, validate_draft_recipient_header,
+        build_raw_mime, build_reply_references, civil_from_days, generate_outbound_message_id,
+        rfc5322_date_now, safe_attachment_filename, validate_draft_recipient_header,
         validate_optional_recipient_header, validate_outbound_message_id,
-        validate_recipient_header, AttachmentPayload,
+        validate_recipient_header, weekday_name, AttachmentPayload,
     };
+
+    #[test]
+    fn every_outbound_header_set_carries_a_from_and_a_date() {
+        let headers = [("From", "person@example.test".to_string()), ("To", "other@example.test".to_string())];
+        let raw = build_raw_mime(&headers, "hi", &[]).expect("build raw mime");
+        assert!(raw.contains("From: person@example.test\r\n"));
+        assert!(raw.starts_with("MIME-Version: 1.0\r\nDate: "));
+        // Never trust the header order: the parser that reads this back finds
+        // Date by name, not by position.
+        assert!(raw.lines().any(|line| line.starts_with("Date: ")));
+    }
+
+    #[test]
+    fn civil_from_days_matches_known_dates() {
+        // 1970-01-01 is day 0 by construction.
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        // The day this bug was found and fixed.
+        assert_eq!(civil_from_days(20_692), (2026, 8, 27));
+        // A leap day, and the transition across it.
+        assert_eq!(civil_from_days(19_416), (2023, 2, 28));
+        assert_eq!(civil_from_days(19_417), (2023, 3, 1));
+        // A date before the epoch: the algorithm must not panic or wrap.
+        assert_eq!(civil_from_days(-1), (1969, 12, 31));
+    }
+
+    #[test]
+    fn weekday_name_lines_up_with_the_epoch() {
+        assert_eq!(weekday_name(0), "Thu"); // 1970-01-01
+        assert_eq!(weekday_name(1), "Fri");
+        assert_eq!(weekday_name(-1), "Wed"); // 1969-12-31
+    }
+
+    #[test]
+    fn the_date_header_is_shaped_like_rfc_5322() {
+        let value = rfc5322_date_now();
+        let parts: Vec<&str> = value.split(' ').collect();
+        assert_eq!(parts.len(), 6, "{value}");
+        assert!(value.ends_with("+0000"), "{value}");
+        assert!(parts[0].ends_with(','));
+    }
 
     #[test]
     fn drafts_allow_an_empty_recipient_but_validate_non_empty_values() {

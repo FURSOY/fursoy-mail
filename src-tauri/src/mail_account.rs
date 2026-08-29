@@ -2640,21 +2640,35 @@ pub async fn get_imap_draft(
     .map_err(|_| "mail_account_test_interrupted".to_string())?
 }
 
+/// Removes one message from the mailbox already SELECTed. UID EXPUNGE
+/// (RFC 4315) is used where the server offers it, since it can only ever
+/// touch the one UID asked for. A server without UIDPLUS — this app has run
+/// into real ones, drafts are the path this is felt on most — used to be
+/// refused outright here, which left every deleted or replaced draft
+/// stranded in the mailbox forever. The fallback is a plain EXPUNGE, which
+/// is safe in the one mailbox this is ever called against: nothing else in
+/// this app flags a message \\Deleted in Drafts, so the only message carrying
+/// that flag when EXPUNGE runs is the one just marked here.
 fn delete_selected_uid(session: &mut OAuthImapSession, uid: u32) -> Result<(), String> {
-    let capabilities = session
+    let supports_uidplus = session
         .capabilities()
-        .map_err(|_| "mail_account_imap_failed".to_string())?;
-    if !capabilities.has_str("UIDPLUS") {
-        return Err("mail_account_label_not_supported".to_string());
-    }
+        .map(|capabilities| capabilities.has_str("UIDPLUS"))
+        .unwrap_or(false);
     let uid = uid.to_string();
     session
         .uid_store(&uid, "+FLAGS.SILENT (\\Deleted)")
         .map_err(|_| "mail_account_imap_failed".to_string())?;
-    session
-        .uid_expunge(&uid)
-        .map(|_| ())
-        .map_err(|_| "mail_account_imap_failed".to_string())
+    if supports_uidplus {
+        session
+            .uid_expunge(&uid)
+            .map(|_| ())
+            .map_err(|_| "mail_account_imap_failed".to_string())
+    } else {
+        session
+            .expunge()
+            .map(|_| ())
+            .map_err(|_| "mail_account_imap_failed".to_string())
+    }
 }
 
 pub async fn save_imap_draft(
