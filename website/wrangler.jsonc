@@ -1,6 +1,7 @@
 {
   "name": "fursoy-mail",
   "compatibility_date": "2026-07-17",
+  "routes": [{ "pattern": "mail.fursoy.com", "custom_domain": true }],
   "assets": {
     "directory": "."
   }
