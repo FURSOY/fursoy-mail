@@ -1,4 +1,4 @@
 User-agent: *
 Allow: /
 
-Sitemap: https://fursoy.com/sitemap.xml
+Sitemap: https://mail.fursoy.com/sitemap.xml

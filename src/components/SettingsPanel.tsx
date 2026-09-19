@@ -9,7 +9,7 @@ import { MIN_SYNC_INTERVAL_SECONDS, normalizeSyncIntervalSeconds } from "../sync
 import { ToolbarTip } from "./ToolbarTip";
 import { ProfileAvatar } from "./ProfileAvatar";
 
-const PRIVACY_POLICY_URL = "https://fursoy.com/privacy/";
+const PRIVACY_POLICY_URL = "https://mail.fursoy.com/privacy/";
 
 interface SettingsPanelProps {
   isVisible: boolean;
