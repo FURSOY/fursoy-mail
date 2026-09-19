@@ -1,4 +1,5 @@
 README.md
+WEBSITE_RULES.md
 wrangler.jsonc
 .assetsignore
 node_modules

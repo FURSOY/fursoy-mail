@@ -1,17 +1,84 @@
+/* FURSOY Mail — product website styles.
+   Follows the canonical FURSOY Web Design Standard:
+   C:/Projeler/fursoy-vault/website/FURSOY_WEB_GUIDELINES.md
+   This site presents dark-first per the surface strategy (guideline §3):
+   dark surfaces stay in the ink family, accents in the teal/bright family.
+   Alignment notes are marked with "FURSOY alignment:". */
+
+/* ===== Self-hosted FURSOY typefaces (no external requests) ===== */
+/* Manrope: variable 200–800, latin + latin-ext subsets */
+@font-face {
+  font-family: "Manrope";
+  font-style: normal;
+  font-weight: 200 800;
+  font-display: swap;
+  src: url("fonts/manrope-latin.woff2") format("woff2");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
+@font-face {
+  font-family: "Manrope";
+  font-style: normal;
+  font-weight: 200 800;
+  font-display: swap;
+  src: url("fonts/manrope-latin-ext.woff2") format("woff2");
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+
+/* Space Mono: 400 + 700, latin + latin-ext subsets (labels/kickers only) */
+@font-face {
+  font-family: "Space Mono";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("fonts/space-mono-latin.woff2") format("woff2");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
+@font-face {
+  font-family: "Space Mono";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("fonts/space-mono-latin-ext.woff2") format("woff2");
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+
+@font-face {
+  font-family: "Space Mono";
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url("fonts/space-mono-bold-latin.woff2") format("woff2");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
+@font-face {
+  font-family: "Space Mono";
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url("fonts/space-mono-bold-latin-ext.woff2") format("woff2");
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+
+/* ===== Tokens — FURSOY alignment ===== */
+/* Dark surfaces are shades of the canonical ink family (#0b3334 → #082526);
+   accents are the canonical teal/bright pair. */
 :root {
   color-scheme: dark;
-  --background: #0a0c0e;
-  --surface: #111519;
-  --surface-raised: #151b20;
+  --background: #0a1618;        /* FURSOY alignment: ink-family dark */
+  --surface: #10282b;           /* FURSOY alignment: ink-family dark */
+  --surface-raised: #143236;    /* FURSOY alignment: ink-family dark */
+  --border: #2a4649;            /* FURSOY alignment: ink-family dark line */
   --text: #f4f6f8;
-  --text-muted: #929ca7;
-  --text-dim: #65707b;
-  --border: #20262c;
-  --accent: #2aa3ac;
-  --accent-bright: #49c2ca;
-  --accent-ink: #031719;
-  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
-    "Segoe UI", sans-serif;
+  --text-muted: #9bb0b2;        /* FURSOY alignment: teal-gray tint */
+  --text-dim: #6f8486;          /* FURSOY alignment: teal-gray tint */
+  --accent: #13abb8;            /* FURSOY canonical --teal */
+  --accent-bright: #27d2d8;     /* FURSOY canonical --bright */
+  --accent-ink: #052526;
+  font-family: "Manrope", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+    "Segoe UI", sans-serif;    /* FURSOY alignment: Manrope primary */
   font-synthesis: none;
   text-rendering: optimizeLegibility;
 }
@@ -28,7 +95,7 @@
 html {
   min-height: 100%;
   background: var(--background);
-  scrollbar-color: rgba(146, 156, 167, 0.18) transparent;
+  scrollbar-color: rgba(155, 176, 178, 0.18) transparent;
   scrollbar-width: thin;
 }
 
@@ -42,12 +109,12 @@ html {
 }
 
 ::-webkit-scrollbar-thumb {
-  border-radius: 999px;
-  background: rgba(146, 156, 167, 0.18);
+  border-radius: var(--radius-pill, 999px);
+  background: rgba(155, 176, 178, 0.18);
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(146, 156, 167, 0.34);
+  background: rgba(155, 176, 178, 0.34);
 }
 
 body {
@@ -57,7 +124,7 @@ body {
   background:
     linear-gradient(rgba(255, 255, 255, 0.018) 1px, transparent 1px),
     linear-gradient(90deg, rgba(255, 255, 255, 0.018) 1px, transparent 1px),
-    radial-gradient(circle at 78% 26%, rgba(42, 163, 172, 0.1), transparent 28rem),
+    radial-gradient(circle at 78% 26%, rgba(19, 171, 184, 0.1), transparent 28rem),
     var(--background);
   background-size: 64px 64px, 64px 64px, auto, auto;
   color: var(--text);
@@ -67,6 +134,7 @@ a {
   color: inherit;
 }
 
+/* FURSOY alignment: ~1180px container system with 48px gutter */
 .page-shell {
   width: min(100% - 48px, 1180px);
   min-height: 100vh;
@@ -75,11 +143,13 @@ a {
   flex-direction: column;
 }
 
+/* FURSOY alignment: bordered navbar character (86px scale) */
 .site-header {
-  min-height: 88px;
+  min-height: 86px;
   display: flex;
   align-items: center;
   justify-content: space-between;
+  border-bottom: 1px solid var(--border);
 }
 
 .brand {
@@ -87,26 +157,34 @@ a {
   align-items: center;
   gap: 11px;
   color: #dfe4e8;
-  font-size: 15px;
-  font-weight: 720;
+  font-size: 16px;
+  font-weight: 800;
   letter-spacing: -0.02em;
   text-decoration: none;
 }
 
-.brand img,
-.notification-app img {
+.brand img {
   border-radius: 9px;
 }
 
+.brand b {
+  font-weight: 800;
+}
+
+/* FURSOY alignment: mono label language for secondary brand text */
 .source-link {
+  font-family: "Space Mono", monospace;
   color: var(--text-muted);
-  font-size: 13px;
-  text-underline-offset: 4px;
-  transition: color 160ms ease;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  text-decoration: none;
+  transition: color 200ms ease;
 }
 
 .source-link:hover {
-  color: var(--text);
+  color: var(--accent-bright);
 }
 
 .hero {
@@ -118,16 +196,15 @@ a {
   padding: clamp(64px, 10vh, 116px) 0 96px;
 }
 
+/* FURSOY alignment: kicker pattern (mono, uppercase, teal, tracked) */
 .hero-app-name {
   margin: 0 0 28px;
   display: flex;
   align-items: center;
   gap: 9px;
   color: var(--accent-bright);
-  font-size: 12px;
-  font-weight: 700;
-  line-height: 1.4;
-  letter-spacing: 0.08em;
+  font: 700 11px/1.4 "Space Mono", monospace;
+  letter-spacing: 0.13em;
   text-transform: uppercase;
 }
 
@@ -138,16 +215,17 @@ a {
   height: 7px;
   border-radius: 50%;
   background: var(--accent);
-  box-shadow: 0 0 0 5px rgba(42, 163, 172, 0.11);
+  box-shadow: 0 0 0 5px rgba(19, 171, 184, 0.11);
 }
 
+/* FURSOY alignment: tight negative tracking, near-solid line-height */
 h1 {
   max-width: 780px;
   margin: 0;
   font-size: clamp(62px, 8.4vw, 112px);
   font-weight: 760;
-  line-height: 0.88;
-  letter-spacing: -0.075em;
+  line-height: 0.92;
+  letter-spacing: -0.065em;
 }
 
 .hero-tagline {
@@ -184,6 +262,8 @@ h1 {
   flex-wrap: wrap;
 }
 
+/* FURSOY alignment: button language (bold 13px scale, hover lift ~200ms,
+   radius 11 control family) — teal fill is this product's primary variant */
 .download-button {
   min-height: 52px;
   padding: 0 22px;
@@ -192,25 +272,25 @@ h1 {
   justify-content: center;
   gap: 10px;
   border: 1px solid rgba(255, 255, 255, 0.12);
-  border-radius: 12px;
+  border-radius: 11px;
   background: var(--accent);
-  color: #ffffff;
+  color: var(--accent-ink);
   box-shadow:
-    0 16px 42px rgba(42, 163, 172, 0.18),
+    0 16px 42px rgba(19, 171, 184, 0.18),
     inset 0 1px rgba(255, 255, 255, 0.16);
-  font-size: 14px;
-  font-weight: 750;
+  font-size: 13px;
+  font-weight: 800;
   text-decoration: none;
   transition:
-    background 160ms ease,
-    transform 160ms ease,
-    box-shadow 160ms ease;
+    background 200ms ease,
+    transform 200ms ease,
+    box-shadow 200ms ease;
 }
 
 .download-button:hover {
-  background: #32b2bb;
+  background: #15858f;
   box-shadow:
-    0 19px 48px rgba(42, 163, 172, 0.24),
+    0 19px 48px rgba(19, 171, 184, 0.24),
     inset 0 1px rgba(255, 255, 255, 0.18);
   transform: translateY(-2px);
 }
@@ -225,14 +305,16 @@ h1 {
   font-size: 12px;
 }
 
+/* FURSOY alignment: product mock card (radius family A, ink-family surface,
+   subtle rotation like the reference implementation) */
 .notification-demo {
   position: relative;
   padding: 20px;
-  border: 1px solid #252d34;
-  border-radius: 18px;
+  border: 1px solid var(--border);
+  border-radius: 20px;
   background:
     linear-gradient(145deg, rgba(255, 255, 255, 0.028), transparent 48%),
-    rgba(17, 21, 25, 0.94);
+    rgba(16, 40, 43, 0.94);
   box-shadow:
     0 30px 70px rgba(0, 0, 0, 0.34),
     0 0 0 8px rgba(255, 255, 255, 0.012);
@@ -244,7 +326,7 @@ h1 {
   inset: -34px -28px auto auto;
   width: 90px;
   height: 90px;
-  border: 1px solid rgba(42, 163, 172, 0.24);
+  border: 1px solid rgba(19, 171, 184, 0.24);
   border-radius: 50%;
   content: "";
 }
@@ -298,21 +380,24 @@ h1 {
   gap: 20px;
 }
 
+/* FURSOY alignment: code display uses the mono identity font */
 .code-row code {
   color: var(--text);
-  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-family: "Space Mono", monospace;
   font-size: clamp(30px, 4vw, 42px);
   font-weight: 700;
   letter-spacing: 0.04em;
 }
 
+/* FURSOY alignment: status chip (mono label + control radius) */
 .copy-state {
   padding: 7px 10px;
   border-radius: 8px;
-  background: rgba(42, 163, 172, 0.13);
+  background: rgba(19, 171, 184, 0.13);
   color: var(--accent-bright);
-  font-size: 11px;
-  font-weight: 750;
+  font: 700 11px/1.2 "Space Mono", monospace;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
 }
 
 .notification-line {
@@ -365,12 +450,13 @@ h1 {
   border-bottom: 1px solid var(--border);
 }
 
-.purpose-label {
+/* FURSOY alignment: kicker labels for section openings */
+.purpose-label,
+.faq-label {
   margin: 6px 0 0;
   color: var(--accent-bright);
-  font-size: 11px;
-  font-weight: 750;
-  letter-spacing: 0.12em;
+  font: 700 11px/1.4 "Space Mono", monospace;
+  letter-spacing: 0.13em;
   text-transform: uppercase;
 }
 
@@ -405,15 +491,6 @@ h1 {
   border-bottom: 1px solid var(--border);
 }
 
-.faq-label {
-  margin: 6px 0 0;
-  color: var(--accent-bright);
-  font-size: 11px;
-  font-weight: 750;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
-}
-
 .faq-copy {
   max-width: 720px;
 }
@@ -437,12 +514,12 @@ h1 {
   border-radius: 12px;
   background: var(--surface);
   overflow: hidden;
-  transition: border-color 160ms ease, background-color 160ms ease;
+  transition: border-color 200ms ease, background-color 200ms ease;
 }
 
 .faq-item[open] {
   background: var(--surface-raised);
-  border-color: rgba(42, 163, 172, 0.35);
+  border-color: rgba(19, 171, 184, 0.35);
 }
 
 .faq-question {
@@ -468,7 +545,7 @@ h1 {
   font-size: 20px;
   font-weight: 400;
   color: var(--text-dim);
-  transition: transform 160ms ease, color 160ms ease;
+  transition: transform 200ms ease, color 200ms ease;
   margin-left: 12px;
 }
 
@@ -488,6 +565,7 @@ h1 {
   line-height: 1.7;
 }
 
+/* FURSOY alignment: mono uppercase column headers + teal-tinted footer text */
 footer {
   min-height: 94px;
   display: flex;
@@ -507,12 +585,16 @@ footer a {
   text-underline-offset: 4px;
 }
 
+footer a:hover {
+  color: var(--accent-bright);
+}
+
 .download-button:focus-visible,
 .brand:focus-visible,
 .source-link:focus-visible,
 footer a:focus-visible,
 .policy a:focus-visible {
-  outline: 3px solid rgba(73, 194, 202, 0.55);
+  outline: 3px solid rgba(39, 210, 216, 0.55);
   outline-offset: 4px;
 }
 
@@ -520,6 +602,7 @@ footer a:focus-visible,
   background: var(--background);
 }
 
+/* FURSOY alignment: narrow legal container (760–850px band) */
 .simple-shell {
   width: min(100% - 48px, 760px);
   margin: 0 auto;
@@ -580,7 +663,7 @@ footer a:focus-visible,
   margin-bottom: 30px;
 }
 
-@media (max-width: 840px) {
+@media (max-width: 900px) {
   .hero {
     grid-template-columns: 1fr;
     gap: 68px;
@@ -619,11 +702,11 @@ footer a:focus-visible,
 @media (max-width: 560px) {
   .page-shell,
   .simple-shell {
-    width: min(100% - 32px, 1180px);
+    width: min(100% - 26px, 1180px);  /* FURSOY alignment: mobile gutter */
   }
 
   .site-header {
-    min-height: 76px;
+    min-height: 72px;
   }
 
   .hero {
@@ -698,7 +781,9 @@ footer a:focus-visible,
 
 @media (prefers-reduced-motion: reduce) {
   .download-button,
-  .source-link {
+  .source-link,
+  .faq-item,
+  .faq-question::after {
     transition: none;
   }
 }
