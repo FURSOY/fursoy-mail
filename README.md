@@ -1,10 +1,15 @@
 # FURSOY Mail
 
-FURSOY Mail is a lightweight Windows mail client built around fast notifications and one-click access to verification codes.
+**Experimental Desktop Mail Client & OTP Heuristics Engine (Rust · Tauri 2 · React)**
 
-Instead of making users open a webmail page, find a message, select a code, and copy it manually, FURSOY Mail detects likely OTP and verification codes and makes them available directly from the desktop notification.
+> [!IMPORTANT]
+> **Project Status: Active Work-in-Progress / Experimental (Not Daily-Driver Ready)**  
+> FURSOY Mail is an active personal exploration of local-first desktop mail architectures, asynchronous IMAP syncing in Rust, and notification-driven OTP heuristics.  
+> **While tagged release builds are available for testing, the client is currently in active development, contains known edge-case bugs, and is NOT ready or recommended for everyday, primary email use.**
 
-[Download the latest Windows release](https://github.com/FURSOY/FURSOY-Mail/releases/latest)
+FURSOY Mail explores a lightweight, local-first alternative to heavy webmail interfaces: detecting likely verification codes in incoming streams and providing instant copy actions directly from native desktop notifications.
+
+[Download Experimental Preview (Testing Only)](https://github.com/FURSOY/fursoy-mail/releases/latest)
 
 ## Highlights
 
@@ -37,7 +42,7 @@ Other operating systems are not currently supported.
 
 ## Installation
 
-1. Open the [latest release](https://github.com/FURSOY/FURSOY-Mail/releases/latest).
+1. Open the [latest release](https://github.com/FURSOY/fursoy-mail/releases/latest) (experimental testing builds).
 2. Download the Windows file ending in `x64-setup.exe`.
 3. Run the installer and launch FURSOY Mail.
 4. Connect a Google account and approve the permissions required by the mail features.
